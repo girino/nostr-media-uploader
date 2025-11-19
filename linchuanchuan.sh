@@ -7,25 +7,28 @@ BLOSSOMS=(
 	"https://nostr.download"
 	"https://blossom.primal.net"
 )
-BLOSSOM_SERVERS=()
 # Shuffle the BLOSSOMS array
 #BLOSSOMS=($(shuf -e "${BLOSSOMS[@]}"))
 
 RELAYS="wss://bcast.girino.org wss://nip13.girino.org"
 
+# Global array to track temp files for cleanup
+TEMP_FILES=()
+
 # functions 
 # Function to delete temp files on exit
 cleanup() {
 	echo "Cleaning up..."
-	if [ -n "$OUT_FILE" ] && [ -f "$OUT_FILE" ]; then
-		rm -f "$OUT_FILE" && echo "Deleted file $OUT_FILE"
-	fi
-	if [ -n "$OUT_FILE_INT" ] && [ -f "$OUT_FILE_INT" ]; then
-		rm -f "$OUT_FILE_INT" && echo "Deleted file $OUT_FILE_INT"
-	fi
-	if [ -n "$DESC_FILE" ] && [ -f "$DESC_FILE" ]; then
-		rm -f "$DESC_FILE" && echo "Deleted file $DESC_FILE"
-	fi
+	# Clean up tracked temp files
+	for TEMP_FILE in "${TEMP_FILES[@]}"; do
+		if [ -n "$TEMP_FILE" ]; then
+			if [ -f "$TEMP_FILE" ]; then
+				rm -f "$TEMP_FILE" && echo "Deleted temp file $TEMP_FILE"
+			elif [ -d "$TEMP_FILE" ]; then
+				rm -rf "$TEMP_FILE" && echo "Deleted temp directory $TEMP_FILE"
+			fi
+		fi
+	done
 	# Clean up temporary files from downloads
 	for PROCESSED_FILE in "${PROCESSED_FILES[@]}"; do
 		if [[ "$PROCESSED_FILE" == /tmp/* ]]; then
@@ -174,11 +177,14 @@ download_video() {
 	download_video_ret_source=""
 	download_video_ret_success=1
 	
-	local FILE_BASE=$(mktemp)
-	local FILE_BASE_INT=$(mktemp)
+	local FILE_BASE=$(mktemp -u)
+	local FILE_BASE_INT=$(mktemp -u)
 	local OUT_FILE_INT=${FILE_BASE_INT}.mp4
 	local OUT_FILE=${FILE_BASE}.mp4
 	local DESC_FILE=${FILE_BASE_INT}.description
+	
+	# Add temp files to cleanup list (only files that will actually be created)
+	TEMP_FILES+=("$OUT_FILE_INT" "$OUT_FILE" "$DESC_FILE")
 	
 	echo "Attempting to download as video to $OUT_FILE_INT"
 	local WINFILE_INT=$(cygpath -w "$OUT_FILE_INT")
@@ -203,7 +209,6 @@ download_video() {
 		if [ -f "$DESC_FILE" ] && [ "$APPEND_ORIGINAL_COMMENT" -eq 1 ]; then
 			echo "Reading description from $DESC_FILE"
 			extracted_caption=$(cat "$DESC_FILE")
-			rm -f "$DESC_FILE"
 		fi
 		file_caption=$(build_caption "$DESCRIPTION_CANDIDATE" "$extracted_caption" "$APPEND_ORIGINAL_COMMENT")
 		
@@ -235,7 +240,7 @@ download_video() {
 					ffmpeg -y -i "$WINFILE_INT" -c:v h264_qsv -b:v "${H264_BITRATE}" -preset slow -pix_fmt nv12 -movflags +faststart -c:a copy "$WINFILE" 2>/dev/null
 					if [ $? -ne 0 ]; then
 						local H265_BITRATE=$((BITRATE * 3 / 2))
-						ffmpeg -y -i "$WINFILE_INT" -c:v libx265 -b:v "${H265_BITRATE}" -preset ultrafast -c:a copy -movflags +faststart -tag:v hvc1 "$WINFILE" 2>/dev/null || rm -f "$OUT_FILE"
+						ffmpeg -y -i "$WINFILE_INT" -c:v libx265 -b:v "${H265_BITRATE}" -preset ultrafast -c:a copy -movflags +faststart -tag:v hvc1 "$WINFILE" 2>/dev/null
 					fi
 					if [ -f "$OUT_FILE" ]; then
 						download_video_ret_files+=("$OUT_FILE")
@@ -306,6 +311,8 @@ download_images() {
 			echo "Trying to remove set param, new URL: $URL_NOSET"
 			local TEST_TMPDIR=$(mktemp -d /tmp/gallery_dl_test_XXXXXXXX)
 			local WIN_TEST_TMPDIR=$(cygpath -w "$TEST_TMPDIR")
+			# Add temp directory to cleanup list
+			TEMP_FILES+=("$TEST_TMPDIR")
 			echo "Testing download: gallery-dl \"${URL_GALLERY_DL_PARAMS[@]}\" -f '{num}.{extension}' -D \"$WIN_TEST_TMPDIR\" --write-metadata \"$URL_NOSET\""
 			gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_TEST_TMPDIR" --write-metadata "$URL_NOSET" 2>&1 >/dev/null
 			if [ $? -eq 0 ] && [ "$(ls -A "$TEST_TMPDIR" 2>/dev/null)" ]; then
@@ -315,7 +322,6 @@ download_images() {
 				PRE_DOWNLOADED_DIR="$TEST_TMPDIR"
 			else
 				echo "Download failed, trying to infer position"
-				rm -rf "$TEST_TMPDIR"
 			fi
 		fi
 		# set was not removed, so try to infer position
@@ -329,6 +335,8 @@ download_images() {
 				echo "Finding position of image with fbid $FBID..."
 				local POSITION_TMPDIR=$(mktemp -d /tmp/gallery_dl_position_XXXXXXXX)
 				local WIN_POSITION_TMPDIR=$(cygpath -w "$POSITION_TMPDIR")
+				# Add temp directory to cleanup list
+				TEMP_FILES+=("$POSITION_TMPDIR")
 				
 				# Download all images to find the one matching FBID
 				gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_POSITION_TMPDIR" --write-metadata "$PROCESSED_URL" 2>&1 >/dev/null
@@ -365,13 +373,9 @@ download_images() {
 						echo "Could not find image with fbid $FBID, defaulting to range 1"
 						URL_GALLERY_DL_PARAMS+=("--range" "1")
 					fi
-					
-					# Clean up position finding temp directory
-					rm -rf "$POSITION_TMPDIR"
 				else
 					echo "Could not download to determine position, defaulting to range 1"
 					URL_GALLERY_DL_PARAMS+=("--range" "1")
-					rm -rf "$POSITION_TMPDIR"
 				fi
 			else
 				URL_GALLERY_DL_PARAMS+=("--range" "1")
@@ -389,6 +393,8 @@ download_images() {
 		echo "Attempting to download as images using gallery-dl"
 		local IMAGES_TMPDIR=$(mktemp -d /tmp/gallery_dl_XXXXXXXX)
 		local WIN_IMAGES_TMPDIR=$(cygpath -w "$IMAGES_TMPDIR")
+		# Add temp directory to cleanup list
+		TEMP_FILES+=("$IMAGES_TMPDIR")
 		
 		gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_IMAGES_TMPDIR" --write-metadata "$PROCESSED_URL" 2>/dev/null
 		
@@ -424,12 +430,7 @@ download_images() {
 			download_images_ret_source="$PROCESSED_URL"
 		fi
 		download_images_ret_success=0
-	else
-		# Only cleanup if this is not the pre-downloaded directory (which will be cleaned up later)
-		if [ "$IMAGES_TMPDIR" != "$PRE_DOWNLOADED_DIR" ] || [ -z "$PRE_DOWNLOADED_DIR" ]; then
-			rm -rf "$IMAGES_TMPDIR"
-		fi
-		fi
+	fi
 }
 
 # Function to clean up source URL by removing problematic parameters
@@ -502,7 +503,6 @@ DISPLAY_SOURCE="${DISPLAY_SOURCE:-0}"
 POW_DIFF="${POW_DIFF:-20}"
 APPEND_ORIGINAL_COMMENT="${APPEND_ORIGINAL_COMMENT:-1}"
 USE_COOKIES_FF="${USE_COOKIES_FF:-0}"
-PROPAGATE_BLOSSOM="${PROPAGATE_BLOSSOM:-0}"
 
 # Load environment variables from ~/.nostr/girino if it exists
 if [[ -f "$HOME/.nostr/${SCRIPT_NAME%.*}" ]]; then
@@ -513,8 +513,8 @@ else
 fi
 
 # Ensure that at least one key variable is set, otherwise exit with error
-if [[ -z "$NSEC_KEY" && -z "$KEY" && -z "$NCRYPT_KEY" && -z "$DECRYPTED_KEY" ]]; then
-	die "Error: No key variable is set. Please set NSEC_KEY, KEY, NCRYPT_KEY, or DECRYPTED_KEY in ~/.nostr/${SCRIPT_NAME%.*}"
+if [[ -z "$NSEC_KEY" && -z "$KEY" && -z "$NCRYPT_KEY" ]]; then
+	die "Error: No key variable is set. Please set NSEC_KEY, KEY, or NCRYPT_KEY in ~/.nostr/${SCRIPT_NAME%.*}"
 fi
 
 # add EXTRA_RELAYS to RELAYS if exists
@@ -529,15 +529,8 @@ if [[ -n "${EXTRA_BLOSSOMS[*]}" ]]; then
 	BLOSSOMS=("${EXTRA_BLOSSOMS[@]}" "${BLOSSOMS[@]}")
 fi
 
-if [ "x$1" == "x" ]; then
-	echo "needs file"
-	exit 1
-fi
-
 # parse command line params
 ALL_MEDIA_FILES=()
-DESCRIPTION=""
-SOURCE=""
 CONVERT_VIDEO="${CONVERT_VIDEO:-1}"
 SEND_TO_RELAY="${SEND_TO_RELAY:-1}"
 DISABLE_HASH_CHECK="${DISABLE_HASH_CHECK:-0}"
@@ -596,14 +589,6 @@ while (( "$#" )); do
 			echo "Password is required after --password option"
 			exit 1
 		fi
-		shift  # shift to remove the password from the params
-	elif [[ "$PARAM" == "--blossom" || "$PARAM" == "-blossom" ]]; then
-		if [ -z "$2" ]; then
-			echo "server is required after --blossom option"
-			exit 1
-		fi
-		BLOSSOMS=("$2")
-		PROPAGATE_BLOSSOM=1
 		shift  # shift to remove the password from the params
 	else
 		# stop processing params if it's not a file or url
@@ -665,11 +650,6 @@ for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
 		fi
 	fi
 done
-
-# If source is provided, append it to the description
-if [ -n "$SOURCE" ]; then
-	DESCRIPTION="${DESCRIPTION}"$'\n\n'"Source: $SOURCE"
-fi
 
 # if exists NPUB_KEY, use "nak decode | jq -r .private_key" to get it. 
 # bypass decrypting
@@ -876,7 +856,6 @@ for TRIES in "${!BLOSSOMS[@]}"; do
 	UPLOAD_URLS=()
 	upload_success=1
 	
-	idx=0
 	for FILE in "${PROCESSED_FILES[@]}"; do
 		FILE_WIN=$(cygpath -w "$FILE")
 		if [ ! -f "$FILE" ]; then
@@ -907,7 +886,6 @@ for TRIES in "${!BLOSSOMS[@]}"; do
 		fi
 		UPLOAD_URLS+=("$file_url")
 		echo "Uploaded to: $file_url"
-		((idx++))
 	done
 
 	if [ $upload_success -eq 0 ]; then
