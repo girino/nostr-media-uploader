@@ -14,12 +14,9 @@ BLOSSOM_SERVERS=()
 RELAYS="wss://bcast.girino.org wss://nip13.girino.org"
 
 # functions 
-# Function to delete the tempfile on exit
+# Function to delete temp files on exit
 cleanup() {
 	echo "Cleaning up..."
-	if [ -n "$TEMPFILE" ] && [ -f "$TEMPFILE" ]; then
-		rm -f "$TEMPFILE" && echo "Deleted tempfile $TEMPFILE"
-	fi
 	if [ -n "$OUT_FILE" ] && [ -f "$OUT_FILE" ]; then
 		rm -f "$OUT_FILE" && echo "Deleted file $OUT_FILE"
 	fi
@@ -29,6 +26,22 @@ cleanup() {
 	if [ -n "$DESC_FILE" ] && [ -f "$DESC_FILE" ]; then
 		rm -f "$DESC_FILE" && echo "Deleted file $DESC_FILE"
 	fi
+	# Clean up temporary files from downloads
+	for PROCESSED_FILE in "${PROCESSED_FILES[@]}"; do
+		if [[ "$PROCESSED_FILE" == /tmp/* ]]; then
+			if [ -f "$PROCESSED_FILE" ]; then
+				rm -f "$PROCESSED_FILE" && echo "Deleted temp file $PROCESSED_FILE"
+			elif [ -d "$PROCESSED_FILE" ]; then
+				rm -rf "$PROCESSED_FILE" && echo "Deleted temp directory $PROCESSED_FILE"
+			fi
+		fi
+	done
+	# Clean up gallery-dl temp directories
+	for TMP_DIR in /tmp/gallery_dl_*; do
+		if [ -d "$TMP_DIR" ]; then
+			rm -rf "$TMP_DIR" && echo "Deleted temp directory $TMP_DIR"
+		fi
+	done
 	echo "Cleanup done."
 }
 trap cleanup INT TERM
@@ -37,6 +50,336 @@ die() {
 	echo "$1"
 	cleanup
 	exit 1
+}
+
+# Function to download video from URL using yt-dlp
+# Parameters:
+#   $1: VIDEO_URL - URL to download
+#   $2: HISTORY_FILE - path to history file
+#   $3: CONVERT_VIDEO - 1 to convert, 0 otherwise
+#   $4: USE_COOKIES_FF - 1 to use Firefox cookies, 0 otherwise
+#   $5: APPEND_ORIGINAL_COMMENT - 1 to append, 0 otherwise
+#   $6: DISABLE_HASH_CHECK - 1 to disable, 0 otherwise
+#   $7: DESCRIPTION_CANDIDATE - current description candidate
+#   $8: SOURCE_CANDIDATE - current source candidate
+# Return variables (set at end of function):
+#   download_video_ret_files - array of downloaded files
+#   download_video_ret_captions - array of captions (one per file, empty string if no caption)
+#   download_video_ret_source - source to set (empty if should keep current)
+#   download_video_ret_success - 0 on success, 1 on failure
+download_video() {
+	local VIDEO_URL="$1"
+	local HISTORY_FILE="$2"
+	local CONVERT_VIDEO="$3"
+	local USE_COOKIES_FF="$4"
+	local APPEND_ORIGINAL_COMMENT="$5"
+	local DISABLE_HASH_CHECK="$6"
+	local DESCRIPTION_CANDIDATE="$7"
+	local SOURCE_CANDIDATE="$8"
+	
+	local DOWNLOADED=0
+	# Return variables (global, set at end of function)
+	download_video_ret_files=()
+	download_video_ret_captions=()
+	download_video_ret_source=""
+	download_video_ret_success=1
+	
+	local FILE_BASE=$(mktemp)
+	local FILE_BASE_INT=$(mktemp)
+	local OUT_FILE_INT=${FILE_BASE_INT}.mp4
+	local OUT_FILE=${FILE_BASE}.mp4
+	local DESC_FILE=${FILE_BASE_INT}.description
+	
+	echo "Attempting to download as video to $OUT_FILE_INT"
+	local WINFILE_INT=$(cygpath -w "$OUT_FILE_INT")
+	local WINFILE=$(cygpath -w "$OUT_FILE")
+	
+	local FORMATS='bestvideo[codec^=hevc]+bestaudio/bestvideo[codec^=avc]+bestaudio/best[codec^=hevc]/best[codec^=avc]/bestvideo+bestaudio/best'
+	if [ "$CONVERT_VIDEO" -eq 0 ]; then
+		FORMATS='bestvideo[codec^=hevc]+bestaudio/bestvideo[codec^=avc]+bestaudio/best[codec^=hevc]/best[codec^=avc]/best'
+	fi
+	
+	local YT_DLP_OPTS=()
+	if [ "$USE_COOKIES_FF" -eq 1 ]; then
+		YT_DLP_OPTS+=(--cookies-from-browser firefox)
+	fi
+	
+	/usr/local/bin/yt-dlp "${YT_DLP_OPTS[@]}" "$VIDEO_URL" -f "$FORMATS" -S ext:mp4:m4a --merge-output-format mp4 --write-description -o "$WINFILE_INT" 2>/dev/null
+	
+	if [ $? -eq 0 ] && [ -f "$OUT_FILE_INT" ]; then
+		DOWNLOADED=1
+		local file_caption=""
+		if [ -f "$DESC_FILE" ] && [ "$APPEND_ORIGINAL_COMMENT" -eq 1 ]; then
+			echo "Reading description from $DESC_FILE"
+			local desc_content=$(cat "$DESC_FILE")
+			rm -f "$DESC_FILE"
+			if [ -n "$DESCRIPTION_CANDIDATE" ]; then
+				file_caption="${DESCRIPTION_CANDIDATE}"$'\n\n'"${desc_content}"
+			else
+				file_caption="${desc_content}"
+			fi
+		elif [ -n "$DESCRIPTION_CANDIDATE" ]; then
+			file_caption="$DESCRIPTION_CANDIDATE"
+		fi
+		
+		if [ -z "$SOURCE_CANDIDATE" ]; then
+			download_video_ret_source="$VIDEO_URL"
+		fi
+		
+		# Calculate the sha256 hash
+		local DOWNLOADED_FILE_HASH=$(sha256sum "$OUT_FILE_INT" | awk '{print $1}')
+		echo "SHA256 hash: $DOWNLOADED_FILE_HASH"
+		if [ "$DISABLE_HASH_CHECK" -eq 0 ]; then
+			if grep -q "$DOWNLOADED_FILE_HASH" "$HISTORY_FILE"; then
+				die "File hash already processed: $DOWNLOADED_FILE_HASH"
+			fi
+		fi
+		
+		# Detect and convert video codec if needed
+		local VIDEO_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$WINFILE_INT" 2>/dev/null)
+		VIDEO_CODEC=$(echo "$VIDEO_CODEC" | tr -d '\r')
+		echo "Video codec: '$VIDEO_CODEC'"
+		
+		if [ "$VIDEO_CODEC" != "h264" ] && [ "$VIDEO_CODEC" != "hevc" ]; then
+			if [ "$CONVERT_VIDEO" -eq 1 ]; then
+				echo "Converting $OUT_FILE_INT to iOS compatible format"
+				local BITRATE=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "$WINFILE_INT" 2>/dev/null)
+				BITRATE=$(echo "$BITRATE" | tr -d '\r' | tr -cd '[:digit:]')
+				echo "Bitrate: '$BITRATE'"
+				
+				if [[ "$BITRATE" =~ ^[0-9]+$ ]]; then
+					local H264_BITRATE=$((BITRATE * 2))
+					ffmpeg -y -i "$WINFILE_INT" -c:v h264_qsv -b:v "${H264_BITRATE}" -preset slow -pix_fmt nv12 -movflags +faststart -c:a copy "$WINFILE" 2>/dev/null
+					if [ $? -ne 0 ]; then
+						local H265_BITRATE=$((BITRATE * 3 / 2))
+						ffmpeg -y -i "$WINFILE_INT" -c:v libx265 -b:v "${H265_BITRATE}" -preset ultrafast -c:a copy -movflags +faststart -tag:v hvc1 "$WINFILE" 2>/dev/null || rm -f "$OUT_FILE"
+					fi
+					if [ -f "$OUT_FILE" ]; then
+						download_video_ret_files+=("$OUT_FILE")
+						download_video_ret_captions+=("$file_caption")
+					else
+						download_video_ret_files+=("$OUT_FILE_INT")
+						download_video_ret_captions+=("$file_caption")
+					fi
+				else
+					download_video_ret_files+=("$OUT_FILE_INT")
+					download_video_ret_captions+=("$file_caption")
+				fi
+			else
+				die "Video codec is not h264 or hevc and conversion is disabled"
+			fi
+		else
+			download_video_ret_files+=("$OUT_FILE_INT")
+			download_video_ret_captions+=("$file_caption")
+		fi
+		echo "Downloaded as video: '${download_video_ret_files[-1]}'"
+		download_video_ret_success=0
+	fi
+}
+
+# Function to download images from URL using gallery-dl
+# Parameters:
+#   $1: IMAGE_URL - URL to download
+#   $2: GALLERY_DL_PARAMS - array of gallery-dl parameters (passed as string to eval)
+#   $3: APPEND_ORIGINAL_COMMENT - 1 to append, 0 otherwise
+#   $4: DESCRIPTION_CANDIDATE - current description candidate
+#   $5: SOURCE_CANDIDATE - current source candidate
+# Return variables (set at end of function):
+#   download_images_ret_files - array of downloaded files
+#   download_images_ret_captions - array of captions (one per file, empty string if no caption)
+#   download_images_ret_source - source to set (empty if should keep current)
+#   download_images_ret_success - 0 on success, 1 on failure
+download_images() {
+	local IMAGE_URL="$1"
+	local GALLERY_DL_PARAMS_STR="$2"
+	local APPEND_ORIGINAL_COMMENT="$3"
+	local DESCRIPTION_CANDIDATE="$4"
+	local SOURCE_CANDIDATE="$5"
+	
+	local DOWNLOADED=0
+	# Return variables (global, set at end of function)
+	download_images_ret_files=()
+	download_images_ret_captions=()
+	download_images_ret_source=""
+	download_images_ret_success=1
+	
+	# Reconstruct GALLERY_DL_PARAMS array from string
+	local GALLERY_DL_PARAMS=()
+	eval "GALLERY_DL_PARAMS=($GALLERY_DL_PARAMS_STR)"
+	
+	# Create a local copy of GALLERY_DL_PARAMS for modifications
+	local URL_GALLERY_DL_PARAMS=("${GALLERY_DL_PARAMS[@]}")
+	local PROCESSED_URL="$IMAGE_URL"
+	local PRE_DOWNLOADED_DIR=""
+	
+	# Handle Facebook URLs - remove set parameter or infer position
+	if [[ "$PROCESSED_URL" =~ facebook\.com ]]; then
+		# Check if URL has set=a.XXXX or set=gm.XXXX parameter
+		if [[ "$PROCESSED_URL" =~ [?\&](set=a\.[0-9]+|set=gm\.[0-9]+) ]]; then
+			# First try removing the set param
+			local URL_NOSET=$(echo "$PROCESSED_URL" | sed -E 's/[?&]set=a\.[0-9]+//')
+			URL_NOSET=$(echo "$URL_NOSET" | sed -E 's/[?&]set=gm\.[0-9]+//')
+			# Try downloading to see if it works
+			echo "Trying to remove set param, new URL: $URL_NOSET"
+			local TEST_TMPDIR=$(mktemp -d /tmp/gallery_dl_test_XXXXXXXX)
+			local WIN_TEST_TMPDIR=$(cygpath -w "$TEST_TMPDIR")
+			echo "Testing download: gallery-dl \"${URL_GALLERY_DL_PARAMS[@]}\" -f '{num}.{extension}' -D \"$WIN_TEST_TMPDIR\" --write-metadata \"$URL_NOSET\""
+			gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_TEST_TMPDIR" --write-metadata "$URL_NOSET" 2>&1 >/dev/null
+			if [ $? -eq 0 ] && [ "$(ls -A "$TEST_TMPDIR" 2>/dev/null)" ]; then
+				PROCESSED_URL="$URL_NOSET"
+				echo "Download succeeded, removed set param, new URL: $PROCESSED_URL"
+				# Keep the test temp directory for later use
+				PRE_DOWNLOADED_DIR="$TEST_TMPDIR"
+			else
+				echo "Download failed, trying to infer position"
+				rm -rf "$TEST_TMPDIR"
+			fi
+		fi
+		# set was not removed, so try to infer position
+		if [[ "$PROCESSED_URL" =~ [?\&](set=a\.[0-9]+|set=gm\.[0-9]+) ]]; then
+			# Extract fbid from URL if present
+			if [[ "$PROCESSED_URL" =~ [?\&]fbid=([0-9]+) ]]; then
+				local FBID="${BASH_REMATCH[1]}"
+				echo "Found fbid: $FBID"
+				
+				# Download images to find position of image with fbid
+				echo "Finding position of image with fbid $FBID..."
+				local POSITION_TMPDIR=$(mktemp -d /tmp/gallery_dl_position_XXXXXXXX)
+				local WIN_POSITION_TMPDIR=$(cygpath -w "$POSITION_TMPDIR")
+				
+				# Download all images to find the one matching FBID
+				gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_POSITION_TMPDIR" --write-metadata "$PROCESSED_URL" 2>&1 >/dev/null
+				if [ $? -eq 0 ] && [ "$(ls -A "$POSITION_TMPDIR" 2>/dev/null)" ]; then
+					# Count the position of the image matching the fbid by checking metadata files
+					local POSITION=1
+					local FOUND=0
+					# Sort files in numerical order
+					local files=($(ls "$POSITION_TMPDIR" | sort -V))
+					for fname in "${files[@]}"; do
+						local file="$POSITION_TMPDIR/$fname"
+						# Skip metadata files in the count
+						[[ "$file" == *.json ]] && continue
+						
+						# Check corresponding metadata file
+						local meta="${file}.json"
+						if [ ! -f "$meta" ]; then
+							meta="${file%.*}.json"
+						fi
+						
+						if [ -f "$meta" ]; then
+							# Check if metadata contains the FBID in URL or filename
+							if grep -q "$FBID" "$meta" 2>/dev/null; then
+								echo "Found matching image at position $POSITION"
+								URL_GALLERY_DL_PARAMS+=("--range" "$POSITION")
+								FOUND=1
+								break
+							fi
+						fi
+						((POSITION++))
+					done
+					
+					if [ $FOUND -eq 0 ]; then
+						echo "Could not find image with fbid $FBID, defaulting to range 1"
+						URL_GALLERY_DL_PARAMS+=("--range" "1")
+					fi
+					
+					# Clean up position finding temp directory
+					rm -rf "$POSITION_TMPDIR"
+				else
+					echo "Could not download to determine position, defaulting to range 1"
+					URL_GALLERY_DL_PARAMS+=("--range" "1")
+					rm -rf "$POSITION_TMPDIR"
+				fi
+			else
+				URL_GALLERY_DL_PARAMS+=("--range" "1")
+			fi
+		fi
+		echo "Modified URL: $PROCESSED_URL"
+	fi
+	
+	# If we already have a pre-downloaded directory from Facebook URL processing, use it
+	if [ -n "$PRE_DOWNLOADED_DIR" ] && [ -d "$PRE_DOWNLOADED_DIR" ] && [ "$(ls -A "$PRE_DOWNLOADED_DIR" 2>/dev/null)" ]; then
+		echo "Using pre-downloaded images from $PRE_DOWNLOADED_DIR"
+		local IMAGES_TMPDIR="$PRE_DOWNLOADED_DIR"
+		DOWNLOADED=1
+	else
+		echo "Attempting to download as images using gallery-dl"
+		local IMAGES_TMPDIR=$(mktemp -d /tmp/gallery_dl_XXXXXXXX)
+		local WIN_IMAGES_TMPDIR=$(cygpath -w "$IMAGES_TMPDIR")
+		
+		gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_IMAGES_TMPDIR" --write-metadata "$PROCESSED_URL" 2>/dev/null
+		
+		if [ $? -eq 0 ] && [ "$(ls -A "$IMAGES_TMPDIR" 2>/dev/null)" ]; then
+			DOWNLOADED=1
+		fi
+	fi
+	
+	if [ $DOWNLOADED -eq 1 ] && [ "$(ls -A "$IMAGES_TMPDIR" 2>/dev/null)" ]; then
+		# Process downloaded images
+		local files=($(ls "$IMAGES_TMPDIR" | sort -V))
+		for fname in "${files[@]}"; do
+			local file="$IMAGES_TMPDIR/$fname"
+			# Skip metadata files
+			[[ "$file" == *.json ]] && continue
+			download_images_ret_files+=("$file")
+			echo "Downloaded image: $file"
+			
+			# Extract caption from metadata if available
+			local file_caption=""
+			local meta="${file}.json"
+			if [ ! -f "$meta" ]; then
+				meta="${file%.*}.json"
+			fi
+			if [ -f "$meta" ] && [ "$APPEND_ORIGINAL_COMMENT" -eq 1 ]; then
+				local caption=$(jq -r '.caption // empty' "$meta" 2>/dev/null | sed 's/^"\|"$//g')
+				if [ -n "$caption" ]; then
+					if [ -n "$DESCRIPTION_CANDIDATE" ]; then
+						file_caption="${DESCRIPTION_CANDIDATE}"$'\n\n'"${caption}"
+					else
+						file_caption="${caption}"
+					fi
+				elif [ -n "$DESCRIPTION_CANDIDATE" ]; then
+					file_caption="$DESCRIPTION_CANDIDATE"
+				fi
+			elif [ -n "$DESCRIPTION_CANDIDATE" ]; then
+				file_caption="$DESCRIPTION_CANDIDATE"
+			fi
+			download_images_ret_captions+=("$file_caption")
+		done
+		
+		if [ -z "$SOURCE_CANDIDATE" ]; then
+			download_images_ret_source="$PROCESSED_URL"
+		fi
+		download_images_ret_success=0
+	else
+		# Only cleanup if this is not the pre-downloaded directory (which will be cleaned up later)
+		if [ "$IMAGES_TMPDIR" != "$PRE_DOWNLOADED_DIR" ] || [ -z "$PRE_DOWNLOADED_DIR" ]; then
+			rm -rf "$IMAGES_TMPDIR"
+		fi
+		fi
+}
+
+# Function to clean up source URL by removing problematic parameters
+# Parameters:
+#   $1: SOURCE_URL - URL to clean up
+# Returns cleaned URL via stdout
+cleanup_source_url() {
+	local SOURCE_URL="$1"
+	
+	# remove param idorvanity= first, since it breaks gallery-dl
+	if [[ "$SOURCE_URL" =~ [?\&]idorvanity=[0-9]+ ]]; then
+		SOURCE_URL=$(echo "$SOURCE_URL" | sed -E 's/[?&]idorvanity=[0-9]+//')
+	fi
+	# remove param __cft__[0]= if present
+	if [[ "$SOURCE_URL" =~ [?\&]__cft__\[0\]=[^\&]+ ]]; then
+		SOURCE_URL=$(echo "$SOURCE_URL" | sed -E 's/[?&]__cft__\[0\]=[^&]+//')
+	fi
+	# remove param __tn__= if present
+	if [[ "$SOURCE_URL" =~ [?\&]__tn__=[^\&]+ ]]; then
+		SOURCE_URL=$(echo "$SOURCE_URL" | sed -E 's/[?&]__tn__=[^&]+//')
+	fi
+	
+	echo "$SOURCE_URL"
 }
 
 # Function to display usage information
@@ -59,23 +402,6 @@ usage() {
 	echo
 }
 
-to_kind_one() {
-	echo "$1" | jq -c '
-		.kind = 1
-		| del(.id, .sig, .created_at, .pubkey)
-		| .tags = [ .tags[] | select(.[0] != "nonce" and .[0] != "d") ]
-		| (
-			.urls = (
-				[ .tags[] | select(.[0] == "imeta") | .[1:][] | select(startswith("url ")) | ltrimstr("url ") ]
-			)
-		)
-		| .content = (
-			(if (.urls | length > 0) then (.urls | join(" ") + "\n\n") else "" end)
-			+ (.content // "")
-		)
-		| del(.urls)
-	' 2>/dev/null
-}
 
 # Check if help option is provided
 for arg in "$@"; do
@@ -100,8 +426,6 @@ fi
 
 # default values, override if exists in ~/.nostr/${SCRIPT_NAME%.*}
 DISPLAY_SOURCE="${DISPLAY_SOURCE:-0}"
-USE_KIND_ONE="${USE_KIND_ONE:-0}"
-USE_OLAS="${USE_OLAS:-1}"
 POW_DIFF="${POW_DIFF:-20}"
 APPEND_ORIGINAL_COMMENT="${APPEND_ORIGINAL_COMMENT:-1}"
 USE_COOKIES_FF="${USE_COOKIES_FF:-0}"
@@ -138,8 +462,7 @@ if [ "x$1" == "x" ]; then
 fi
 
 # parse command line params
-IMAGE_FILES=()
-VIDEO_FILE=""
+ALL_MEDIA_FILES=()
 DESCRIPTION=""
 SOURCE=""
 CONVERT_VIDEO="${CONVERT_VIDEO:-1}"
@@ -151,24 +474,29 @@ while (( "$#" )); do
 	PARAM=$(echo "$PARAM" | tr -d '\r\n\t' | sed 's/[[:space:]]\+$//')
 	if [ -f "$PARAM" ]; then
 		MIME_TYPE=$(file --mime-type -b "$PARAM")
-		if [[ "$MIME_TYPE" == image/* ]]; then
-			IMAGE_FILES+=("$PARAM")
-		elif [[ "$MIME_TYPE" == video/* ]]; then
-			VIDEO_FILE="$PARAM"
-			# params was used, shift before breaking
-			shift
-			break
+		if [[ "$MIME_TYPE" == image/* || "$MIME_TYPE" == video/* ]]; then
+			ALL_MEDIA_FILES+=("$PARAM")
 		else
 			echo "Unsupported file type: $PARAM => $MIME_TYPE"
 			exit 1
 		fi
 	elif [[ "$PARAM" =~ ^https?:// ]]; then
+		# Check if this contains multiple URLs (space-separated)
+		if [[ "$PARAM" =~ https?://.*[[:space:]]+https?:// ]]; then
+			# Contains multiple URLs, split and add each one
+			while read -r url; do
+				if [[ "$url" =~ ^https?:// ]]; then
+					# Remove ?utm_source=ig_web_copy_link if present at the end of the URL
+					url=$(echo "$url" | sed 's/\?utm_source=ig_web_copy_link$//')
+					ALL_MEDIA_FILES+=("$url")
+				fi
+			done <<< "$(echo "$PARAM" | grep -oE 'https?://[^[:space:]]+' || echo "$PARAM")"
+		else
+			# Single URL
 		# Remove ?utm_source=ig_web_copy_link if present at the end of the URL
 		PARAM=$(echo "$PARAM" | sed 's/\?utm_source=ig_web_copy_link$//')
-		VIDEO_FILE="$PARAM"
-		# params was used, shift before breaking
-		shift
-		break
+			ALL_MEDIA_FILES+=("$PARAM")
+		fi
 	elif [[ "$PARAM" == "--convert" || "$PARAM" == "-convert" ]]; then
 		CONVERT_VIDEO=1
 	elif [[ "$PARAM" == "--noconvert" || "$PARAM" == "-noconvert" ]]; then
@@ -179,14 +507,6 @@ while (( "$#" )); do
 		POW_DIFF=0
 	elif [[ "$PARAM" == "--nocheck" || "$PARAM" == "-nocheck" ]]; then
 		DISABLE_HASH_CHECK=1
-	elif [[ "$PARAM" == "--kind1" || "$PARAM" == "-kind1" ]]; then
-		USE_KIND_ONE=1
-	elif [[ "$PARAM" == "--nokind1" || "$PARAM" == "-nokind1" ]]; then
-		USE_KIND_ONE=0
-	elif [[ "$PARAM" == "--olas" || "$PARAM" == "-olas" ]]; then
-		USE_OLAS=1
-	elif [[ "$PARAM" == "--noolas" || "$PARAM" == "-noolas" ]]; then
-		USE_OLAS=0
 	elif [[ "$PARAM" == "--comment" || "$PARAM" == "-comment" ]]; then
 		APPEND_ORIGINAL_COMMENT=1
 	elif [[ "$PARAM" == "--nocomment" || "$PARAM" == "-nocomment" ]]; then
@@ -222,27 +542,11 @@ while (( "$#" )); do
 	shift
 done
 
-# Check if at least one image or video file is provided
-if [ ${#IMAGE_FILES[@]} -eq 0 ] && [ -z "$VIDEO_FILE" ]; then
+# Check if at least one media file is provided
+if [ ${#ALL_MEDIA_FILES[@]} -eq 0 ]; then
 	echo "No image or video file provided"
 	exit 1
 fi
-
-# Check if more than one video file is provided
-if [ ${#IMAGE_FILES[@]} -gt 0 ] && [ -n "$VIDEO_FILE" ]; then
-	echo "${#IMAGE_FILES[@]} image files and one video file provided '$VIDEO_FILE'"
-	echo "Only one video file can be processed"
-	exit 1
-fi
-
-# Remove processed files from the params list
-NUM_IMAGE_FILES=${#IMAGE_FILES[@]}
-NUM_VIDEO_FILES=0
-if [ -n "$VIDEO_FILE" ]; then
-	NUM_VIDEO_FILES=1
-fi
-# already shifted
-# shift $(( NUM_IMAGE_FILES + NUM_VIDEO_FILES ))
 
 # The remaining params are description and source
 # if there is another param, its description candidate
@@ -261,32 +565,34 @@ if [ $# -gt 0 ]; then
 	exit 1
 fi
 
-# Check if the video file name is present in the history file
-if [ -n "$VIDEO_FILE" ]; then
-	TMP_VIDEO_FILE=$(echo "$VIDEO_FILE" | tr -d '\r\n')
-	# remove url params from the video file but only if from instagram
-	if [[ "$TMP_VIDEO_FILE" =~ ^https?://.*instagram\.com/.* ]]; then
-		TMP_VIDEO_FILE=$(echo "$TMP_VIDEO_FILE" | sed 's/\?.*//')
-	fi
-	ORIGINAL_VIDEO_FILE="$TMP_VIDEO_FILE"
-	# remove trailing "/" from VIDEO_FILE if it exists
-	TMP_VIDEO_FILE=$(echo "$TMP_VIDEO_FILE" | sed 's:/*$::')
-	VIDEO_FILE_NAME=$(basename "$TMP_VIDEO_FILE")
+# Check if the file names are present in the history file
+ORIGINAL_URLS=()
+for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
+	if [[ "$MEDIA_FILE" =~ ^https?:// ]]; then
+		# It's a URL
+		TMP_FILE=$(echo "$MEDIA_FILE" | tr -d '\r\n')
+		# remove url params from the file but only if from instagram
+		if [[ "$TMP_FILE" =~ ^https?://.*instagram\.com/.* ]]; then
+			TMP_FILE=$(echo "$TMP_FILE" | sed 's/\?.*//')
+		fi
+		ORIGINAL_URLS+=("$TMP_FILE")
+		# remove trailing "/" from FILE if it exists
+		TMP_FILE=$(echo "$TMP_FILE" | sed 's:/*$::')
+		FILE_NAME=$(basename "$TMP_FILE")
 	if [ $DISABLE_HASH_CHECK -eq 0 ]; then
-		if grep -q "$VIDEO_FILE_NAME" "$HISTORY_FILE"; then
-			echo "Video file name already processed: $VIDEO_FILE_NAME"
+			if grep -q "$FILE_NAME" "$HISTORY_FILE"; then
+				echo "File name already processed: $FILE_NAME"
 			exit 1
 		fi
 	fi
-fi
-
-# Check if the image file names are present in the history file
-for IMAGE_FILE in "${IMAGE_FILES[@]}"; do
-	IMAGE_FILE_NAME=$(basename "$IMAGE_FILE")
+	else
+		# It's a local file
+		FILE_NAME=$(basename "$MEDIA_FILE")
 	if [ $DISABLE_HASH_CHECK -eq 0 ]; then
-		if grep -q "$IMAGE_FILE_NAME" "$HISTORY_FILE"; then
-			echo "Image file name already processed: $IMAGE_FILE_NAME"
+			if grep -q "$FILE_NAME" "$HISTORY_FILE"; then
+				echo "File name already processed: $FILE_NAME"
 			exit 1
+			fi
 		fi
 	fi
 done
@@ -345,240 +651,177 @@ if [ -z "$KEY" ]; then
 	exit 1
 fi
 
-# if it's an url from facebook, download the video
-if [ -n "$VIDEO_FILE" ]; then
-	if [[ "$VIDEO_FILE" == https://*.facebook.com/* || "$VIDEO_FILE" == https://facebook.com/* || \
-			"$VIDEO_FILE" == https://*.fb.watch/* || "$VIDEO_FILE" == https://fb.watch/* || \
-			"$VIDEO_FILE" == https://*.x.com/* || "$VIDEO_FILE" == https://x.com/* || \
-			"$VIDEO_FILE" == https://*.threads.com/* || "$VIDEO_FILE" == https://threads.com/* || \
-			"$VIDEO_FILE" == https://*.instagram.com/* || "$VIDEO_FILE" == https://instagram.com/* || \
-			"$VIDEO_FILE" == https://*.tiktok.com/* || "$VIDEO_FILE" == https://tiktok.com/* || \
-			"$VIDEO_FILE" == https://*.douyin.com/* || "$VIDEO_FILE" == https://douyin.com/* || \
-			"$VIDEO_FILE" == https://*.bilibili.com/* || "$VIDEO_FILE" == https://bilibili.com/* || \
-			"$VIDEO_FILE" == https://*.youtube.com/* || "$VIDEO_FILE" == https://youtube.com/* || \
-			"$VIDEO_FILE" == https://*.youtu.be/* || "$VIDEO_FILE" == https://youtu.be/* || \
-			"$VIDEO_FILE" == https://*.y2meta.com/* || "$VIDEO_FILE" == https://y2meta.com/* || \
-			"$VIDEO_FILE" == https://*.y2meta.to/* || "$VIDEO_FILE" == https://y2meta.to/* || \
-			"$VIDEO_FILE" == https://*.y2meta.net/* || "$VIDEO_FILE" == https://y2meta.net/* || \
-			"$VIDEO_FILE" == https://*.y2meta.org/* || "$VIDEO_FILE" == https://y2meta.org/* || \
-			"$VIDEO_FILE" == https://*.y2meta.io/* || "$VIDEO_FILE" == https://y2meta.io/* || \
-			"$VIDEO_FILE" == https://*.y2meta.tv/* || "$VIDEO_FILE" == https://y2meta.tv/* || \
-			"$VIDEO_FILE" == https://*.youtube.com/* || "$VIDEO_FILE" == https://youtube.com/* ]]; then
-		# generate temp filename for file download
-		FILE_BASE=$(mktemp)
-		FILE_BASE_INT=$(mktemp)
-		OUT_FILE_INT=${FILE_BASE_INT}.mp4
-		OUT_FILE=${FILE_BASE}.mp4
-		DESC_FILE=${FILE_BASE_INT}.description
-		echo "Downloading reels to $OUT_FILE"
-		WINFILE_INT=$(cygpath -w "$OUT_FILE_INT")
-		WINFILE=$(cygpath -w "$OUT_FILE")
-		FORMATS='bestvideo[codec^=hevc]+bestaudio/bestvideo[codec^=avc]+bestaudio/best[codec^=hevc]/best[codec^=avc]/bestvideo+bestaudio/best'
-		if [ $CONVERT_VIDEO -eq 0 ]; then
-			FORMATS='bestvideo[codec^=hevc]+bestaudio/bestvideo[codec^=avc]+bestaudio/best[codec^=hevc]/best[codec^=avc]/best'
-		fi
-		YT_DLP_OPTS=()
+# Prepare gallery-dl params
+GALLERY_DL_PARAMS=()
 		if [ "$USE_COOKIES_FF" -eq 1 ]; then
-			YT_DLP_OPTS+=(--cookies-from-browser firefox)
-		fi
-		/usr/local/bin/yt-dlp "${YT_DLP_OPTS[@]}" "$VIDEO_FILE" -f "$FORMATS" -S ext:mp4:m4a --merge-output-format mp4 --write-description -o "$WINFILE_INT"
-		if [ $? -ne 0 ]; then
-			ALT_SCRIPT="${SCRIPT_NAME%.*}img.sh"
-			if [ -x "$SCRIPT_DIR/$ALT_SCRIPT" ]; then
-				echo "Using alternative script $ALT_SCRIPT to download"
-				ALT_OPTS=()
-				if [ "$USE_COOKIES_FF" -eq 1 ]; then
-					ALT_OPTS+=(-firefox)
-				fi
-				if [ "$PROPAGATE_BLOSSOM" -eq 1 ]; then
-					ALT_OPTS+=(-blossom "${BLOSSOMS[@]}")
-				fi
-				if [ "$APPEND_ORIGINAL_COMMENT" -eq 0 ]; then
-					ALT_OPTS+=(-nocomment)
-				fi
-				if [ "$DISPLAY_SOURCE" -eq 0 ]; then
-					ALT_OPTS+=(-nosource)
-				fi
-				if [ "$SEND_TO_RELAY" -eq 0 ]; then
-					ALT_OPTS+=(-norelay)
-				fi
-				# Add custom caption if provided
-				if [ -n "$DESCRIPTION_CANDIDATE" ]; then
-					echo "$SCRIPT_DIR/$ALT_SCRIPT" "${ALT_OPTS[@]}" -key "$KEY" "$VIDEO_FILE" "$DESCRIPTION_CANDIDATE"
-					"$SCRIPT_DIR/$ALT_SCRIPT" "${ALT_OPTS[@]}" -key "$KEY" "$VIDEO_FILE" "$DESCRIPTION_CANDIDATE"
-				else
-					echo "$SCRIPT_DIR/$ALT_SCRIPT" "${ALT_OPTS[@]}" -key "$KEY" "$VIDEO_FILE"
-					"$SCRIPT_DIR/$ALT_SCRIPT" "${ALT_OPTS[@]}" -key "$KEY" "$VIDEO_FILE"
-				fi
-				if [ $? -ne 0 ]; then
-					die "Failed to download video from $VIDEO_FILE"
-				fi
-				exit 0
-			else
-				die "Failed to download video from $VIDEO_FILE"
-			fi
-		fi
-		if [ -f "$DESC_FILE" ] && [ $APPEND_ORIGINAL_COMMENT -eq 1 ]; then
-			echo "Reading description from $DESC_FILE"
-			if [ -n "$DESCRIPTION_CANDIDATE" ]; then
-				DESCRIPTION_CANDIDATE="$DESCRIPTION_CANDIDATE"$'\n\n'$(cat "$DESC_FILE")
-			else
-				DESCRIPTION_CANDIDATE=$(cat "$DESC_FILE")
-			fi
-			rm -f "$DESC_FILE"
-		fi
-		if [ -z "$SOURCE_CANDIDATE" ]; then
-			SOURCE_CANDIDATE="$VIDEO_FILE"
-		fi
-		# Calculate the sha256 hash of the downloaded file
-		DOWNLOADED_FILE_HASH=$(sha256sum "$OUT_FILE_INT" | awk '{print $1}')
-		echo "SHA256 hash of the downloaded file: $DOWNLOADED_FILE_HASH"
-		if grep -q "$DOWNLOADED_FILE_HASH" "$HISTORY_FILE"; then
-			die "File hash already processed: $IMAGE_FILE"
-		fi
-		# Detect the video codec
-		VIDEO_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$WINFILE_INT")
-		# Remove carriage return characters from the video codec
-		VIDEO_CODEC=$(echo "$VIDEO_CODEC" | tr -d '\r')
-		echo "Video codec: '$VIDEO_CODEC'"
-		# Check if the video codec is h264 or h265
-		if [ "$VIDEO_CODEC" != "h264" ] && [ "$VIDEO_CODEC" != "hevc" ]; then
-			if [ $CONVERT_VIDEO -eq 1 ]; then
-				echo "Converting $OUT_FILE_INT to iOS compatible format"
-				# Get the average bitrate directly from the video
-				BITRATE=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "$WINFILE_INT")
-				# Remove carriage return from BITRATE
-				BITRATE=$(echo "$BITRATE" | tr -d '\r')
-				# Remove non-numeric characters from BITRATE
-				BITRATE=$(echo "$BITRATE" | tr -cd '[:digit:]')
-				echo "Bitrate: '$BITRATE'"
+	GALLERY_DL_PARAMS+=(--cookies-from-browser firefox)
+fi
+GALLERY_DL_PARAMS+=(--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0")
 
-				# Check if BITRATE is a number
-				if ! [[ "$BITRATE" =~ ^[0-9]+$ ]]; then
-					die "Invalid bitrate: '$BITRATE'"
-				fi
-
-				# Use the calculated bitrate for the conversion
-				H264_BITRATE=$((BITRATE * 2))
-				ffmpeg -y -i "$WINFILE_INT" -c:v h264_qsv -b:v "${H264_BITRATE}" -preset slow -pix_fmt nv12 -movflags +faststart -c:a copy "$WINFILE"
-				if [ $? -ne 0 ]; then
-					echo "Failed to convert file, trying with libx265"
-					H265_BITRATE=$((BITRATE * 3 / 2))
-					ffmpeg -y -i "$WINFILE_INT" -c:v libx265 -b:v "${H265_BITRATE}" -preset ultrafast -c:a copy -movflags +faststart -tag:v hvc1 "$WINFILE" || die "Failed to convert file"
-				fi
-			else
-				die "Video codec is not h264 or hevc and conversion is disabled, cannot process the file"
+# Process all media files - download URLs if needed, keep local files
+PROCESSED_FILES=()
+FILE_CAPTIONS=()
+FILE_SOURCES=()
+FILE_GALLERIES=()  # Track which gallery/media item each file belongs to
+GALLERY_ID=0
+	for MEDIA_ITEM in "${ALL_MEDIA_FILES[@]}"; do
+	if [[ "$MEDIA_ITEM" =~ ^https?:// ]]; then
+		# It's a URL - try to download as video first, then as image
+		echo "Processing URL: $MEDIA_ITEM"
+		
+		# Prepare gallery-dl params as string for passing to function
+		GALLERY_DL_PARAMS_STR=$(printf '%q ' "${GALLERY_DL_PARAMS[@]}")
+		
+		# Try video download first for any URL
+		# Initialize return variables
+		download_video_ret_files=()
+		download_video_ret_captions=()
+		download_video_ret_source=""
+		download_video_ret_success=1
+		
+		download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
+		VIDEO_DOWNLOAD_RESULT="${download_video_ret_success:-1}"
+		
+		# If video download succeeded, use its return values
+		if [ "$VIDEO_DOWNLOAD_RESULT" -eq 0 ]; then
+			# Append downloaded files and captions to parallel arrays
+			if [ ${#download_video_ret_files[@]} -gt 0 ]; then
+				idx=0
+				for file in "${download_video_ret_files[@]}"; do
+					PROCESSED_FILES+=("$file")
+					if [ $idx -lt ${#download_video_ret_captions[@]} ]; then
+						FILE_CAPTIONS+=("${download_video_ret_captions[$idx]}")
+					else
+						FILE_CAPTIONS+=("")
+					fi
+					FILE_GALLERIES+=("$GALLERY_ID")
+					((idx++))
+				done
 			fi
-			VIDEO_FILE="$OUT_FILE"
+			# Update source if provided
+			if [ -n "$download_video_ret_source" ]; then
+				cleaned_source=$(cleanup_source_url "$download_video_ret_source")
+				FILE_SOURCES+=("$cleaned_source")
+			fi
+			((GALLERY_ID++))
 		else
-			VIDEO_FILE="$OUT_FILE_INT"
+			# If video download failed, try image download with gallery-dl
+			echo "Video download failed, trying gallery-dl for images"
+			# Initialize return variables
+			download_images_ret_files=()
+			download_images_ret_captions=()
+			download_images_ret_source=""
+			download_images_ret_success=1
+			
+			# Call download_images function (Facebook URL handling is done inside)
+			download_images "$MEDIA_ITEM" "$GALLERY_DL_PARAMS_STR" "$APPEND_ORIGINAL_COMMENT" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
+			IMAGE_DOWNLOAD_RESULT="${download_images_ret_success:-1}"
+			
+			if [ "$IMAGE_DOWNLOAD_RESULT" -eq 0 ]; then
+				# For gallery images, all files from same gallery share the same gallery ID and caption
+				# Use the first caption (they should all be the same or similar for gallery downloads)
+				gallery_caption=""
+				if [ ${#download_images_ret_captions[@]} -gt 0 ]; then
+					# Use first non-empty caption, or first caption if all empty
+					for cap in "${download_images_ret_captions[@]}"; do
+						if [ -n "$cap" ]; then
+							gallery_caption="$cap"
+							break
+						fi
+					done
+					if [ -z "$gallery_caption" ] && [ -n "${download_images_ret_captions[0]}" ]; then
+						gallery_caption="${download_images_ret_captions[0]}"
+					fi
+				fi
+				
+				# Append downloaded files to parallel arrays - all from same gallery
+				if [ ${#download_images_ret_files[@]} -gt 0 ]; then
+					current_gallery_id=$GALLERY_ID
+					for file in "${download_images_ret_files[@]}"; do
+						PROCESSED_FILES+=("$file")
+						# For gallery images, store caption once per gallery (will be used after all URLs)
+						FILE_CAPTIONS+=("")
+						FILE_GALLERIES+=("$current_gallery_id")
+					done
+					# Store gallery caption in the last file's position (we'll handle it differently during content building)
+					if [ ${#PROCESSED_FILES[@]} -gt 0 ] && [ -n "$gallery_caption" ]; then
+						last_idx=$((${#PROCESSED_FILES[@]} - 1))
+						FILE_CAPTIONS[$last_idx]="$gallery_caption"
+					fi
+				fi
+				# Update source if provided
+				if [ -n "$download_images_ret_source" ]; then
+					cleaned_source=$(cleanup_source_url "$download_images_ret_source")
+					FILE_SOURCES+=("$cleaned_source")
+				fi
+				((GALLERY_ID++))
+			else
+				die "Failed to download from URL: $MEDIA_ITEM"
+			fi
 		fi
-		echo "Downloaded reels to '$VIDEO_FILE' with description '$DESCRIPTION_CANDIDATE'"
-	fi
-	# at this point i need an existing file
-	if [ ! -f "$VIDEO_FILE" ]; then
-			echo "file does not exist"
-			exit 1
-	fi
-fi
-
-if [ -z "${DESCRIPTION// }" ]; then
-	DESCRIPTION="$DESCRIPTION_CANDIDATE"
-fi
-
-if [ $DISPLAY_SOURCE -eq 1 ]; then
-	if [ -n "$SOURCE_CANDIDATE" ]; then
-		if [ -n "$DESCRIPTION" ]; then
-			DESCRIPTION="${DESCRIPTION}"$'\n\n'"Source: $SOURCE_CANDIDATE"
-		else
-			DESCRIPTION="Source: $SOURCE_CANDIDATE"
+	else
+		# It's a local file
+		if [ ! -f "$MEDIA_ITEM" ]; then
+			die "File does not exist: $MEDIA_ITEM"
 		fi
+		PROCESSED_FILES+=("$MEDIA_ITEM")
+		FILE_CAPTIONS+=("")
+		FILE_GALLERIES+=("$GALLERY_ID")
+		((GALLERY_ID++))
+		echo "Using local file: $MEDIA_ITEM"
 	fi
-fi
+done
+
 
 # Create an array to store file hashes
 FILE_HASHES=()
 if [ $DISABLE_HASH_CHECK -eq 0 ]; then
-	if [ ${#IMAGE_FILES[@]} -eq 0 ]; then
-		for FILE in "$OUT_FILE" "$OUT_FILE_INT"; do
-			if [ -n "$FILE" ] && [ -f "$FILE" ]; then
+	# Process all processed files
+	for FILE in "${PROCESSED_FILES[@]}"; do
+		if [ -f "$FILE" ]; then
 				# Calculate file hash
 				FILE_HASH=$(sha256sum "$FILE" | awk '{print $1}')
 				# Check if file hash exists in history file
 				if grep -q "$FILE_HASH" "$HISTORY_FILE"; then
 					die "File hash already processed: $FILE"
-				fi
-				FILE_HASHES+=("$FILE_HASH")
-			fi
-		done 
-	else
-		# If there are additional image files, process them
-		for IMAGE_FILE in "${IMAGE_FILES[@]}"; do
-			# Calculate file hash
-			FILE_HASH=$(sha256sum "$IMAGE_FILE" | awk '{print $1}')
-			# Check if file hash exists in history file
-			if grep -q "$FILE_HASH" "$HISTORY_FILE"; then
-				die "File hash already processed: $IMAGE_FILE"
 			fi
 			# Add file hash to the array
 			FILE_HASHES+=("$FILE_HASH")
-		done
-	fi
-fi
-# file type already checked, just check if the file array is empty
-TEMPFILE=$(mktemp)
-WINTEMP=$(cygpath -w "$TEMPFILE")
-
-# Write the relays to the tempfile in JSON format
-echo -n '[' > "$TEMPFILE"
-for RELAY in $RELAYS; do
-	echo -n "\"$RELAY\"," >> "$TEMPFILE"
-done
-# Remove the last comma and close the JSON array
-sed -i '$ s/,$//' "$TEMPFILE"
-echo ']' >> "$TEMPFILE"
-
-USE_LEGACY=0
-WINFILES=()
-if [ ${#IMAGE_FILES[@]} -gt 0 ]; then
-	CLI_TOOL="nip68-cli"
-	for IMAGE_FILE in "${IMAGE_FILES[@]}"; do
-		IMAGE_FILE_WIN=$(cygpath -w "$IMAGE_FILE")
-		WINFILES+=("$IMAGE_FILE_WIN")
+		fi
 	done
-else
-	CLI_TOOL="nip71-cli"
-	USE_LEGACY=1
-	WINFILES+=("$(cygpath -w "$VIDEO_FILE")")
 fi
 
-CMD=("$CLI_TOOL")
-# for FILE in "${WINFILES[@]}"; do
-#     CMD+=("-file" "$FILE")
-# done
-CMD+=("-key" "$KEY")
-if [ "$SEND_TO_RELAY" -eq 1 ]; then
-	# only send to relays if its for olas.
-	if [ $USE_OLAS -eq 1 ]; then
-		CMD+=("-r" "$WINTEMP")
-	fi
+if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
+	die "No files to upload"
 fi
-if [ "x$DESCRIPTION" != "x" ]; then
-	CMD+=("-description" "$DESCRIPTION")
-fi
-# force pow to zero on nopow
-CMD+=("-diff" "$POW_DIFF")
 
+# Upload all files via blossom and collect URLs
+UPLOAD_URLS=()
 RESULT=0
+upload_success=0
+
 for TRIES in "${!BLOSSOMS[@]}"; do
 	BLOSSOM="${BLOSSOMS[$TRIES]}"
 	echo "Using blossom: $BLOSSOM, try: $((TRIES+1))"
-	for FILE in "${WINFILES[@]}"; do
-		upload_output=$(nak blossom upload --server "$BLOSSOM" "$FILE" "--sec" "$KEY")
+	
+	UPLOAD_URLS=()
+	upload_success=1
+	
+	idx=0
+	for FILE in "${PROCESSED_FILES[@]}"; do
+		FILE_WIN=$(cygpath -w "$FILE")
+		if [ ! -f "$FILE" ]; then
+			echo "File does not exist: $FILE"
+			upload_success=0
+			break
+		fi
+		
+		echo "Uploading $FILE to $BLOSSOM"
+		upload_output=$(nak blossom upload --server "$BLOSSOM" "$FILE_WIN" "--sec" "$KEY")
 		RESULT=$?
 		if [ $RESULT -ne 0 ] ; then
 			echo "Failed to upload file $FILE to $BLOSSOM with nak, trying with blossom-cli"
-			upload_output=$(blossom-cli upload -file "$FILE" -server "$BLOSSOM" -privkey "$KEY")
+			upload_output=$(blossom-cli upload -file "$FILE_WIN" -server "$BLOSSOM" -privkey "$KEY" 2>/dev/null)
 			RESULT=$?
 		fi
 		if [ $RESULT -ne 0 ]; then
@@ -586,9 +829,16 @@ for TRIES in "${!BLOSSOMS[@]}"; do
 			upload_success=0
 			break
 		fi
-		upload_success=1
+		
 		file_url=$(echo "$upload_output" | jq -r '.url')
-		CMD+=("-url" "$file_url")
+		if [ -z "$file_url" ] || [ "$file_url" == "null" ]; then
+			echo "Failed to extract URL from upload output: $upload_output"
+			upload_success=0
+			break
+		fi
+		UPLOAD_URLS+=("$file_url")
+		echo "Uploaded to: $file_url"
+		((idx++))
 	done
 
 	if [ $upload_success -eq 0 ]; then
@@ -596,56 +846,224 @@ for TRIES in "${!BLOSSOMS[@]}"; do
 		continue
 	fi
 
-	FULL_CMD=("${CMD[@]}")
-	#FULL_CMD+=("-blossom" "$BLOSSOM")
-	# only use legacy for videos
-	if [ $USE_LEGACY -eq 1 ]; then
-		FULL_CMD+=("-legacy")
+	# Build content for kind 1 event: interleaved URL -> caption -> URL -> caption, then sources at bottom
+	# For gallery images: all URLs first, then caption for the gallery
+	# Formatting: empty line after images before caption, 2 empty lines after caption before next URL
+	CONTENT=""
+	
+	# Interleave URLs and captions
+	if [ ${#UPLOAD_URLS[@]} -gt 0 ]; then
+		idx=0
+		current_gallery_id=""
+		gallery_caption=""
+		gallery_count=0
+		last_idx_in_gallery=-1
+		need_space_before_url=0  # Track if we need spacing before adding next URL
+		
+		while [ $idx -lt ${#UPLOAD_URLS[@]} ]; do
+			url="${UPLOAD_URLS[$idx]}"
+			gallery_id=""
+			if [ $idx -lt ${#FILE_GALLERIES[@]} ]; then
+				gallery_id="${FILE_GALLERIES[$idx]}"
+			fi
+			
+			# Check if this is a new gallery (and not the first item)
+			if [ -n "$current_gallery_id" ] && [ "$gallery_id" != "$current_gallery_id" ]; then
+				# End of previous gallery - add its caption if available (multi-image gallery)
+				# Note: This should have been handled when we processed the last item of the previous gallery
+				# But if we missed it, handle it here
+				if [ $gallery_count -gt 1 ] && [ -n "$gallery_caption" ]; then
+					# Empty line after images, before caption
+					CONTENT="${CONTENT}"$'\n'"${gallery_caption}"
+					need_space_before_url=1  # Need 2 empty lines after caption before next URL
+				fi
+				gallery_caption=""
+				gallery_count=0
+				last_idx_in_gallery=-1
+			fi
+			
+			# Check if this is start of a new gallery or a single file
+			if [ "$current_gallery_id" != "$gallery_id" ]; then
+				current_gallery_id="$gallery_id"
+				# Count how many files belong to this gallery
+				gallery_count=0
+				for check_idx in $(seq $idx $((${#UPLOAD_URLS[@]} - 1))); do
+					check_gallery=""
+					if [ $check_idx -lt ${#FILE_GALLERIES[@]} ]; then
+						check_gallery="${FILE_GALLERIES[$check_idx]}"
+					fi
+					if [ "$check_gallery" = "$gallery_id" ]; then
+						((gallery_count++))
+					else
+						break
+					fi
+				done
+				last_idx_in_gallery=$((idx + gallery_count - 1))
+				
+				# If multiple files in gallery, collect all captions
+				if [ $gallery_count -gt 1 ]; then
+					# Accumulate all captions from all files in the gallery
+					gallery_caption=""
+					caption_count=0
+					for cap_idx in $(seq $idx $last_idx_in_gallery); do
+						if [ $cap_idx -lt ${#FILE_CAPTIONS[@]} ] && [ -n "${FILE_CAPTIONS[$cap_idx]}" ]; then
+							if [ $caption_count -eq 0 ]; then
+								gallery_caption="${FILE_CAPTIONS[$cap_idx]}"
+							else
+								# Add blank line between captions (two newlines = one blank line)
+								gallery_caption="${gallery_caption}"$'\n\n'"${FILE_CAPTIONS[$cap_idx]}"
+							fi
+							((caption_count++))
+						fi
+					done
+				else
+					# Single file - caption goes immediately after URL
+					gallery_caption=""
+				fi
+			fi
+			
+			# Add spacing before URL if needed (2 empty lines after previous caption)
+			# Three newlines = caption + newline + empty line + empty line + URL
+			if [ $need_space_before_url -eq 1 ]; then
+				CONTENT="${CONTENT}"$'\n\n\n'
+				need_space_before_url=0
+			fi
+			
+			# Add URL
+			if [ -n "$CONTENT" ]; then
+				CONTENT="${CONTENT}"$'\n'"${url}"
+			else
+				CONTENT="${url}"
+			fi
+			
+			# Check if we're at the last item in a gallery - add caption after all gallery URLs
+			if [ $gallery_count -gt 1 ] && [ $idx -eq $last_idx_in_gallery ]; then
+				# This is the last URL in the gallery
+				# Check if there's a next item - we'll need spacing before it
+				if [ $((idx + 1)) -lt ${#UPLOAD_URLS[@]} ]; then
+					if [ -n "$gallery_caption" ]; then
+						# Empty line after images, before caption (two newlines = one empty line)
+						CONTENT="${CONTENT}"$'\n\n'"${gallery_caption}"
+						need_space_before_url=1  # Need 2 empty lines after caption before next URL
+					else
+						# No caption, but still need 2 empty lines before next URL
+						need_space_before_url=1
+					fi
+				else
+					# No next item, just add caption if available
+					if [ -n "$gallery_caption" ]; then
+						# Empty line after images, before caption (two newlines = one empty line)
+						CONTENT="${CONTENT}"$'\n\n'"${gallery_caption}"
+					fi
+				fi
+			fi
+			
+			# For single files (not galleries), add caption immediately after URL
+			if [ $gallery_count -eq 1 ]; then
+				if [ $idx -lt ${#FILE_CAPTIONS[@]} ] && [ -n "${FILE_CAPTIONS[$idx]}" ]; then
+					# Empty line after URL, before caption (two newlines = one empty line)
+					CONTENT="${CONTENT}"$'\n\n'"${FILE_CAPTIONS[$idx]}"
+					# Check if there's a next item
+					if [ $((idx + 1)) -lt ${#UPLOAD_URLS[@]} ]; then
+						need_space_before_url=1  # Need 2 empty lines after caption before next URL
+					fi
+				fi
+			fi
+			
+			((idx++))
+		done
 	fi
-	echo "${FULL_CMD[@]}"
-	OUTPUT=$("${FULL_CMD[@]}")
-	RESULT=$?
-	echo "$OUTPUT"
-	# if [ $USE_LEGACY -eq 1 ] && [ $RESULT -eq 0 ]; then
-	# 	FULL_CMD+=("-legacy")
-	# 	echo "${FULL_CMD[@]}"
-	# 	"${FULL_CMD[@]}"
-	# 	RESULT=$?
-	# fi
-	# use nak to publish KIND_ONE to all relays
-	if [ $USE_KIND_ONE -eq 1 ] && [ $RESULT -eq 0 ]; then
-		# Extract the event JSON from the output
-		EVENT_JSON="${OUTPUT#*\{}"
-		EVENT_JSON="${EVENT_JSON%%$'\n'*}"
-		EVENT_JSON="{${EVENT_JSON}"
-		KIND_ONE=$(to_kind_one "$EVENT_JSON") || die "Failed to convert to KIND_ONE"
-		if [ "$SEND_TO_RELAY" -eq 1 ]; then
-			echo "Publishing KIND_ONE to relays"
-			echo "$KIND_ONE" | nak event "--auth" -sec "$KEY" --pow "$POW_DIFF" $RELAYS
+	
+	# Add sources at the bottom (if any and if display_source is enabled)
+	if [ $DISPLAY_SOURCE -eq 1 ] && [ ${#FILE_SOURCES[@]} -gt 0 ]; then
+		if [ -n "$CONTENT" ]; then
+			# One empty line before sources section (two newlines = one empty line)
+			CONTENT="${CONTENT}"$'\n\n'
+		fi
+		
+		# Count non-empty sources
+		source_count=0
+		for source in "${FILE_SOURCES[@]}"; do
+			if [ -n "$source" ]; then
+				((source_count++))
+			fi
+		done
+		
+		if [ $source_count -eq 1 ]; then
+			# Only one source - use "Source: " prefix on same line
+			for source in "${FILE_SOURCES[@]}"; do
+				if [ -n "$source" ]; then
+					CONTENT="${CONTENT}Source: ${source}"
+					break
+				fi
+			done
 		else
-			echo "$KIND_ONE" | nak event -sec "$KEY" --pow "$POW_DIFF"
+			# Multiple sources - use "Sources:" on its own line, then each source with "- " prefix
+			CONTENT="${CONTENT}Sources:"
+			for source in "${FILE_SOURCES[@]}"; do
+				if [ -n "$source" ]; then
+					CONTENT="${CONTENT}"$'\n'"- ${source}"
+				fi
+			done
 		fi
 	fi
+
+	# Print content for debugging before creating event
+	echo "=== Event Content (Debug) ==="
+	echo "$CONTENT"
+	echo "=== End Event Content ==="
+
+	# Create kind 1 event with nak
+	echo "Creating kind 1 event with content length: ${#CONTENT}"
+	
+	NAK_CMD=("nak" "event" "--kind" "1" "-sec" "$KEY" "--pow" "$POW_DIFF")
+	if [ "$SEND_TO_RELAY" -eq 1 ]; then
+		NAK_CMD+=("--auth" "-sec" "$KEY")
+		for RELAY in $RELAYS; do
+			NAK_CMD+=("$RELAY")
+		done
+	fi
+	
+	if [ -n "$CONTENT" ]; then
+		NAK_CMD+=("--content" "$(echo -e "$CONTENT")")
+	else
+		NAK_CMD+=("--content" "")
+	fi
+	
+	echo "${NAK_CMD[@]}"
+	"${NAK_CMD[@]}"
+	RESULT=$?
+	
 	if [ $RESULT -eq 0 ]; then
+		echo "Successfully published kind 1 event"
 		break
+	else
+		echo "Failed to publish kind 1 event, trying next blossom server"
+		RESULT=1
 	fi
 done
 
 if [ $RESULT -ne 0 ]; then
-	die "Failed to process the file '$WINFILE' with $CLI_TOOL"
+	die "Failed to upload files and publish event"
 fi
 
-# Add the file hash to history file only if the CLI_TOOL command was successful
+# Add the file hash to history file only if the upload was successful
 # but only if sent to relays
-if [ "$SEND_TO_RELAY" -eq 1 ] && [ "$DISABLE_HASH_CHECK" -eq 0 ]; then
+if [ "$SEND_TO_RELAY" -eq 1 ] && [ "$DISABLE_HASH_CHECK" -eq 0 ] && [ $RESULT -eq 0 ]; then
 	for FILE_HASH in "${FILE_HASHES[@]}"; do
 		echo "$FILE_HASH" >> "$HISTORY_FILE"
 	done
-	if [ -n "$ORIGINAL_VIDEO_FILE" ]; then
-		echo "$ORIGINAL_VIDEO_FILE" >> "$HISTORY_FILE"
-	fi
-	for IMAGE_FILE in "${IMAGE_FILES[@]}"; do
-		echo "$IMAGE_FILE" >> "$HISTORY_FILE"
+	for ORIGINAL_URL in "${ORIGINAL_URLS[@]}"; do
+		echo "$ORIGINAL_URL" >> "$HISTORY_FILE"
+	done
+	for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
+		if [ ! -f "$MEDIA_FILE" ]; then
+			# It's a URL, already added to ORIGINAL_URLS
+			:
+		else
+			# It's a local file
+			echo "$MEDIA_FILE" >> "$HISTORY_FILE"
+		fi
 	done
 fi
 
