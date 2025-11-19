@@ -300,10 +300,19 @@ fi
 # bypass decrypting
 if [ -n "$NSEC_KEY" ]; then
 	echo "Using NSEC_KEY to decrypt the secret key"
-	KEY=$(nak decode $NSEC_KEY | jq -r .private_key)
+	DECODED=$(nak decode $NSEC_KEY)
 	if [ $? -ne 0 ]; then
 		echo "Failed to decrypt the key"
 		exit 1
+	fi
+	
+	# Check if the decoded output is JSON (starts with {) or a hex key
+	if echo "$DECODED" | grep -q '^{'; then
+		# It's JSON, extract the private_key field
+		KEY=$(echo "$DECODED" | jq -r .private_key)
+	else
+		# It's already a hex key, use it directly
+		KEY="$DECODED"
 	fi
 elif [ -n "$NCRYPT_KEY" ]; then
 	echo "Using NCRYPT_KEY to decrypt the secret key"

@@ -1,16 +1,97 @@
 #!/bin/bash
 
 usage () {
-    echo "Usage: $0 [file1] [file2] ... [comment]"
+    echo "Usage: $0 [--profile=PROFILE|-profile=PROFILE|-p=PROFILE] [file1] [file2] ... [comment]"
     echo "Uploads files to Blossom servers and creates a kind 1 event with the URLs."
     echo "Files can be specified as individual files or directories containing files."
     echo "The last argument is treated as a comment for the event."
+    echo ""
+    echo "Options:"
+    echo "  --profile=PROFILE    Use the specified profile from ~/.nostr/ (default: girino)"
+    echo "  -profile=PROFILE     Short form of --profile"
+    echo "  -p=PROFILE           Shortcut for -profile=PROFILE"
 }
 
-# Load environment variables from ~/.nostr/girino if it exists
-if [[ -f "$HOME/.nostr/tarado" ]]; then
+# Default profile
+PROFILE="tarado"
+
+# Function to validate profile
+validate_profile() {
+    local profile="$1"
+    local nostr_dir="$HOME/.nostr"
+    
+    if [[ ! -d "$nostr_dir" ]]; then
+        echo "Error: ~/.nostr directory does not exist"
+        exit 1
+    fi
+    
+    if [[ ! -f "$nostr_dir/$profile" ]]; then
+        echo "Error: Profile '$profile' not found in ~/.nostr/"
+        echo "Available profiles:"
+        ls -1 "$nostr_dir" 2>/dev/null | grep -v '^\.' || echo "  (no profiles found)"
+        exit 1
+    fi
+    
+    return 0
+}
+
+# Function to set profile from parameter
+set_profile() {
+    local profile="$1"
+    if [[ -z "$profile" ]]; then
+        echo "Error: Empty profile specified"
+        usage
+        exit 1
+    fi
+    validate_profile "$profile"
+    PROFILE="$profile"
+}
+
+# Parse profile parameter from command line arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --profile=*)
+            set_profile "${1#--profile=}"
+            shift
+            ;;
+        --profile)
+            shift
+            set_profile "$1"
+            shift
+            ;;
+        -profile=*)
+            set_profile "${1#-profile=}"
+            shift
+            ;;
+        -profile)
+            shift
+            set_profile "$1"
+            shift
+            ;;
+        -p=*)
+            set_profile "${1#-p=}"
+            shift
+            ;;
+        -p)
+            shift
+            set_profile "$1"
+            shift
+            ;;
+        *)
+            # Not a profile parameter, break out of this loop
+            break
+            ;;
+    esac
+done
+
+# Load environment variables from the selected profile
+if [[ -f "$HOME/.nostr/$PROFILE" ]]; then
+    echo "Loading profile: $PROFILE"
     # shellcheck source=/dev/null
-    source "$HOME/.nostr/tarado"
+    source "$HOME/.nostr/$PROFILE"
+else
+    echo "Error: Profile file $HOME/.nostr/$PROFILE not found"
+    exit 1
 fi
 # Default values
 # Check if POW_DIFF is set, otherwise default to 20
@@ -18,12 +99,24 @@ if [[ -z "$POW_DIFF" ]]; then
     POW_DIFF=20
 fi
 if [[ -z "${BLOSSOMS[*]}" ]]; then
-    BLOSSOMS=(
+    echo "Using default BLOSSOMS"
+    BLOSSOM_SERVERS=(
 	    "https://blossom.primal.net"
 	    "https://nostr.download"
 	    "https://cdn.nostrcheck.me"
     )
+else
+    echo "Using provided BLOSSOMS: ${BLOSSOMS[@]}"
+    BLOSSOM_SERVERS=("${BLOSSOMS[@]}")
 fi
+
+# Check for EXTRA_BLOSSOMS and add them to the front of BLOSSOM_SERVERS
+if [[ -n "${EXTRA_BLOSSOMS[*]}" ]]; then
+    echo "Adding EXTRA_BLOSSOMS to BLOSSOM_SERVERS: ${EXTRA_BLOSSOMS[@]}"
+    BLOSSOM_SERVERS=("${EXTRA_BLOSSOMS[@]}" "${BLOSSOM_SERVERS[@]}")
+fi
+
+
 if [[ -z "$NSEC_KEY" && -z "$KEY" ]]; then
     echo "Error: Neither NSEC_KEY nor KEY is set."
     exit 1
@@ -31,14 +124,9 @@ fi
 
 # Set default relays
 DEFAULT_RELAYS=(
-    "wss://relay.damus.io"
-    "wss://relay.primal.net"
-    "wss://nostr.girino.org"
+    "wss://bcast.girino.org"
     "wss://wot.girino.org"
     "wss://nip13.girino.org"
-    "wss://nostr.oxtr.dev/"
-    "wss://ditto.pub/relay"
-    "wss://nostr.einundzwanzig.space/"
 )
 if [[ -z "${RELAYS[*]}" ]]; then
     RELAYS=("${DEFAULT_RELAYS[@]}")
@@ -74,10 +162,19 @@ if [ -n "$DECRYPTED_KEY" ]; then
     KEY="$DECRYPTED_KEY"
 elif [ -n "$NSEC_KEY" ]; then
 	echo "Using NSEC_KEY to decrypt the secret key"
-	KEY=$(nak decode $NSEC_KEY | jq -r .private_key)
+	DECODED=$(nak decode $NSEC_KEY)
 	if [ $? -ne 0 ]; then
 		echo "Failed to decrypt the key"
 		exit 1
+	fi
+	
+	# Check if the decoded output is JSON (starts with {) or a hex key
+	if echo "$DECODED" | grep -q '^{'; then
+		# It's JSON, extract the private_key field
+		KEY=$(echo "$DECODED" | jq -r .private_key)
+	else
+		# It's already a hex key, use it directly
+		KEY="$DECODED"
 	fi
 elif [ -n "$NCRYPT_KEY" ]; then
 	echo "Using NCRYPT_KEY to decrypt the secret key"
@@ -190,6 +287,7 @@ BAD_SERVERS=()
 for FILE in "${FILES[@]}"; do
     UPLOADED=0
     for SERVER in "${BLOSSOM_SERVERS[@]}"; do
+        echo "Uploading $FILE to $SERVER"
         # Skip bad servers
         if [[ " ${BAD_SERVERS[@]} " =~ " $SERVER " ]]; then
             continue

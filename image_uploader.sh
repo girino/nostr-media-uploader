@@ -23,6 +23,7 @@ POW_DIFF=20
 NO_COMMENT=0
 NO_RELAY=0
 CUSTOM_CAPTION=""
+PRE_DOWNLOADED_DIR=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -key)
@@ -88,10 +89,19 @@ fi
 # if DECRYPTED_KEY starts with nsec, use nak decode to get the private key
 if [[ "$DECRYPTED_KEY" =~ ^nsec[0-9a-zA-Z]+ ]]; then
     echo "Using NSEC_KEY to decrypt the secret key"
-    DECRYPTED_KEY=$(nak decode "$DECRYPTED_KEY" | jq -r .private_key)
+    DECODED=$(nak decode "$DECRYPTED_KEY")
     if [ $? -ne 0 ]; then
         echo "Failed to decrypt the key"
         exit 1
+    fi
+    echo "Decoded: $DECODED"
+    # Check if the decoded output is JSON (starts with {) or a hex key
+    if echo "$DECODED" | grep -q '^{'; then
+        # It's JSON, extract the private_key field
+        DECRYPTED_KEY=$(echo "$DECODED" | jq -r .private_key)
+    else
+        # It's already a hex key, use it directly
+        DECRYPTED_KEY="$DECODED"
     fi
 fi
 
@@ -105,6 +115,8 @@ GALLERY_DL_PARAMS=()
 if [ $USE_FIREFOX -eq 1 ]; then
     GALLERY_DL_PARAMS+=("--cookies-from-browser" "firefox")
 fi
+# Set Firefox user agent
+GALLERY_DL_PARAMS+=("--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0")
 URL="$1"
 # Check if there's a custom caption parameter (second positional argument)
 if [ -n "$2" ]; then
@@ -115,66 +127,85 @@ else
 fi
 # Remove "&set=a.XXXX" from Facebook URLs if present
 if [[ "$URL" =~ facebook\.com ]]; then
-    if [[ "$URL" =~ [?\&]set=a\.[0-9]+ ]]; then
+    #then remove set=a.XXXX or set=gm.XXXX
+    if [[ "$URL" =~ [?\&](set=a\.[0-9]+|set=gm\.[0-9]+) ]]; then
         # first try removing the set param
         URL_NOSET=$(echo "$URL" | sed -E 's/[?&]set=a\.[0-9]+//')
-        # and try dry run this way, to see if it works.
+        URL_NOSET=$(echo "$URL_NOSET" | sed -E 's/[?&]set=gm\.[0-9]+//')
+        # Try downloading to see if it works
         echo "Trying to remove set param, new URL: $URL_NOSET"
-        echo "gallery-dl --no-download ${GALLERY_DL_PARAMS[@]} \"$URL_NOSET\" 2>&1 >/dev/null"
-        gallery-dl --no-download ${GALLERY_DL_PARAMS[@]} "$URL_NOSET" 2>&1 >/dev/null
-        if [ $? -eq 0 ]; then
+        TEST_TMPDIR=$(mktemp -d /tmp/gallery_dl_test_XXXXXXXX)
+        WIN_TEST_TMPDIR=$(cygpath -w "$TEST_TMPDIR")
+        echo "Testing download: gallery-dl \"${GALLERY_DL_PARAMS[@]}\" -f '{num}.{extension}' -D \"$WIN_TEST_TMPDIR\" --write-metadata \"$URL_NOSET\""
+        gallery-dl "${GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_TEST_TMPDIR" --write-metadata "$URL_NOSET" 2>&1 >/dev/null
+        if [ $? -eq 0 ] && [ "$(ls -A "$TEST_TMPDIR" 2>/dev/null)" ]; then
             URL="$URL_NOSET"
-            echo "Removed set param, new URL: $URL"
+            echo "Download succeeded, removed set param, new URL: $URL"
+            # Keep the test temp directory for later use
+            PRE_DOWNLOADED_DIR="$TEST_TMPDIR"
         else
-            echo "Failed to remove set param, trying to infer position"
+            echo "Download failed, trying to infer position"
+            rm -rf "$TEST_TMPDIR"
         fi
     fi
     # set was not removed, so try to infer position
-    if [[ "$URL" =~ [?\&]set=a\.[0-9]+ ]]; then
+    if [[ "$URL" =~ [?\&](set=a\.[0-9]+|set=gm\.[0-9]+) ]]; then
         # Extract fbid from URL if present
         if [[ "$URL" =~ [?\&]fbid=([0-9]+) ]]; then
             FBID="${BASH_REMATCH[1]}"
             echo "Found fbid: $FBID"
             
-            # Run gallery-dl --no-download to list all images
+            # Download images to find position of image with fbid
             echo "Finding position of image with fbid $FBID..."
+            POSITION_TMPDIR=$(mktemp -d /tmp/gallery_dl_position_XXXXXXXX)
+            WIN_POSITION_TMPDIR=$(cygpath -w "$POSITION_TMPDIR")
             
-            # Count the position of the image matching the fbid
-            POSITION=1
-            TMP_FILE=$(mktemp /tmp/fbimg_position_XXXXXXXX.txt)
-            gallery-dl --no-download "${GALLERY_DL_PARAMS[@]}" "$URL" 2>&1 | while IFS= read -r line; do
-                # Look for lines that contain image URLs or filenames
-                if [[ "$line" =~ $FBID ]]; then
-                    echo "Found matching image at position $POSITION"
-                    echo $POSITION > $TMP_FILE
-                    break
-                fi
-                # Increment position for each potential image line
-                if [[ "$line" =~ ^https:// ]] || [[ "$line" =~ \.(jpg|jpeg|png|gif|mp4|webp) ]]; then
+            # Download all images to find the one matching FBID
+            gallery-dl "${GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_POSITION_TMPDIR" --write-metadata "$URL" 2>&1 >/dev/null
+            if [ $? -eq 0 ] && [ "$(ls -A "$POSITION_TMPDIR" 2>/dev/null)" ]; then
+                # Count the position of the image matching the fbid by checking metadata files
+                POSITION=1
+                FOUND=0
+                # Sort files in numerical order
+                files=($(ls "$POSITION_TMPDIR" | sort -V))
+                for fname in "${files[@]}"; do
+                    file="$POSITION_TMPDIR/$fname"
+                    # Skip metadata files in the count
+                    [[ "$file" == *.json ]] && continue
+                    
+                    # Check corresponding metadata file
+                    meta="${file}.json"
+                    if [ ! -f "$meta" ]; then
+                        meta="${file%.*}.json"
+                    fi
+                    
+                    if [ -f "$meta" ]; then
+                        # Check if metadata contains the FBID in URL or filename
+                        if grep -q "$FBID" "$meta" 2>/dev/null; then
+                            echo "Found matching image at position $POSITION"
+                            GALLERY_DL_PARAMS+=("--range" "$POSITION")
+                            FOUND=1
+                            break
+                        fi
+                    fi
                     ((POSITION++))
+                done
+                
+                if [ $FOUND -eq 0 ]; then
+                    echo "Could not find image with fbid $FBID, defaulting to range 1"
+                    GALLERY_DL_PARAMS+=("--range" "1")
                 fi
-            done
-            
-            if [ -f "$TMP_FILE" ]; then
-                POSITION=$(cat "$TMP_FILE")
-                rm "$TMP_FILE"
-                echo "Found position: $POSITION"
-                GALLERY_DL_PARAMS+=("--range" "$POSITION")
+                
+                # Clean up position finding temp directory
+                rm -rf "$POSITION_TMPDIR"
             else
-                echo "Could not determine position, defaulting to range 1"
+                echo "Could not download to determine position, defaulting to range 1"
                 GALLERY_DL_PARAMS+=("--range" "1")
+                rm -rf "$POSITION_TMPDIR"
             fi
         else
             GALLERY_DL_PARAMS+=("--range" "1")
         fi
-    fi
-    # remove param __cft__[0]= if present
-    if [[ "$URL" =~ [?\&]__cft__\[0\]=[^\&]+ ]]; then
-        URL=$(echo "$URL" | sed -E 's/[?&]__cft__\[0\]=[^&]+//')
-    fi
-    # remove param __tn__= if present
-    if [[ "$URL" =~ [?\&]__tn__=[^\&]+ ]]; then
-        URL=$(echo "$URL" | sed -E 's/[?&]__tn__=[^&]+//')
     fi
     echo "Modified URL: $URL"
 fi
@@ -229,10 +260,19 @@ if [ -n "$DECRYPTED_KEY" ]; then
     KEY="$DECRYPTED_KEY"
 elif [ -n "$NSEC_KEY" ]; then
 	echo "Using NSEC_KEY to decrypt the secret key"
-	KEY=$(nak decode $NSEC_KEY | jq -r .private_key)
+	DECODED=$(nak decode $NSEC_KEY)
 	if [ $? -ne 0 ]; then
 		echo "Failed to decrypt the key"
 		exit 1
+	fi
+	
+	# Check if the decoded output is JSON (starts with {) or a hex key
+	if echo "$DECODED" | grep -q '^{'; then
+		# It's JSON, extract the private_key field
+		KEY=$(echo "$DECODED" | jq -r .private_key)
+	else
+		# It's already a hex key, use it directly
+		KEY="$DECODED"
 	fi
 elif [ -n "$NCRYPT_KEY" ]; then
 	echo "Using NCRYPT_KEY to decrypt the secret key"
@@ -267,14 +307,24 @@ WIN_TMPDIR=$(cygpath -w "$TMPDIR")
 function cleanup {
     echo "Cleaning up temporary files..."
     #rm -rf "$TMPDIR"
+    if [ -n "$PRE_DOWNLOADED_DIR" ] && [ -d "$PRE_DOWNLOADED_DIR" ]; then
+        rm -rf "$PRE_DOWNLOADED_DIR"
+    fi
 }
 trap cleanup EXIT
 
-# Download images and metadata
-gallery-dl "${GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_TMPDIR" --write-metadata "$URL"
-if [ $? -ne 0 ]; then
-    echo "Error: gallery-dl failed to download images or metadata."
-    exit 2
+# Check if we already downloaded files earlier
+if [ -n "$PRE_DOWNLOADED_DIR" ] && [ -d "$PRE_DOWNLOADED_DIR" ] && [ "$(ls -A "$PRE_DOWNLOADED_DIR" 2>/dev/null)" ]; then
+    echo "Using pre-downloaded files from test download (already includes metadata)"
+    # Copy files from pre-downloaded directory to TMPDIR
+    cp -r "$PRE_DOWNLOADED_DIR"/* "$TMPDIR"/ 2>/dev/null || true
+else
+    # Download images and metadata
+    gallery-dl "${GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_TMPDIR" --write-metadata "$URL"
+    if [ $? -ne 0 ]; then
+        echo "Error: gallery-dl failed to download images or metadata."
+        exit 2
+    fi
 fi
 # Check if any files were downloaded
 if [ ! "$(ls -A "$TMPDIR")" ]; then
@@ -376,7 +426,21 @@ if [ $NO_COMMENT -eq 0 ] && [ -n "$CUSTOM_CAPTION" ]; then
 fi
 # add source
 if [ $USE_SOURCE -eq 1 ]; then
-    event_content="${event_content}\n\nSource: $URL"
+    # remove param idorvanity= first, since it breaks gallery-dl
+    SOURCE_URL="$URL"
+    if [[ "$SOURCE_URL" =~ [?\&]idorvanity=[0-9]+ ]]; then
+        SOURCE_URL=$(echo "$SOURCE_URL" | sed -E 's/[?&]idorvanity=[0-9]+//')
+    fi
+    # remove param __cft__[0]= if present
+    if [[ "$SOURCE_URL" =~ [?\&]__cft__\[0\]=[^\&]+ ]]; then
+        SOURCE_URL=$(echo "$SOURCE_URL" | sed -E 's/[?&]__cft__\[0\]=[^&]+//')
+    fi
+    # remove param __tn__= if present
+    if [[ "$SOURCE_URL" =~ [?\&]__tn__=[^\&]+ ]]; then
+        SOURCE_URL=$(echo "$SOURCE_URL" | sed -E 's/[?&]__tn__=[^&]+//')
+    fi
+    echo "Source URL: $SOURCE_URL"
+    event_content="${event_content}\n\nSource: $SOURCE_URL"
 fi
 
 # Prepare tags for nak command
