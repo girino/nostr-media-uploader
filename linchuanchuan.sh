@@ -52,6 +52,96 @@ die() {
 	exit 1
 }
 
+# Function to build caption from description candidate and extracted content
+# Parameters:
+#   $1: DESCRIPTION_CANDIDATE - current description candidate
+#   $2: EXTRACTED_CAPTION - caption extracted from metadata/description file
+#   $3: APPEND_ORIGINAL_COMMENT - 1 to append, 0 otherwise
+# Returns caption via stdout
+build_caption() {
+	local DESCRIPTION_CANDIDATE="$1"
+	local EXTRACTED_CAPTION="$2"
+	local APPEND_ORIGINAL_COMMENT="$3"
+	
+	local file_caption=""
+	if [ -n "$EXTRACTED_CAPTION" ] && [ "$APPEND_ORIGINAL_COMMENT" -eq 1 ]; then
+		if [ -n "$DESCRIPTION_CANDIDATE" ]; then
+			file_caption="${DESCRIPTION_CANDIDATE}"$'\n\n'"${EXTRACTED_CAPTION}"
+		else
+			file_caption="${EXTRACTED_CAPTION}"
+		fi
+	elif [ -n "$DESCRIPTION_CANDIDATE" ]; then
+		file_caption="$DESCRIPTION_CANDIDATE"
+	fi
+	echo "$file_caption"
+}
+
+# Function to check if hash/filename exists in history file
+# Parameters:
+#   $1: HASH_OR_NAME - hash or filename to check
+#   $2: HISTORY_FILE - path to history file
+#   $3: DISABLE_HASH_CHECK - 1 to disable, 0 otherwise
+# Returns 0 if found (should die), 1 if not found (ok to proceed)
+check_history() {
+	local HASH_OR_NAME="$1"
+	local HISTORY_FILE="$2"
+	local DISABLE_HASH_CHECK="$3"
+	
+	if [ "$DISABLE_HASH_CHECK" -eq 0 ]; then
+		if grep -q "$HASH_OR_NAME" "$HISTORY_FILE"; then
+			return 0  # Found - should die
+		fi
+	fi
+	return 1  # Not found - ok to proceed
+}
+
+# Function to count files in a gallery starting from given index
+# Parameters:
+#   $1: START_IDX - starting index
+#   $2: GALLERY_ID - gallery ID to match
+#   $3: FILE_GALLERIES - array reference (passed as string to eval)
+#   $4: MAX_IDX - maximum index to check
+# Returns count via stdout
+count_gallery_files() {
+	local START_IDX="$1"
+	local GALLERY_ID="$2"
+	local FILE_GALLERIES_STR="$3"
+	local MAX_IDX="$4"
+	
+	local FILE_GALLERIES=()
+	eval "FILE_GALLERIES=($FILE_GALLERIES_STR)"
+	
+	local count=0
+	for check_idx in $(seq $START_IDX $MAX_IDX); do
+		local check_gallery=""
+		if [ $check_idx -lt ${#FILE_GALLERIES[@]} ]; then
+			check_gallery="${FILE_GALLERIES[$check_idx]}"
+		fi
+		if [ "$check_gallery" = "$GALLERY_ID" ]; then
+			((count++))
+		else
+			break
+		fi
+	done
+	echo "$count"
+}
+
+# Function to write items to history file
+# Parameters:
+#   $1: HISTORY_FILE - path to history file
+#   $2: ITEMS - array of items to write (passed as string to eval)
+write_to_history() {
+	local HISTORY_FILE="$1"
+	local ITEMS_STR="$2"
+	
+	local ITEMS=()
+	eval "ITEMS=($ITEMS_STR)"
+	
+	for item in "${ITEMS[@]}"; do
+		echo "$item" >> "$HISTORY_FILE"
+	done
+}
+
 # Function to download video from URL using yt-dlp
 # Parameters:
 #   $1: VIDEO_URL - URL to download
@@ -109,18 +199,13 @@ download_video() {
 	if [ $? -eq 0 ] && [ -f "$OUT_FILE_INT" ]; then
 		DOWNLOADED=1
 		local file_caption=""
+		local extracted_caption=""
 		if [ -f "$DESC_FILE" ] && [ "$APPEND_ORIGINAL_COMMENT" -eq 1 ]; then
 			echo "Reading description from $DESC_FILE"
-			local desc_content=$(cat "$DESC_FILE")
+			extracted_caption=$(cat "$DESC_FILE")
 			rm -f "$DESC_FILE"
-			if [ -n "$DESCRIPTION_CANDIDATE" ]; then
-				file_caption="${DESCRIPTION_CANDIDATE}"$'\n\n'"${desc_content}"
-			else
-				file_caption="${desc_content}"
-			fi
-		elif [ -n "$DESCRIPTION_CANDIDATE" ]; then
-			file_caption="$DESCRIPTION_CANDIDATE"
 		fi
+		file_caption=$(build_caption "$DESCRIPTION_CANDIDATE" "$extracted_caption" "$APPEND_ORIGINAL_COMMENT")
 		
 		if [ -z "$SOURCE_CANDIDATE" ]; then
 			download_video_ret_source="$VIDEO_URL"
@@ -129,10 +214,8 @@ download_video() {
 		# Calculate the sha256 hash
 		local DOWNLOADED_FILE_HASH=$(sha256sum "$OUT_FILE_INT" | awk '{print $1}')
 		echo "SHA256 hash: $DOWNLOADED_FILE_HASH"
-		if [ "$DISABLE_HASH_CHECK" -eq 0 ]; then
-			if grep -q "$DOWNLOADED_FILE_HASH" "$HISTORY_FILE"; then
-				die "File hash already processed: $DOWNLOADED_FILE_HASH"
-			fi
+		if check_history "$DOWNLOADED_FILE_HASH" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
+			die "File hash already processed: $DOWNLOADED_FILE_HASH"
 		fi
 		
 		# Detect and convert video codec if needed
@@ -325,25 +408,15 @@ download_images() {
 			echo "Downloaded image: $file"
 			
 			# Extract caption from metadata if available
-			local file_caption=""
+			local extracted_caption=""
 			local meta="${file}.json"
 			if [ ! -f "$meta" ]; then
 				meta="${file%.*}.json"
 			fi
 			if [ -f "$meta" ] && [ "$APPEND_ORIGINAL_COMMENT" -eq 1 ]; then
-				local caption=$(jq -r '.caption // empty' "$meta" 2>/dev/null | sed 's/^"\|"$//g')
-				if [ -n "$caption" ]; then
-					if [ -n "$DESCRIPTION_CANDIDATE" ]; then
-						file_caption="${DESCRIPTION_CANDIDATE}"$'\n\n'"${caption}"
-					else
-						file_caption="${caption}"
-					fi
-				elif [ -n "$DESCRIPTION_CANDIDATE" ]; then
-					file_caption="$DESCRIPTION_CANDIDATE"
-				fi
-			elif [ -n "$DESCRIPTION_CANDIDATE" ]; then
-				file_caption="$DESCRIPTION_CANDIDATE"
+				extracted_caption=$(jq -r '.caption // empty' "$meta" 2>/dev/null | sed 's/^"\|"$//g')
 			fi
+			local file_caption=$(build_caption "$DESCRIPTION_CANDIDATE" "$extracted_caption" "$APPEND_ORIGINAL_COMMENT")
 			download_images_ret_captions+=("$file_caption")
 		done
 		
@@ -579,20 +652,16 @@ for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
 		# remove trailing "/" from FILE if it exists
 		TMP_FILE=$(echo "$TMP_FILE" | sed 's:/*$::')
 		FILE_NAME=$(basename "$TMP_FILE")
-	if [ $DISABLE_HASH_CHECK -eq 0 ]; then
-			if grep -q "$FILE_NAME" "$HISTORY_FILE"; then
-				echo "File name already processed: $FILE_NAME"
+		if check_history "$FILE_NAME" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
+			echo "File name already processed: $FILE_NAME"
 			exit 1
 		fi
-	fi
 	else
 		# It's a local file
 		FILE_NAME=$(basename "$MEDIA_FILE")
-	if [ $DISABLE_HASH_CHECK -eq 0 ]; then
-			if grep -q "$FILE_NAME" "$HISTORY_FILE"; then
-				echo "File name already processed: $FILE_NAME"
+		if check_history "$FILE_NAME" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
+			echo "File name already processed: $FILE_NAME"
 			exit 1
-			fi
 		fi
 	fi
 done
@@ -779,11 +848,11 @@ if [ $DISABLE_HASH_CHECK -eq 0 ]; then
 	# Process all processed files
 	for FILE in "${PROCESSED_FILES[@]}"; do
 		if [ -f "$FILE" ]; then
-				# Calculate file hash
-				FILE_HASH=$(sha256sum "$FILE" | awk '{print $1}')
-				# Check if file hash exists in history file
-				if grep -q "$FILE_HASH" "$HISTORY_FILE"; then
-					die "File hash already processed: $FILE"
+			# Calculate file hash
+			FILE_HASH=$(sha256sum "$FILE" | awk '{print $1}')
+			# Check if file hash exists in history file
+			if check_history "$FILE_HASH" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
+				die "File hash already processed: $FILE"
 			fi
 			# Add file hash to the array
 			FILE_HASHES+=("$FILE_HASH")
@@ -886,18 +955,8 @@ for TRIES in "${!BLOSSOMS[@]}"; do
 			if [ "$current_gallery_id" != "$gallery_id" ]; then
 				current_gallery_id="$gallery_id"
 				# Count how many files belong to this gallery
-				gallery_count=0
-				for check_idx in $(seq $idx $((${#UPLOAD_URLS[@]} - 1))); do
-					check_gallery=""
-					if [ $check_idx -lt ${#FILE_GALLERIES[@]} ]; then
-						check_gallery="${FILE_GALLERIES[$check_idx]}"
-					fi
-					if [ "$check_gallery" = "$gallery_id" ]; then
-						((gallery_count++))
-					else
-						break
-					fi
-				done
+				FILE_GALLERIES_STR=$(printf '%q ' "${FILE_GALLERIES[@]}")
+				gallery_count=$(count_gallery_files "$idx" "$gallery_id" "$FILE_GALLERIES_STR" "$((${#UPLOAD_URLS[@]} - 1))")
 				last_idx_in_gallery=$((idx + gallery_count - 1))
 				
 				# If multiple files in gallery, collect all captions
@@ -1050,21 +1109,26 @@ fi
 # Add the file hash to history file only if the upload was successful
 # but only if sent to relays
 if [ "$SEND_TO_RELAY" -eq 1 ] && [ "$DISABLE_HASH_CHECK" -eq 0 ] && [ $RESULT -eq 0 ]; then
-	for FILE_HASH in "${FILE_HASHES[@]}"; do
-		echo "$FILE_HASH" >> "$HISTORY_FILE"
-	done
-	for ORIGINAL_URL in "${ORIGINAL_URLS[@]}"; do
-		echo "$ORIGINAL_URL" >> "$HISTORY_FILE"
-	done
+	# Collect local files from ALL_MEDIA_FILES
+	LOCAL_FILES=()
 	for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
-		if [ ! -f "$MEDIA_FILE" ]; then
-			# It's a URL, already added to ORIGINAL_URLS
-			:
-		else
+		if [ -f "$MEDIA_FILE" ]; then
 			# It's a local file
-			echo "$MEDIA_FILE" >> "$HISTORY_FILE"
+			LOCAL_FILES+=("$MEDIA_FILE")
 		fi
 	done
+	
+	# Write hashes, URLs, and local files to history
+	FILE_HASHES_STR=$(printf '%q ' "${FILE_HASHES[@]}")
+	write_to_history "$HISTORY_FILE" "$FILE_HASHES_STR"
+	
+	ORIGINAL_URLS_STR=$(printf '%q ' "${ORIGINAL_URLS[@]}")
+	write_to_history "$HISTORY_FILE" "$ORIGINAL_URLS_STR"
+	
+	if [ ${#LOCAL_FILES[@]} -gt 0 ]; then
+		LOCAL_FILES_STR=$(printf '%q ' "${LOCAL_FILES[@]}")
+		write_to_history "$HISTORY_FILE" "$LOCAL_FILES_STR"
+	fi
 fi
 
 # Remove the tempfile
