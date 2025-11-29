@@ -1337,7 +1337,7 @@ fi
 # Check if the file names are present in the history file
 ORIGINAL_URLS=()
 for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
-	local result=$(check_media_history "$MEDIA_FILE" "$HISTORY_FILE" "$DISABLE_HASH_CHECK")
+	result=$(check_media_history "$MEDIA_FILE" "$HISTORY_FILE" "$DISABLE_HASH_CHECK")
 	if [ $? -ne 0 ]; then
 		# File is in history - result contains filename
 		echo "File name already processed: $result"
@@ -1513,7 +1513,7 @@ for TRIES in "${!BLOSSOMS[@]}"; do
 	upload_success=1
 	
 	for FILE in "${PROCESSED_FILES[@]}"; do
-		local upload_url=$(upload_file_to_blossom "$FILE" "$BLOSSOM" "$KEY")
+		upload_url=$(upload_file_to_blossom "$FILE" "$BLOSSOM" "$KEY")
 		if [ $? -ne 0 ]; then
 			upload_success=0
 			break
