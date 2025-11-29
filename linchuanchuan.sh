@@ -145,6 +145,134 @@ write_to_history() {
 	done
 }
 
+# Function to extract 'id' field from JSON metadata file (for matching)
+# Parameters:
+#   $1: META_FILE - path to JSON metadata file
+# Returns: ID via stdout, returns 0 if found, 1 if not found or error
+# Note: Only extracts 'id' field to avoid matching on other ID fields
+extract_meta_id_only() {
+	local META_FILE="$1"
+	
+	if [ ! -f "$META_FILE" ]; then
+		return 1
+	fi
+	
+	local meta_id=$(jq -r '.id // empty' "$META_FILE" 2>/dev/null)
+	if [ -n "$meta_id" ] && [ "$meta_id" != "null" ] && [ "$meta_id" != "empty" ]; then
+		echo "$meta_id"
+		return 0
+	fi
+	
+	return 1
+}
+
+# Function to extract ID from JSON metadata file with fallbacks (for display)
+# Parameters:
+#   $1: META_FILE - path to JSON metadata file
+# Returns: ID via stdout, returns 0 if found, 1 if not found or error
+# Note: Tries multiple methods to find any ID for display purposes
+extract_meta_id() {
+	local META_FILE="$1"
+	
+	if [ ! -f "$META_FILE" ]; then
+		return 1
+	fi
+	
+	local meta_id=""
+	
+	# Try 'id' field first
+	meta_id=$(jq -r '.id // empty' "$META_FILE" 2>/dev/null)
+	if [ -n "$meta_id" ] && [ "$meta_id" != "null" ] && [ "$meta_id" != "empty" ]; then
+		echo "$meta_id"
+		return 0
+	fi
+	
+	# Fallback: try 'fbid' field
+	meta_id=$(jq -r '.fbid // empty' "$META_FILE" 2>/dev/null)
+	if [ -n "$meta_id" ] && [ "$meta_id" != "null" ] && [ "$meta_id" != "empty" ]; then
+		echo "$meta_id"
+		return 0
+	fi
+	
+	# Fallback: try extracting from 'url' field
+	local url=$(jq -r '.url // empty' "$META_FILE" 2>/dev/null)
+	if [ -n "$url" ] && [ "$url" != "null" ] && [ "$url" != "empty" ]; then
+		meta_id=$(echo "$url" | grep -oE '[?&]fbid=([0-9]+)' | grep -oE '[0-9]+' | head -1)
+		if [ -n "$meta_id" ]; then
+			echo "$meta_id"
+			return 0
+		fi
+	fi
+	
+	# Fallback: grep for fbid patterns in the JSON
+	meta_id=$(grep -oE '[?&]fbid=([0-9]+)' "$META_FILE" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+	if [ -n "$meta_id" ]; then
+		echo "$meta_id"
+		return 0
+	fi
+	
+	meta_id=$(grep -oE 'fbid["\s:=]+([0-9]+)' "$META_FILE" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+	if [ -n "$meta_id" ]; then
+		echo "$meta_id"
+		return 0
+	fi
+	
+	return 1
+}
+
+# Function to check a file for matching FBID in metadata
+# Parameters:
+#   $1: FILE - path to image file to check
+#   $2: FBID - Facebook ID to match against
+# Returns: position number via stdout if found, returns 0 if found, 1 if not found or error
+check_file_for_fbid() {
+	local file="$1"
+	local FBID="$2"
+	
+	# Skip metadata files
+	[[ "$file" == *.json ]] && return 1
+	
+	# Extract position number from filename (e.g., "1.jpg" -> 1, "2.png" -> 2)
+	local basename=$(basename "$file")
+	local position=${basename%%.*}
+	# Verify it's a number
+	if ! [[ "$position" =~ ^[0-9]+$ ]]; then
+		return 1
+	fi
+	
+	# Check if metadata file exists
+	local meta="${file}.json"
+	if [ ! -f "$meta" ]; then
+		meta="${file%.*}.json"
+	fi
+	
+	# Wait a bit for metadata file to be written if image file exists
+	if [ -f "$file" ] && [ ! -f "$meta" ]; then
+		local wait_count=0
+		while [ $wait_count -lt 10 ] && [ ! -f "$meta" ]; do
+			sleep 0.1
+			((wait_count++))
+			# Re-check meta path
+			meta="${file}.json"
+			if [ ! -f "$meta" ]; then
+				meta="${file%.*}.json"
+			fi
+		done
+	fi
+	
+	# Check metadata file if it exists
+	if [ -f "$meta" ]; then
+		# Check if the 'id' field matches the FBID (only check 'id' field, not other ID fields)
+		local meta_id=$(extract_meta_id_only "$meta")
+		if [ $? -eq 0 ] && [ "$meta_id" = "$FBID" ]; then
+			echo "$position"
+			return 0
+		fi
+	fi
+	
+	return 1
+}
+
 # Function to download video from URL using yt-dlp
 # Parameters:
 #   $1: VIDEO_URL - URL to download
@@ -277,6 +405,8 @@ download_video() {
 #   download_images_ret_captions - array of captions (one per file, empty string if no caption)
 #   download_images_ret_source - source to set (empty if should keep current)
 #   download_images_ret_success - 0 on success, 1 on failure
+#   download_images_ret_error - error message if download failed (empty on success)
+#   download_images_ret_temp_dir - temporary directory that needs cleanup (empty if none)
 download_images() {
 	local IMAGE_URL="$1"
 	local GALLERY_DL_PARAMS_STR="$2"
@@ -290,6 +420,8 @@ download_images() {
 	download_images_ret_captions=()
 	download_images_ret_source=""
 	download_images_ret_success=1
+	download_images_ret_error=""
+	download_images_ret_temp_dir=""
 	
 	# Reconstruct GALLERY_DL_PARAMS array from string
 	local GALLERY_DL_PARAMS=()
@@ -331,54 +463,189 @@ download_images() {
 				local FBID="${BASH_REMATCH[1]}"
 				echo "Found fbid: $FBID"
 				
-				# Download images to find position of image with fbid
-				echo "Finding position of image with fbid $FBID..."
+				# Download images and monitor output line-by-line to find position of image with fbid
+				echo "Finding position of image with fbid $FBID by monitoring gallery-dl output in real-time..."
+				local FOUND=0
+				local FOUND_POSITION=0
+				
 				local POSITION_TMPDIR=$(mktemp -d /tmp/gallery_dl_position_XXXXXXXX)
 				local WIN_POSITION_TMPDIR=$(cygpath -w "$POSITION_TMPDIR")
 				# Add temp directory to cleanup list
 				TEMP_FILES+=("$POSITION_TMPDIR")
 				
-				# Download all images to find the one matching FBID
-				gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_POSITION_TMPDIR" --write-metadata "$PROCESSED_URL" 2>&1 >/dev/null
-				if [ $? -eq 0 ] && [ "$(ls -A "$POSITION_TMPDIR" 2>/dev/null)" ]; then
-					# Count the position of the image matching the fbid by checking metadata files
-					local POSITION=1
-					local FOUND=0
-					# Sort files in numerical order
-					local files=($(ls "$POSITION_TMPDIR" | sort -V))
-					for fname in "${files[@]}"; do
-						local file="$POSITION_TMPDIR/$fname"
-						# Skip metadata files in the count
-						[[ "$file" == *.json ]] && continue
+				
+				# Start gallery-dl and read its output line by line
+				echo "Starting gallery-dl and reading output line-by-line..."
+				
+				# Use local variables (no files needed since we use process substitution, not pipe)
+				local current_count=0
+				
+				# Run gallery-dl and read its output line by line using process substitution
+				# Process substitution doesn't create a subshell, so variables are accessible
+				# When we break out of the loop, gallery-dl will receive SIGPIPE on its next write
+				while IFS= read -r line; do
+					# Parse the line to extract filename
+					# gallery-dl may output full paths or just filenames
+					local filename=""
+					
+					# Try to extract filename from the line - look for number.extension pattern
+					# Match patterns like: "1.jpg", "2.png", or full paths containing them
+					if [[ "$line" =~ ([0-9]+\.[a-zA-Z]+) ]]; then
+						filename="${BASH_REMATCH[1]}"
 						
-						# Check corresponding metadata file
-						local meta="${file}.json"
-						if [ ! -f "$meta" ]; then
-							meta="${file%.*}.json"
+						# Check if we've reached max file search limit
+						if [ "$current_count" -ge "$MAX_FILE_SEARCH" ]; then
+							echo "Reached maximum file search limit ($MAX_FILE_SEARCH), stopping"
+							break
 						fi
 						
-						if [ -f "$meta" ]; then
-							# Check if metadata contains the FBID in URL or filename
-							if grep -q "$FBID" "$meta" 2>/dev/null; then
-								echo "Found matching image at position $POSITION"
-								URL_GALLERY_DL_PARAMS+=("--range" "$POSITION")
-								FOUND=1
-								break
+						# If filename extracted, check the corresponding file
+						if [ -n "$filename" ] && [ $FOUND -eq 0 ]; then
+							local file="$POSITION_TMPDIR/$filename"
+							
+							# Wait briefly for file to appear if it's mentioned in output
+							local wait_count=0
+							while [ $wait_count -lt 20 ] && [ ! -f "$file" ]; do
+								sleep 0.1
+								((wait_count++))
+							done
+							
+							# Skip if file still doesn't exist
+							if [ ! -f "$file" ]; then
+								continue
+							fi
+							
+							# Extract position number from filename
+							local position=${filename%%.*}
+							if ! [[ "$position" =~ ^[0-9]+$ ]]; then
+								continue
+							fi
+							
+							# Check metadata file
+							local meta="${file}.json"
+							if [ ! -f "$meta" ]; then
+								meta="${file%.*}.json"
+							fi
+							
+							# Wait briefly for metadata to be written
+							if [ -f "$file" ] && [ ! -f "$meta" ]; then
+								local meta_wait=0
+								while [ $meta_wait -lt 10 ] && [ ! -f "$meta" ]; do
+									sleep 0.1
+									((meta_wait++))
+									meta="${file}.json"
+									if [ ! -f "$meta" ]; then
+										meta="${file%.*}.json"
+									fi
+								done
+							fi
+							
+							# Increment file count
+							((current_count++))
+							
+							# Extract ID from JSON metadata for display (only 'id' field)
+							local found_id=""
+							if [ -f "$meta" ]; then
+								found_id=$(extract_meta_id "$meta")
+								if [ $? -ne 0 ]; then
+									found_id=""
+								fi
+							fi
+							
+							# Print single line: file processed and its ID
+							if [ -n "$found_id" ]; then
+								echo "Processed file: $filename (ID: $found_id)"
+							else
+								echo "Processed file: $filename (ID: not found)"
+							fi
+							
+							# Check if the 'id' field in metadata matches the FBID we're looking for (only check 'id' field)
+							if [ -f "$meta" ]; then
+								local meta_id=$(extract_meta_id_only "$meta")
+								if [ $? -eq 0 ] && [ "$meta_id" = "$FBID" ]; then
+									FOUND_POSITION=$position
+									FOUND=1
+									echo "Found matching image at position $position"
+									break
+								fi
 							fi
 						fi
-						((POSITION++))
+					fi
+					
+					# Break if found or max count reached
+					if [ $FOUND -eq 1 ]; then
+						break
+					fi
+					if [ "$current_count" -ge "$MAX_FILE_SEARCH" ]; then
+						break
+					fi
+				done < <(gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_POSITION_TMPDIR" --write-metadata "$PROCESSED_URL" 2>&1)
+				
+				# Final check if we haven't found it yet
+				if [ $FOUND -eq 0 ] && [ -d "$POSITION_TMPDIR" ]; then
+					echo "Doing final check of all downloaded files..."
+					local files=($(ls "$POSITION_TMPDIR" 2>/dev/null | sort -V))
+					for fname in "${files[@]}"; do
+						local file="$POSITION_TMPDIR/$fname"
+						local result=$(check_file_for_fbid "$file" "$FBID")
+						if [ $? -eq 0 ] && [ -n "$result" ]; then
+							FOUND_POSITION=$result
+							FOUND=1
+							echo "Found matching image at position $FOUND_POSITION"
+							break
+						fi
+					done
+				fi
+				
+				if [ $FOUND -eq 1 ] && [ $FOUND_POSITION -gt 0 ]; then
+					# We already downloaded the file, reuse it instead of redownloading
+					# Create a directory with just the matching file
+					local MATCHING_FILE_DIR=$(mktemp -d /tmp/gallery_dl_matching_XXXXXXXX)
+					local WIN_MATCHING_FILE_DIR=$(cygpath -w "$MATCHING_FILE_DIR")
+					# Return directory for caller to add to TEMP_FILES for cleanup
+					download_images_ret_temp_dir="$MATCHING_FILE_DIR"
+					
+					# Find the file at the matching position
+					local matching_filename=""
+					local files=($(ls "$POSITION_TMPDIR" 2>/dev/null | sort -V))
+					for fname in "${files[@]}"; do
+						local file="$POSITION_TMPDIR/$fname"
+						[[ "$file" == *.json ]] && continue
+						
+						local basename=$(basename "$file")
+						local position=${basename%%.*}
+						if [[ "$position" =~ ^[0-9]+$ ]] && [ "$position" -eq "$FOUND_POSITION" ]; then
+							matching_filename="$fname"
+							# Copy the image file and its metadata
+							cp "$file" "$MATCHING_FILE_DIR/" 2>/dev/null
+							# Copy metadata file if it exists
+							local meta="${file}.json"
+							if [ ! -f "$meta" ]; then
+								meta="${file%.*}.json"
+							fi
+							if [ -f "$meta" ]; then
+								cp "$meta" "$MATCHING_FILE_DIR/" 2>/dev/null
+							fi
+							break
+						fi
 					done
 					
-					if [ $FOUND -eq 0 ]; then
-						echo "Could not find image with fbid $FBID, defaulting to range 1"
-						URL_GALLERY_DL_PARAMS+=("--range" "1")
+					if [ -n "$matching_filename" ] && [ "$(ls -A "$MATCHING_FILE_DIR" 2>/dev/null)" ]; then
+						# Use the pre-downloaded directory instead of setting range
+						PRE_DOWNLOADED_DIR="$MATCHING_FILE_DIR"
+						echo "Reusing already downloaded file at position $FOUND_POSITION"
+					else
+						# Fallback: use range if we couldn't find/copy the file
+						URL_GALLERY_DL_PARAMS+=("--range" "$FOUND_POSITION")
 					fi
 				else
-					echo "Could not download to determine position, defaulting to range 1"
-					URL_GALLERY_DL_PARAMS+=("--range" "1")
+					download_images_ret_error="Could not find image with fbid $FBID after searching $MAX_FILE_SEARCH files"
+					download_images_ret_success=1
+					return
 				fi
 			else
-				URL_GALLERY_DL_PARAMS+=("--range" "1")
+				# No FBID in URL, don't set range
+				:
 			fi
 		fi
 		echo "Modified URL: $PROCESSED_URL"
@@ -534,6 +801,7 @@ ALL_MEDIA_FILES=()
 CONVERT_VIDEO="${CONVERT_VIDEO:-1}"
 SEND_TO_RELAY="${SEND_TO_RELAY:-1}"
 DISABLE_HASH_CHECK="${DISABLE_HASH_CHECK:-0}"
+MAX_FILE_SEARCH="${MAX_FILE_SEARCH:-10}"
 
 while (( "$#" )); do
 	PARAM="$1"
@@ -590,6 +858,13 @@ while (( "$#" )); do
 			exit 1
 		fi
 		shift  # shift to remove the password from the params
+	elif [[ "$PARAM" == "--max-file-search" || "$PARAM" == "-max-file-search" ]]; then
+		MAX_FILE_SEARCH="$2"
+		if [ -z "$MAX_FILE_SEARCH" ] || ! [[ "$MAX_FILE_SEARCH" =~ ^[0-9]+$ ]]; then
+			echo "Invalid value for --max-file-search: $MAX_FILE_SEARCH (must be a number)"
+			exit 1
+		fi
+		shift  # shift to remove the value from the params
 	else
 		# stop processing params if it's not a file or url
 		# do not shift to keep the description and source
@@ -761,10 +1036,16 @@ GALLERY_ID=0
 			download_images_ret_captions=()
 			download_images_ret_source=""
 			download_images_ret_success=1
+			download_images_ret_temp_dir=""
 			
 			# Call download_images function (Facebook URL handling is done inside)
 			download_images "$MEDIA_ITEM" "$GALLERY_DL_PARAMS_STR" "$APPEND_ORIGINAL_COMMENT" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
 			IMAGE_DOWNLOAD_RESULT="${download_images_ret_success:-1}"
+			
+			# Add temp directory to TEMP_FILES for cleanup if returned
+			if [ -n "$download_images_ret_temp_dir" ]; then
+				TEMP_FILES+=("$download_images_ret_temp_dir")
+			fi
 			
 			if [ "$IMAGE_DOWNLOAD_RESULT" -eq 0 ]; then
 				# For gallery images, all files from same gallery share the same gallery ID and caption
@@ -805,7 +1086,11 @@ GALLERY_ID=0
 				fi
 				((GALLERY_ID++))
 			else
-				die "Failed to download from URL: $MEDIA_ITEM"
+				if [ -n "$download_images_ret_error" ]; then
+					die "$download_images_ret_error"
+				else
+					die "Failed to download from URL: $MEDIA_ITEM"
+				fi
 			fi
 		fi
 	else
