@@ -226,6 +226,259 @@ extract_meta_id() {
 	return 1
 }
 
+# Function to get first non-empty caption from an array of captions
+# Parameters:
+#   $1: CAPTIONS_STR - array of captions passed as string to eval
+# Returns: first non-empty caption via stdout, or empty if none found
+get_first_non_empty_caption() {
+	local CAPTIONS_STR="$1"
+	local CAPTIONS=()
+	eval "CAPTIONS=($CAPTIONS_STR)"
+	
+	local gallery_caption=""
+	if [ ${#CAPTIONS[@]} -gt 0 ]; then
+		# Use first non-empty caption, or first caption if all empty
+		for cap in "${CAPTIONS[@]}"; do
+			if [ -n "$cap" ]; then
+				gallery_caption="$cap"
+				break
+			fi
+		done
+		if [ -z "$gallery_caption" ] && [ -n "${CAPTIONS[0]}" ]; then
+			gallery_caption="${CAPTIONS[0]}"
+		fi
+	fi
+	echo "$gallery_caption"
+}
+
+# Function to get metadata file path for an image file
+# Parameters:
+#   $1: FILE - path to image file
+# Returns: metadata file path via stdout (empty if not found)
+# Note: Tries both "${file}.json" and "${file%.*}.json" patterns
+get_metadata_file_path() {
+	local file="$1"
+	local meta="${file}.json"
+	if [ ! -f "$meta" ]; then
+		meta="${file%.*}.json"
+	fi
+	# Only return if file exists, otherwise return empty
+	if [ -f "$meta" ]; then
+		echo "$meta"
+	fi
+}
+
+# Function to wait for metadata file to appear
+# Parameters:
+#   $1: FILE - path to image file
+#   $2: MAX_WAIT - maximum number of wait iterations (default: 10)
+# Returns: metadata file path via stdout if found, empty if timeout
+# Note: Waits up to MAX_WAIT * 0.1 seconds for metadata file to appear
+wait_for_metadata_file() {
+	local file="$1"
+	local MAX_WAIT="${2:-10}"
+	
+	if [ ! -f "$file" ]; then
+		return 1
+	fi
+	
+	local meta=$(get_metadata_file_path "$file")
+	if [ -f "$meta" ]; then
+		echo "$meta"
+		return 0
+	fi
+	
+	local wait_count=0
+	while [ $wait_count -lt "$MAX_WAIT" ]; do
+		sleep 0.1
+		((wait_count++))
+		meta=$(get_metadata_file_path "$file")
+		if [ -f "$meta" ]; then
+			echo "$meta"
+			return 0
+		fi
+	done
+	
+	return 1
+}
+
+# Function to build event content for kind 1 Nostr event
+# Parameters:
+#   $1: UPLOAD_URLS_STR - array of uploaded URLs passed as string to eval
+#   $2: FILE_CAPTIONS_STR - array of captions passed as string to eval
+#   $3: FILE_GALLERIES_STR - array of gallery IDs passed as string to eval
+#   $4: FILE_SOURCES_STR - array of source URLs passed as string to eval
+#   $5: DISPLAY_SOURCE - 1 to display sources, 0 otherwise
+# Returns: event content via stdout
+# Note: Interleaves URLs and captions, handles galleries, adds sources at bottom
+build_event_content() {
+	local UPLOAD_URLS_STR="$1"
+	local FILE_CAPTIONS_STR="$2"
+	local FILE_GALLERIES_STR="$3"
+	local FILE_SOURCES_STR="$4"
+	local DISPLAY_SOURCE="$5"
+	
+	local UPLOAD_URLS=()
+	local FILE_CAPTIONS=()
+	local FILE_GALLERIES=()
+	local FILE_SOURCES=()
+	eval "UPLOAD_URLS=($UPLOAD_URLS_STR)"
+	eval "FILE_CAPTIONS=($FILE_CAPTIONS_STR)"
+	eval "FILE_GALLERIES=($FILE_GALLERIES_STR)"
+	eval "FILE_SOURCES=($FILE_SOURCES_STR)"
+	
+	local CONTENT=""
+	
+	# Interleave URLs and captions
+	if [ ${#UPLOAD_URLS[@]} -gt 0 ]; then
+		local idx=0
+		local current_gallery_id=""
+		local gallery_caption=""
+		local gallery_count=0
+		local last_idx_in_gallery=-1
+		local need_space_before_url=0  # Track if we need spacing before adding next URL
+		
+		while [ $idx -lt ${#UPLOAD_URLS[@]} ]; do
+			local url="${UPLOAD_URLS[$idx]}"
+			local gallery_id=""
+			if [ $idx -lt ${#FILE_GALLERIES[@]} ]; then
+				gallery_id="${FILE_GALLERIES[$idx]}"
+			fi
+			
+			# Check if this is a new gallery (and not the first item)
+			if [ -n "$current_gallery_id" ] && [ "$gallery_id" != "$current_gallery_id" ]; then
+				# End of previous gallery - add its caption if available (multi-image gallery)
+				# Note: This should have been handled when we processed the last item of the previous gallery
+				# But if we missed it, handle it here
+				if [ $gallery_count -gt 1 ] && [ -n "$gallery_caption" ]; then
+					# Empty line after images, before caption
+					CONTENT="${CONTENT}"$'\n'"${gallery_caption}"
+					need_space_before_url=1  # Need 2 empty lines after caption before next URL
+				fi
+				gallery_caption=""
+				gallery_count=0
+				last_idx_in_gallery=-1
+			fi
+			
+			# Check if this is start of a new gallery or a single file
+			if [ "$current_gallery_id" != "$gallery_id" ]; then
+				current_gallery_id="$gallery_id"
+				# Count how many files belong to this gallery
+				local FILE_GALLERIES_FOR_COUNT_STR=$(printf '%q ' "${FILE_GALLERIES[@]}")
+				gallery_count=$(count_gallery_files "$idx" "$gallery_id" "$FILE_GALLERIES_FOR_COUNT_STR" "$((${#UPLOAD_URLS[@]} - 1))")
+				last_idx_in_gallery=$((idx + gallery_count - 1))
+				
+				# If multiple files in gallery, collect all captions
+				if [ $gallery_count -gt 1 ]; then
+					# Accumulate all captions from all files in the gallery
+					gallery_caption=""
+					local caption_count=0
+					for cap_idx in $(seq $idx $last_idx_in_gallery); do
+						if [ $cap_idx -lt ${#FILE_CAPTIONS[@]} ] && [ -n "${FILE_CAPTIONS[$cap_idx]}" ]; then
+							if [ $caption_count -eq 0 ]; then
+								gallery_caption="${FILE_CAPTIONS[$cap_idx]}"
+							else
+								# Add blank line between captions (two newlines = one blank line)
+								gallery_caption="${gallery_caption}"$'\n\n'"${FILE_CAPTIONS[$cap_idx]}"
+							fi
+							((caption_count++))
+						fi
+					done
+				else
+					# Single file - caption goes immediately after URL
+					gallery_caption=""
+				fi
+			fi
+			
+			# Add spacing before URL if needed (2 empty lines after previous caption)
+			# Three newlines = caption + newline + empty line + empty line + URL
+			if [ $need_space_before_url -eq 1 ]; then
+				CONTENT="${CONTENT}"$'\n\n\n'
+				need_space_before_url=0
+			fi
+			
+			# Add URL
+			if [ -n "$CONTENT" ]; then
+				CONTENT="${CONTENT}"$'\n'"${url}"
+			else
+				CONTENT="${url}"
+			fi
+			
+			# Check if we're at the last item in a gallery - add caption after all gallery URLs
+			if [ $gallery_count -gt 1 ] && [ $idx -eq $last_idx_in_gallery ]; then
+				# This is the last URL in the gallery
+				# Check if there's a next item - we'll need spacing before it
+				if [ $((idx + 1)) -lt ${#UPLOAD_URLS[@]} ]; then
+					if [ -n "$gallery_caption" ]; then
+						# Empty line after images, before caption (two newlines = one empty line)
+						CONTENT="${CONTENT}"$'\n\n'"${gallery_caption}"
+						need_space_before_url=1  # Need 2 empty lines after caption before next URL
+					else
+						# No caption, but still need 2 empty lines before next URL
+						need_space_before_url=1
+					fi
+				else
+					# No next item, just add caption if available
+					if [ -n "$gallery_caption" ]; then
+						# Empty line after images, before caption (two newlines = one empty line)
+						CONTENT="${CONTENT}"$'\n\n'"${gallery_caption}"
+					fi
+				fi
+			fi
+			
+			# For single files (not galleries), add caption immediately after URL
+			if [ $gallery_count -eq 1 ]; then
+				if [ $idx -lt ${#FILE_CAPTIONS[@]} ] && [ -n "${FILE_CAPTIONS[$idx]}" ]; then
+					# Empty line after URL, before caption (two newlines = one empty line)
+					CONTENT="${CONTENT}"$'\n\n'"${FILE_CAPTIONS[$idx]}"
+					# Check if there's a next item
+					if [ $((idx + 1)) -lt ${#UPLOAD_URLS[@]} ]; then
+						need_space_before_url=1  # Need 2 empty lines after caption before next URL
+					fi
+				fi
+			fi
+			
+			((idx++))
+		done
+	fi
+	
+	# Add sources at the bottom (if any and if display_source is enabled)
+	if [ $DISPLAY_SOURCE -eq 1 ] && [ ${#FILE_SOURCES[@]} -gt 0 ]; then
+		if [ -n "$CONTENT" ]; then
+			# One empty line before sources section (two newlines = one empty line)
+			CONTENT="${CONTENT}"$'\n\n'
+		fi
+		
+		# Count non-empty sources
+		local source_count=0
+		for source in "${FILE_SOURCES[@]}"; do
+			if [ -n "$source" ]; then
+				((source_count++))
+			fi
+		done
+		
+		if [ $source_count -eq 1 ]; then
+			# Only one source - use "Source: " prefix on same line
+			for source in "${FILE_SOURCES[@]}"; do
+				if [ -n "$source" ]; then
+					CONTENT="${CONTENT}Source: ${source}"
+					break
+				fi
+			done
+		else
+			# Multiple sources - use "Sources:" on its own line, then each source with "- " prefix
+			CONTENT="${CONTENT}Sources:"
+			for source in "${FILE_SOURCES[@]}"; do
+				if [ -n "$source" ]; then
+					CONTENT="${CONTENT}"$'\n'"- ${source}"
+				fi
+			done
+		fi
+	fi
+	
+	echo "$CONTENT"
+}
+
 # Function to check a file for matching FBID in metadata
 # Parameters:
 #   $1: FILE - path to image file to check
@@ -246,28 +499,11 @@ check_file_for_fbid() {
 		return 1
 	fi
 	
-	# Check if metadata file exists
-	local meta="${file}.json"
-	if [ ! -f "$meta" ]; then
-		meta="${file%.*}.json"
-	fi
-	
-	# Wait a bit for metadata file to be written if image file exists
-	if [ -f "$file" ] && [ ! -f "$meta" ]; then
-		local wait_count=0
-		while [ $wait_count -lt 10 ] && [ ! -f "$meta" ]; do
-			sleep 0.1
-			((wait_count++))
-			# Re-check meta path
-			meta="${file}.json"
-			if [ ! -f "$meta" ]; then
-				meta="${file%.*}.json"
-			fi
-		done
-	fi
+	# Wait for metadata file to appear and get its path
+	local meta=$(wait_for_metadata_file "$file" 10)
 	
 	# Check metadata file if it exists
-	if [ -f "$meta" ]; then
+	if [ -n "$meta" ] && [ -f "$meta" ]; then
 		# Check if the 'id' field matches the FBID (only check 'id' field, not other ID fields)
 		local meta_id=$(extract_meta_id_only "$meta")
 		if [ $? -eq 0 ] && [ "$meta_id" = "$FBID" ]; then
@@ -534,24 +770,8 @@ download_images() {
 								continue
 							fi
 							
-							# Check metadata file
-							local meta="${file}.json"
-							if [ ! -f "$meta" ]; then
-								meta="${file%.*}.json"
-							fi
-							
-							# Wait briefly for metadata to be written
-							if [ -f "$file" ] && [ ! -f "$meta" ]; then
-								local meta_wait=0
-								while [ $meta_wait -lt 10 ] && [ ! -f "$meta" ]; do
-									sleep 0.1
-									((meta_wait++))
-									meta="${file}.json"
-									if [ ! -f "$meta" ]; then
-										meta="${file%.*}.json"
-									fi
-								done
-							fi
+							# Wait for metadata file to appear and get its path
+							local meta=$(wait_for_metadata_file "$file" 10)
 							
 							# Increment file count
 							((current_count++))
@@ -632,11 +852,8 @@ download_images() {
 							# Copy the image file and its metadata
 							cp "$file" "$MATCHING_FILE_DIR/" 2>/dev/null
 							# Copy metadata file if it exists
-							local meta="${file}.json"
-							if [ ! -f "$meta" ]; then
-								meta="${file%.*}.json"
-							fi
-							if [ -f "$meta" ]; then
+							local meta=$(get_metadata_file_path "$file")
+							if [ -n "$meta" ] && [ -f "$meta" ]; then
 								cp "$meta" "$MATCHING_FILE_DIR/" 2>/dev/null
 							fi
 							break
@@ -699,11 +916,8 @@ download_images() {
 			
 			# Extract caption from metadata if available
 			local extracted_caption=""
-			local meta="${file}.json"
-			if [ ! -f "$meta" ]; then
-				meta="${file%.*}.json"
-			fi
-			if [ -f "$meta" ] && [ "$APPEND_ORIGINAL_COMMENT" -eq 1 ]; then
+			local meta=$(get_metadata_file_path "$file")
+			if [ -n "$meta" ] && [ -f "$meta" ] && [ "$APPEND_ORIGINAL_COMMENT" -eq 1 ]; then
 				extracted_caption=$(jq -r '.caption // empty' "$meta" 2>/dev/null | sed 's/^"\|"$//g')
 			fi
 			local file_caption=$(build_caption "$DESCRIPTION_CANDIDATE" "$extracted_caption" "$APPEND_ORIGINAL_COMMENT")
@@ -1070,19 +1284,8 @@ GALLERY_ID=0
 			if [ "$IMAGE_DOWNLOAD_RESULT" -eq 0 ]; then
 				# For gallery images, all files from same gallery share the same gallery ID and caption
 				# Use the first caption (they should all be the same or similar for gallery downloads)
-				gallery_caption=""
-				if [ ${#download_images_ret_captions[@]} -gt 0 ]; then
-					# Use first non-empty caption, or first caption if all empty
-					for cap in "${download_images_ret_captions[@]}"; do
-						if [ -n "$cap" ]; then
-							gallery_caption="$cap"
-							break
-						fi
-					done
-					if [ -z "$gallery_caption" ] && [ -n "${download_images_ret_captions[0]}" ]; then
-						gallery_caption="${download_images_ret_captions[0]}"
-					fi
-				fi
+				CAPTIONS_STR=$(printf '%q ' "${download_images_ret_captions[@]}")
+				gallery_caption=$(get_first_non_empty_caption "$CAPTIONS_STR")
 				
 				# Append downloaded files to parallel arrays - all from same gallery
 				if [ ${#download_images_ret_files[@]} -gt 0 ]; then
@@ -1201,154 +1404,11 @@ for TRIES in "${!BLOSSOMS[@]}"; do
 	# Build content for kind 1 event: interleaved URL -> caption -> URL -> caption, then sources at bottom
 	# For gallery images: all URLs first, then caption for the gallery
 	# Formatting: empty line after images before caption, 2 empty lines after caption before next URL
-	CONTENT=""
-	
-	# Interleave URLs and captions
-	if [ ${#UPLOAD_URLS[@]} -gt 0 ]; then
-		idx=0
-		current_gallery_id=""
-		gallery_caption=""
-		gallery_count=0
-		last_idx_in_gallery=-1
-		need_space_before_url=0  # Track if we need spacing before adding next URL
-		
-		while [ $idx -lt ${#UPLOAD_URLS[@]} ]; do
-			url="${UPLOAD_URLS[$idx]}"
-			gallery_id=""
-			if [ $idx -lt ${#FILE_GALLERIES[@]} ]; then
-				gallery_id="${FILE_GALLERIES[$idx]}"
-			fi
-			
-			# Check if this is a new gallery (and not the first item)
-			if [ -n "$current_gallery_id" ] && [ "$gallery_id" != "$current_gallery_id" ]; then
-				# End of previous gallery - add its caption if available (multi-image gallery)
-				# Note: This should have been handled when we processed the last item of the previous gallery
-				# But if we missed it, handle it here
-				if [ $gallery_count -gt 1 ] && [ -n "$gallery_caption" ]; then
-					# Empty line after images, before caption
-					CONTENT="${CONTENT}"$'\n'"${gallery_caption}"
-					need_space_before_url=1  # Need 2 empty lines after caption before next URL
-				fi
-				gallery_caption=""
-				gallery_count=0
-				last_idx_in_gallery=-1
-			fi
-			
-			# Check if this is start of a new gallery or a single file
-			if [ "$current_gallery_id" != "$gallery_id" ]; then
-				current_gallery_id="$gallery_id"
-				# Count how many files belong to this gallery
-				FILE_GALLERIES_STR=$(printf '%q ' "${FILE_GALLERIES[@]}")
-				gallery_count=$(count_gallery_files "$idx" "$gallery_id" "$FILE_GALLERIES_STR" "$((${#UPLOAD_URLS[@]} - 1))")
-				last_idx_in_gallery=$((idx + gallery_count - 1))
-				
-				# If multiple files in gallery, collect all captions
-				if [ $gallery_count -gt 1 ]; then
-					# Accumulate all captions from all files in the gallery
-					gallery_caption=""
-					caption_count=0
-					for cap_idx in $(seq $idx $last_idx_in_gallery); do
-						if [ $cap_idx -lt ${#FILE_CAPTIONS[@]} ] && [ -n "${FILE_CAPTIONS[$cap_idx]}" ]; then
-							if [ $caption_count -eq 0 ]; then
-								gallery_caption="${FILE_CAPTIONS[$cap_idx]}"
-							else
-								# Add blank line between captions (two newlines = one blank line)
-								gallery_caption="${gallery_caption}"$'\n\n'"${FILE_CAPTIONS[$cap_idx]}"
-							fi
-							((caption_count++))
-						fi
-					done
-				else
-					# Single file - caption goes immediately after URL
-					gallery_caption=""
-				fi
-			fi
-			
-			# Add spacing before URL if needed (2 empty lines after previous caption)
-			# Three newlines = caption + newline + empty line + empty line + URL
-			if [ $need_space_before_url -eq 1 ]; then
-				CONTENT="${CONTENT}"$'\n\n\n'
-				need_space_before_url=0
-			fi
-			
-			# Add URL
-			if [ -n "$CONTENT" ]; then
-				CONTENT="${CONTENT}"$'\n'"${url}"
-			else
-				CONTENT="${url}"
-			fi
-			
-			# Check if we're at the last item in a gallery - add caption after all gallery URLs
-			if [ $gallery_count -gt 1 ] && [ $idx -eq $last_idx_in_gallery ]; then
-				# This is the last URL in the gallery
-				# Check if there's a next item - we'll need spacing before it
-				if [ $((idx + 1)) -lt ${#UPLOAD_URLS[@]} ]; then
-					if [ -n "$gallery_caption" ]; then
-						# Empty line after images, before caption (two newlines = one empty line)
-						CONTENT="${CONTENT}"$'\n\n'"${gallery_caption}"
-						need_space_before_url=1  # Need 2 empty lines after caption before next URL
-					else
-						# No caption, but still need 2 empty lines before next URL
-						need_space_before_url=1
-					fi
-				else
-					# No next item, just add caption if available
-					if [ -n "$gallery_caption" ]; then
-						# Empty line after images, before caption (two newlines = one empty line)
-						CONTENT="${CONTENT}"$'\n\n'"${gallery_caption}"
-					fi
-				fi
-			fi
-			
-			# For single files (not galleries), add caption immediately after URL
-			if [ $gallery_count -eq 1 ]; then
-				if [ $idx -lt ${#FILE_CAPTIONS[@]} ] && [ -n "${FILE_CAPTIONS[$idx]}" ]; then
-					# Empty line after URL, before caption (two newlines = one empty line)
-					CONTENT="${CONTENT}"$'\n\n'"${FILE_CAPTIONS[$idx]}"
-					# Check if there's a next item
-					if [ $((idx + 1)) -lt ${#UPLOAD_URLS[@]} ]; then
-						need_space_before_url=1  # Need 2 empty lines after caption before next URL
-					fi
-				fi
-			fi
-			
-			((idx++))
-		done
-	fi
-	
-	# Add sources at the bottom (if any and if display_source is enabled)
-	if [ $DISPLAY_SOURCE -eq 1 ] && [ ${#FILE_SOURCES[@]} -gt 0 ]; then
-		if [ -n "$CONTENT" ]; then
-			# One empty line before sources section (two newlines = one empty line)
-			CONTENT="${CONTENT}"$'\n\n'
-		fi
-		
-		# Count non-empty sources
-		source_count=0
-		for source in "${FILE_SOURCES[@]}"; do
-			if [ -n "$source" ]; then
-				((source_count++))
-			fi
-		done
-		
-		if [ $source_count -eq 1 ]; then
-			# Only one source - use "Source: " prefix on same line
-			for source in "${FILE_SOURCES[@]}"; do
-				if [ -n "$source" ]; then
-					CONTENT="${CONTENT}Source: ${source}"
-					break
-				fi
-			done
-		else
-			# Multiple sources - use "Sources:" on its own line, then each source with "- " prefix
-			CONTENT="${CONTENT}Sources:"
-			for source in "${FILE_SOURCES[@]}"; do
-				if [ -n "$source" ]; then
-					CONTENT="${CONTENT}"$'\n'"- ${source}"
-				fi
-			done
-		fi
-	fi
+	UPLOAD_URLS_STR=$(printf '%q ' "${UPLOAD_URLS[@]}")
+	FILE_CAPTIONS_STR=$(printf '%q ' "${FILE_CAPTIONS[@]}")
+	FILE_GALLERIES_STR=$(printf '%q ' "${FILE_GALLERIES[@]}")
+	FILE_SOURCES_STR=$(printf '%q ' "${FILE_SOURCES[@]}")
+	CONTENT=$(build_event_content "$UPLOAD_URLS_STR" "$FILE_CAPTIONS_STR" "$FILE_GALLERIES_STR" "$FILE_SOURCES_STR" "$DISPLAY_SOURCE")
 
 	# Print content for debugging before creating event
 	echo "=== Event Content (Debug) ==="
