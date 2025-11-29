@@ -7,7 +7,7 @@ BLOSSOMS=(
 	"https://nostr.download"
 	"https://blossom.primal.net"
 )
-# Shuffle the BLOSSOMS array
+# Shuffle the BLOSSOMS array (disabled temporarily until finished)
 #BLOSSOMS=($(shuf -e "${BLOSSOMS[@]}"))
 
 RELAYS="wss://bcast.girino.org wss://nip13.girino.org"
@@ -303,7 +303,6 @@ get_first_non_empty_caption() {
 	fi
 	echo "$gallery_caption"
 }
-
 
 # Function to wait for metadata file to appear
 # Parameters:
@@ -1367,7 +1366,6 @@ GALLERY_ID=0
 		download_video_ret_captions=()
 		download_video_ret_source=""
 		download_video_ret_success=1
-		download_video_ret_temp_files=""
 		
 		download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
 		VIDEO_DOWNLOAD_RESULT="${download_video_ret_success:-1}"
