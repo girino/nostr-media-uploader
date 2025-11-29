@@ -2,3 +2,5 @@ refactoring_report*.txt
 
 unused_code_report.txt
 unused_code_report*.txt
+*_report.txt
+return_variables_refactoring_report.txt

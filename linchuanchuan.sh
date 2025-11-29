@@ -961,45 +961,41 @@ download_images() {
 #   $1: FILE - path to file to upload
 #   $2: BLOSSOM - blossom server URL
 #   $3: KEY - private key for upload
-# Return variables (set at end of function):
-#   upload_file_ret_url - uploaded file URL (empty on failure)
-#   upload_file_ret_success - 0 on success, 1 on failure
+# Returns: uploaded file URL via stdout
+# Exit code: 0 on success, 1 on failure
 upload_file_to_blossom() {
 	local FILE="$1"
 	local BLOSSOM="$2"
 	local KEY="$3"
 	
-	upload_file_ret_url=""
-	upload_file_ret_success=1
-	
 	local FILE_WIN=$(cygpath -w "$FILE")
 	if [ ! -f "$FILE" ]; then
-		echo "File does not exist: $FILE"
+		echo "File does not exist: $FILE" >&2
 		return 1
 	fi
 	
-	echo "Uploading $FILE to $BLOSSOM"
+	echo "Uploading $FILE to $BLOSSOM" >&2
 	local upload_output=$(nak blossom upload --server "$BLOSSOM" "$FILE_WIN" "--sec" "$KEY")
 	local RESULT=$?
 	if [ $RESULT -ne 0 ]; then
-		echo "Failed to upload file $FILE to $BLOSSOM with nak, trying with blossom-cli"
+		echo "Failed to upload file $FILE to $BLOSSOM with nak, trying with blossom-cli" >&2
 		upload_output=$(blossom-cli upload -file "$FILE_WIN" -server "$BLOSSOM" -privkey "$KEY" 2>/dev/null)
 		RESULT=$?
 	fi
 	if [ $RESULT -ne 0 ]; then
-		echo "Failed to upload file $FILE to $BLOSSOM: $upload_output"
+		echo "Failed to upload file $FILE to $BLOSSOM: $upload_output" >&2
 		return 1
 	fi
 	
 	local file_url=$(echo "$upload_output" | jq -r '.url')
 	if [ -z "$file_url" ] || [ "$file_url" == "null" ]; then
-		echo "Failed to extract URL from upload output: $upload_output"
+		echo "Failed to extract URL from upload output: $upload_output" >&2
 		return 1
 	fi
 	
-	upload_file_ret_url="$file_url"
-	upload_file_ret_success=0
-	echo "Uploaded to: $file_url"
+	echo "Uploaded to: $file_url" >&2
+	echo "$file_url"
+	return 0
 }
 
 # Function to decrypt key from various formats
@@ -1008,87 +1004,75 @@ upload_file_to_blossom() {
 #   $2: NCRYPT_KEY_VAL - NCRYPT key value (may be empty)
 #   $3: KEY_VAL - default key value (may be empty)
 #   $4: PASSWORD - password for decryption (may be empty, will prompt if needed)
-# Return variables (set at end of function):
-#   decrypt_key_ret_key - decrypted key (empty on failure)
-#   decrypt_key_ret_success - 0 on success, 1 on failure
+# Returns: decrypted key via stdout
+# Exit code: 0 on success, 1 on failure
 decrypt_key() {
 	local NSEC_KEY_VAL="$1"
 	local NCRYPT_KEY_VAL="$2"
 	local KEY_VAL="$3"
 	local PASSWORD="$4"
 	
-	decrypt_key_ret_key=""
-	decrypt_key_ret_success=1
+	local decrypted_key=""
 	
 	if [ -n "$NSEC_KEY_VAL" ]; then
-		echo "Using NSEC_KEY to decrypt the secret key"
+		echo "Using NSEC_KEY to decrypt the secret key" >&2
 		local DECODED=$(nak decode $NSEC_KEY_VAL)
 		if [ $? -ne 0 ]; then
-			echo "Failed to decrypt the key"
+			echo "Failed to decrypt the key" >&2
 			return 1
 		fi
 		
 		# Check if the decoded output is JSON (starts with {) or a hex key
 		if echo "$DECODED" | grep -q '^{'; then
 			# It's JSON, extract the private_key field
-			decrypt_key_ret_key=$(echo "$DECODED" | jq -r .private_key)
+			decrypted_key=$(echo "$DECODED" | jq -r .private_key)
 		else
 			# It's already a hex key, use it directly
-			decrypt_key_ret_key="$DECODED"
+			decrypted_key="$DECODED"
 		fi
 	elif [ -n "$NCRYPT_KEY_VAL" ]; then
-		echo "Using NCRYPT_KEY to decrypt the secret key"
+		echo "Using NCRYPT_KEY to decrypt the secret key" >&2
 		if [ -z "$PASSWORD" ]; then
 			read -sp "Enter password to decrypt the secret key: " PASSWORD
 			echo
 		fi
-		decrypt_key_ret_key=$(nak key decrypt "$NCRYPT_KEY_VAL" "$PASSWORD")
+		decrypted_key=$(nak key decrypt "$NCRYPT_KEY_VAL" "$PASSWORD")
 		if [ $? -ne 0 ]; then
-			echo "Failed to decrypt the key"
+			echo "Failed to decrypt the key" >&2
 			return 1
 		fi
 	else
-		echo "Using default key"
+		echo "Using default key" >&2
 		if [ -z "$KEY_VAL" ]; then
-			echo "Key is empty, cannot decrypt"
+			echo "Key is empty, cannot decrypt" >&2
 			return 1
 		fi
 		if [ -z "$PASSWORD" ]; then
 			read -sp "Enter password to decrypt the secret key: " PASSWORD
 			echo
 		fi
-		decrypt_key_ret_key=$(echo "$KEY_VAL" | openssl enc -aes-256-cbc -pbkdf2 -d -a -pass pass:"$PASSWORD")
+		decrypted_key=$(echo "$KEY_VAL" | openssl enc -aes-256-cbc -pbkdf2 -d -a -pass pass:"$PASSWORD")
 		if [ $? -ne 0 ]; then
-			echo "Failed to decrypt the key"
+			echo "Failed to decrypt the key" >&2
 			return 1
 		fi
 	fi
 	
-	if [ -z "$decrypt_key_ret_key" ]; then
-		echo "Decryption failed, key is empty"
+	if [ -z "$decrypted_key" ]; then
+		echo "Decryption failed, key is empty" >&2
 		return 1
 	fi
 	
-	decrypt_key_ret_success=0
+	echo "$decrypted_key"
+	return 0
 }
 
-# Function to process URL for history checking
+# Function to normalize a media URL (removes tracking params, normalizes)
 # Parameters:
-#   $1: MEDIA_FILE - URL or file path to process
-#   $2: HISTORY_FILE - path to history file
-#   $3: DISABLE_HASH_CHECK - 1 to disable, 0 otherwise
-# Return variables (set at end of function):
-#   process_url_for_history_ret_original_url - original URL (normalized)
-#   process_url_for_history_ret_file_name - file name for history check
-#   process_url_for_history_ret_should_exit - 1 if already processed, 0 otherwise
-process_url_for_history() {
+#   $1: MEDIA_FILE - URL or file path to normalize
+# Returns: normalized URL via stdout (empty if not a URL)
+normalize_media_url() {
 	local MEDIA_FILE="$1"
-	local HISTORY_FILE="$2"
-	local DISABLE_HASH_CHECK="$3"
-	
-	process_url_for_history_ret_original_url=""
-	process_url_for_history_ret_file_name=""
-	process_url_for_history_ret_should_exit=0
 	
 	if [[ "$MEDIA_FILE" =~ ^https?:// ]]; then
 		# It's a URL
@@ -1097,26 +1081,57 @@ process_url_for_history() {
 		if [[ "$TMP_FILE" =~ ^https?://.*instagram\.com/.* ]]; then
 			TMP_FILE=$(echo "$TMP_FILE" | sed 's/\?.*//')
 		fi
-		process_url_for_history_ret_original_url="$TMP_FILE"
-		# remove trailing "/" from FILE if it exists
-		TMP_FILE=$(echo "$TMP_FILE" | sed 's:/*$::')
+		echo "$TMP_FILE"
+	else
+		# It's a local file, return empty
+		echo ""
+	fi
+}
+
+# Function to get filename from URL or file path
+# Parameters:
+#   $1: MEDIA_FILE - URL or file path
+# Returns: filename via stdout
+get_media_filename() {
+	local MEDIA_FILE="$1"
+	
+	if [[ "$MEDIA_FILE" =~ ^https?:// ]]; then
+		# It's a URL - normalize first to get clean URL
+		local normalized=$(normalize_media_url "$MEDIA_FILE")
+		# remove trailing "/" from URL if it exists
+		local TMP_FILE=$(echo "$normalized" | sed 's:/*$::')
 		local FILE_NAME=$(basename "$TMP_FILE")
-		process_url_for_history_ret_file_name="$FILE_NAME"
-		if check_history "$FILE_NAME" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
-			process_url_for_history_ret_should_exit=1
-			return 0
-		fi
+		echo "$FILE_NAME"
 	else
 		# It's a local file
 		local FILE_NAME=$(basename "$MEDIA_FILE")
-		process_url_for_history_ret_file_name="$FILE_NAME"
-		if check_history "$FILE_NAME" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
-			process_url_for_history_ret_should_exit=1
-			return 0
-		fi
+		echo "$FILE_NAME"
+	fi
+}
+
+# Function to check if media file is in history and return normalized URL or filename
+# Parameters:
+#   $1: MEDIA_FILE - URL or file path to check
+#   $2: HISTORY_FILE - path to history file
+#   $3: DISABLE_HASH_CHECK - 1 to disable, 0 otherwise
+# Returns: filename via stdout if in history, normalized URL via stdout if not (empty if local file)
+# Exit code: 0 if NOT in history (ok to proceed), 1 if in history (should exit)
+check_media_history() {
+	local MEDIA_FILE="$1"
+	local HISTORY_FILE="$2"
+	local DISABLE_HASH_CHECK="$3"
+	
+	local FILE_NAME=$(get_media_filename "$MEDIA_FILE")
+	if check_history "$FILE_NAME" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
+		# Found in history - return filename
+		echo "$FILE_NAME"
+		return 1  # Found in history - should exit
 	fi
 	
-	return 0
+	# Not in history - return normalized URL (empty if local file)
+	local normalized_url=$(normalize_media_url "$MEDIA_FILE")
+	echo "$normalized_url"
+	return 0  # Not found - ok to proceed
 }
 
 # Function to clean up source URL by removing problematic parameters
@@ -1144,7 +1159,7 @@ cleanup_source_url() {
 
 # Function to display usage information
 usage() {
-	SCRIPT_NAME=$(basename "$0")
+	local SCRIPT_NAME=$(basename "$0")
 	echo "Usage: $SCRIPT_NAME [options] <file|url>... [description] [source]"
 	echo
 	echo "Options:"
@@ -1322,22 +1337,25 @@ fi
 # Check if the file names are present in the history file
 ORIGINAL_URLS=()
 for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
-	process_url_for_history "$MEDIA_FILE" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"
-	if [ "$process_url_for_history_ret_should_exit" -eq 1 ]; then
-		echo "File name already processed: $process_url_for_history_ret_file_name"
+	local result=$(check_media_history "$MEDIA_FILE" "$HISTORY_FILE" "$DISABLE_HASH_CHECK")
+	if [ $? -ne 0 ]; then
+		# File is in history - result contains filename
+		echo "File name already processed: $result"
 		exit 1
 	fi
-	if [ -n "$process_url_for_history_ret_original_url" ]; then
-		ORIGINAL_URLS+=("$process_url_for_history_ret_original_url")
+	
+	# Not in history - result contains normalized URL (empty if local file)
+	# Add normalized URL if it's not empty (it's a URL, not a local file)
+	if [ -n "$result" ]; then
+		ORIGINAL_URLS+=("$result")
 	fi
 done
 
 # Decrypt key from various formats
-decrypt_key "$NSEC_KEY" "$NCRYPT_KEY" "$KEY" "$PASSWORD"
+KEY=$(decrypt_key "$NSEC_KEY" "$NCRYPT_KEY" "$KEY" "$PASSWORD")
 if [ $? -ne 0 ]; then
 	die "Decryption failed, key is empty"
 fi
-KEY="$decrypt_key_ret_key"
 
 # Prepare gallery-dl params
 GALLERY_DL_PARAMS=()
@@ -1495,12 +1513,12 @@ for TRIES in "${!BLOSSOMS[@]}"; do
 	upload_success=1
 	
 	for FILE in "${PROCESSED_FILES[@]}"; do
-		upload_file_to_blossom "$FILE" "$BLOSSOM" "$KEY"
+		local upload_url=$(upload_file_to_blossom "$FILE" "$BLOSSOM" "$KEY")
 		if [ $? -ne 0 ]; then
 			upload_success=0
 			break
 		fi
-		UPLOAD_URLS+=("$upload_file_ret_url")
+		UPLOAD_URLS+=("$upload_url")
 	done
 
 	if [ $upload_success -eq 0 ]; then
