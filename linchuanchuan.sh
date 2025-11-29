@@ -12,35 +12,41 @@ BLOSSOMS=(
 
 RELAYS="wss://bcast.girino.org wss://nip13.girino.org"
 
-# Global array to track temp files for cleanup
-TEMP_FILES=()
+# Global array to track files/directories for cleanup (used only by add_to_cleanup and cleanup functions)
+CLEANUP_FILES=()
 
 # functions 
+# Function to add a file or directory to the cleanup list
+# Parameters:
+#   $1: FILE_OR_DIR - path to file or directory to add to cleanup list
+add_to_cleanup() {
+	local FILE_OR_DIR="$1"
+	if [ -n "$FILE_OR_DIR" ]; then
+		CLEANUP_FILES+=("$FILE_OR_DIR")
+	fi
+}
+
 # Function to delete temp files on exit
 cleanup() {
 	echo "Cleaning up..."
-	# Clean up tracked temp files
-	for TEMP_FILE in "${TEMP_FILES[@]}"; do
-		if [ -n "$TEMP_FILE" ]; then
-			if [ -f "$TEMP_FILE" ]; then
-				rm -f "$TEMP_FILE" && echo "Deleted temp file $TEMP_FILE"
-			elif [ -d "$TEMP_FILE" ]; then
-				rm -rf "$TEMP_FILE" && echo "Deleted temp directory $TEMP_FILE"
+	# Clean up all files/directories listed in the cleanup array
+	for CLEANUP_ITEM in "${CLEANUP_FILES[@]}"; do
+		if [ -n "$CLEANUP_ITEM" ]; then
+			if [ -f "$CLEANUP_ITEM" ]; then
+				rm -f "$CLEANUP_ITEM" && echo "Deleted temp file $CLEANUP_ITEM"
+			elif [ -d "$CLEANUP_ITEM" ]; then
+				rm -rf "$CLEANUP_ITEM" && echo "Deleted temp directory $CLEANUP_ITEM"
 			fi
 		fi
 	done
-	# Clean up temporary files from downloads
-	for PROCESSED_FILE in "${PROCESSED_FILES[@]}"; do
-		if [[ "$PROCESSED_FILE" == /tmp/* ]]; then
-			if [ -f "$PROCESSED_FILE" ]; then
-				rm -f "$PROCESSED_FILE" && echo "Deleted temp file $PROCESSED_FILE"
-			elif [ -d "$PROCESSED_FILE" ]; then
-				rm -rf "$PROCESSED_FILE" && echo "Deleted temp directory $PROCESSED_FILE"
-			fi
-		fi
-	done
-	# Clean up gallery-dl temp directories
+	# Clean up gallery-dl temp directories (fallback for any missed ones)
 	for TMP_DIR in /tmp/gallery_dl_*; do
+		if [ -d "$TMP_DIR" ]; then
+			rm -rf "$TMP_DIR" && echo "Deleted temp directory $TMP_DIR"
+		fi
+	done
+	# Clean up video-dl temp directories (fallback for any missed ones)
+	for TMP_DIR in /tmp/video_dl_*; do
 		if [ -d "$TMP_DIR" ]; then
 			rm -rf "$TMP_DIR" && echo "Deleted temp directory $TMP_DIR"
 		fi
@@ -305,14 +311,19 @@ download_video() {
 	download_video_ret_source=""
 	download_video_ret_success=1
 	
-	local FILE_BASE=$(mktemp -u)
-	local FILE_BASE_INT=$(mktemp -u)
-	local OUT_FILE_INT=${FILE_BASE_INT}.mp4
-	local OUT_FILE=${FILE_BASE}.mp4
-	local DESC_FILE=${FILE_BASE_INT}.description
+	# Create a temporary directory for video downloads
+	local VIDEO_TMPDIR=$(mktemp -d /tmp/video_dl_XXXXXXXX)
+	# Add temp directory to cleanup list
+	add_to_cleanup "$VIDEO_TMPDIR"
 	
-	# Add temp files to cleanup list (only files that will actually be created)
-	TEMP_FILES+=("$OUT_FILE_INT" "$OUT_FILE" "$DESC_FILE")
+	local OUT_FILE_INT="${VIDEO_TMPDIR}/video.mp4"
+	local OUT_FILE="${VIDEO_TMPDIR}/video_converted.mp4"
+	local DESC_FILE="${VIDEO_TMPDIR}/video.description"
+	
+	# Also add individual files for redundancy (directory cleanup + individual file cleanup)
+	add_to_cleanup "$OUT_FILE_INT"
+	add_to_cleanup "$OUT_FILE"
+	add_to_cleanup "$DESC_FILE"
 	
 	echo "Attempting to download as video to $OUT_FILE_INT"
 	local WINFILE_INT=$(cygpath -w "$OUT_FILE_INT")
@@ -400,19 +411,21 @@ download_video() {
 #   $3: APPEND_ORIGINAL_COMMENT - 1 to append, 0 otherwise
 #   $4: DESCRIPTION_CANDIDATE - current description candidate
 #   $5: SOURCE_CANDIDATE - current source candidate
+#   $6: MAX_FILE_SEARCH - maximum number of files to search when looking for FBID
 # Return variables (set at end of function):
 #   download_images_ret_files - array of downloaded files
 #   download_images_ret_captions - array of captions (one per file, empty string if no caption)
 #   download_images_ret_source - source to set (empty if should keep current)
 #   download_images_ret_success - 0 on success, 1 on failure
 #   download_images_ret_error - error message if download failed (empty on success)
-#   download_images_ret_temp_dir - temporary directory that needs cleanup (empty if none)
+#   download_images_ret_temp_dir - temporary directory that needs cleanup (empty if none, added to cleanup list by caller)
 download_images() {
 	local IMAGE_URL="$1"
 	local GALLERY_DL_PARAMS_STR="$2"
 	local APPEND_ORIGINAL_COMMENT="$3"
 	local DESCRIPTION_CANDIDATE="$4"
 	local SOURCE_CANDIDATE="$5"
+	local MAX_FILE_SEARCH="$6"
 	
 	local DOWNLOADED=0
 	# Return variables (global, set at end of function)
@@ -443,16 +456,16 @@ download_images() {
 			echo "Trying to remove set param, new URL: $URL_NOSET"
 			local TEST_TMPDIR=$(mktemp -d /tmp/gallery_dl_test_XXXXXXXX)
 			local WIN_TEST_TMPDIR=$(cygpath -w "$TEST_TMPDIR")
-			# Add temp directory to cleanup list
-			TEMP_FILES+=("$TEST_TMPDIR")
 			echo "Testing download: gallery-dl \"${URL_GALLERY_DL_PARAMS[@]}\" -f '{num}.{extension}' -D \"$WIN_TEST_TMPDIR\" --write-metadata \"$URL_NOSET\""
 			gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_TEST_TMPDIR" --write-metadata "$URL_NOSET" 2>&1 >/dev/null
 			if [ $? -eq 0 ] && [ "$(ls -A "$TEST_TMPDIR" 2>/dev/null)" ]; then
 				PROCESSED_URL="$URL_NOSET"
 				echo "Download succeeded, removed set param, new URL: $PROCESSED_URL"
-				# Keep the test temp directory for later use
+				# Keep the test temp directory for later use (will be added to cleanup when used as IMAGES_TMPDIR)
 				PRE_DOWNLOADED_DIR="$TEST_TMPDIR"
 			else
+				# Track temp directory for cleanup if download failed
+				add_to_cleanup "$TEST_TMPDIR"
 				echo "Download failed, trying to infer position"
 			fi
 		fi
@@ -471,7 +484,7 @@ download_images() {
 				local POSITION_TMPDIR=$(mktemp -d /tmp/gallery_dl_position_XXXXXXXX)
 				local WIN_POSITION_TMPDIR=$(cygpath -w "$POSITION_TMPDIR")
 				# Add temp directory to cleanup list
-				TEMP_FILES+=("$POSITION_TMPDIR")
+				add_to_cleanup "$POSITION_TMPDIR"
 				
 				
 				# Start gallery-dl and read its output line by line
@@ -602,7 +615,7 @@ download_images() {
 					# Create a directory with just the matching file
 					local MATCHING_FILE_DIR=$(mktemp -d /tmp/gallery_dl_matching_XXXXXXXX)
 					local WIN_MATCHING_FILE_DIR=$(cygpath -w "$MATCHING_FILE_DIR")
-					# Return directory for caller to add to TEMP_FILES for cleanup
+					# Return directory for caller to add to cleanup list
 					download_images_ret_temp_dir="$MATCHING_FILE_DIR"
 					
 					# Find the file at the matching position
@@ -655,13 +668,15 @@ download_images() {
 	if [ -n "$PRE_DOWNLOADED_DIR" ] && [ -d "$PRE_DOWNLOADED_DIR" ] && [ "$(ls -A "$PRE_DOWNLOADED_DIR" 2>/dev/null)" ]; then
 		echo "Using pre-downloaded images from $PRE_DOWNLOADED_DIR"
 		local IMAGES_TMPDIR="$PRE_DOWNLOADED_DIR"
+		# Add the pre-downloaded directory to cleanup list (it's a temp directory)
+		add_to_cleanup "$PRE_DOWNLOADED_DIR"
 		DOWNLOADED=1
 	else
 		echo "Attempting to download as images using gallery-dl"
 		local IMAGES_TMPDIR=$(mktemp -d /tmp/gallery_dl_XXXXXXXX)
 		local WIN_IMAGES_TMPDIR=$(cygpath -w "$IMAGES_TMPDIR")
 		# Add temp directory to cleanup list
-		TEMP_FILES+=("$IMAGES_TMPDIR")
+		add_to_cleanup "$IMAGES_TMPDIR"
 		
 		gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_IMAGES_TMPDIR" --write-metadata "$PROCESSED_URL" 2>/dev/null
 		
@@ -678,6 +693,8 @@ download_images() {
 			# Skip metadata files
 			[[ "$file" == *.json ]] && continue
 			download_images_ret_files+=("$file")
+			# Add the downloaded file to cleanup list when it's added to return array
+			add_to_cleanup "$file"
 			echo "Downloaded image: $file"
 			
 			# Extract caption from metadata if available
@@ -764,6 +781,8 @@ HISTORY_FILE=$SCRIPT_DIR/$HISTORY_FILE
 if [ ! -f "$HISTORY_FILE" ]; then
 	die "History file not found: $HISTORY_FILE"
 fi
+
+# Initialize cleanup files array (already initialized as empty array above)
 
 # default values, override if exists in ~/.nostr/${SCRIPT_NAME%.*}
 DISPLAY_SOURCE="${DISPLAY_SOURCE:-0}"
@@ -1002,6 +1021,7 @@ GALLERY_ID=0
 		download_video_ret_captions=()
 		download_video_ret_source=""
 		download_video_ret_success=1
+		download_video_ret_temp_files=""
 		
 		download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
 		VIDEO_DOWNLOAD_RESULT="${download_video_ret_success:-1}"
@@ -1039,12 +1059,12 @@ GALLERY_ID=0
 			download_images_ret_temp_dir=""
 			
 			# Call download_images function (Facebook URL handling is done inside)
-			download_images "$MEDIA_ITEM" "$GALLERY_DL_PARAMS_STR" "$APPEND_ORIGINAL_COMMENT" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
+			download_images "$MEDIA_ITEM" "$GALLERY_DL_PARAMS_STR" "$APPEND_ORIGINAL_COMMENT" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE" "$MAX_FILE_SEARCH"
 			IMAGE_DOWNLOAD_RESULT="${download_images_ret_success:-1}"
 			
-			# Add temp directory to TEMP_FILES for cleanup if returned
+			# Add temp directory to cleanup list if returned
 			if [ -n "$download_images_ret_temp_dir" ]; then
-				TEMP_FILES+=("$download_images_ret_temp_dir")
+				add_to_cleanup "$download_images_ret_temp_dir"
 			fi
 			
 			if [ "$IMAGE_DOWNLOAD_RESULT" -eq 0 ]; then
