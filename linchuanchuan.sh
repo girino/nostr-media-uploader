@@ -1,6 +1,8 @@
 #!/bin/bash
 
+# Script-level constants (read-only after definition)
 SCRIPT_DIR=$(dirname "$0")
+readonly SCRIPT_DIR
 
 BLOSSOMS=(
 	"https://cdn.nostrcheck.me"
@@ -9,8 +11,10 @@ BLOSSOMS=(
 )
 # Shuffle the BLOSSOMS array (disabled temporarily until finished)
 #BLOSSOMS=($(shuf -e "${BLOSSOMS[@]}"))
+readonly BLOSSOMS
 
 RELAYS="wss://bcast.girino.org wss://nip13.girino.org"
+readonly RELAYS
 
 # Global array to track files/directories for cleanup (used only by add_to_cleanup and cleanup functions)
 CLEANUP_FILES=()
@@ -1177,243 +1181,255 @@ usage() {
 	echo
 }
 
-
-# Check if help option is provided
-for arg in "$@"; do
-	if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
-		usage
-		exit 0
+# Main function containing all script logic
+# Parameters:
+#   $@ - command-line arguments
+main() {
+	# All variables declared as local
+	
+	# ========================================================================
+	# READ EXPORTED VARIABLES (read-only)
+	# ========================================================================
+	local DISPLAY_SOURCE="${DISPLAY_SOURCE:-0}"
+	local POW_DIFF="${POW_DIFF:-20}"
+	local APPEND_ORIGINAL_COMMENT="${APPEND_ORIGINAL_COMMENT:-1}"
+	local USE_COOKIES_FF="${USE_COOKIES_FF:-0}"
+	local NSEC_KEY="${NSEC_KEY:-}"
+	local NCRYPT_KEY="${NCRYPT_KEY:-}"
+	local KEY="${KEY:-}"
+	local PASSWORD="${PASSWORD:-}"
+	local EXTRA_RELAYS=("${EXTRA_RELAYS[@]}")
+	local EXTRA_BLOSSOMS=("${EXTRA_BLOSSOMS[@]}")
+	
+	# ========================================================================
+	# SCRIPT METADATA
+	# ========================================================================
+	local SCRIPT_NAME=$(basename "$0")
+	local HISTORY_FILE="${SCRIPT_DIR}/${SCRIPT_NAME%.*}.history"
+	
+	# ========================================================================
+	# VALIDATION
+	# ========================================================================
+	if [ ! -f "$HISTORY_FILE" ]; then
+		die "History file not found: $HISTORY_FILE"
 	fi
-done
-
-# Check if any parameters are provided
-if [ $# -eq 0 ]; then
-	usage
-	exit 1
-fi
-
-SCRIPT_NAME=$(basename "$0")
-HISTORY_FILE="${SCRIPT_NAME%.*}.history"
-HISTORY_FILE=$SCRIPT_DIR/$HISTORY_FILE
-if [ ! -f "$HISTORY_FILE" ]; then
-	die "History file not found: $HISTORY_FILE"
-fi
-
-# Initialize cleanup files array (already initialized as empty array above)
-
-# default values, override if exists in ~/.nostr/${SCRIPT_NAME%.*}
-DISPLAY_SOURCE="${DISPLAY_SOURCE:-0}"
-POW_DIFF="${POW_DIFF:-20}"
-APPEND_ORIGINAL_COMMENT="${APPEND_ORIGINAL_COMMENT:-1}"
-USE_COOKIES_FF="${USE_COOKIES_FF:-0}"
-
-# Load environment variables from ~/.nostr/girino if it exists
-if [[ -f "$HOME/.nostr/${SCRIPT_NAME%.*}" ]]; then
-    # shellcheck source=/dev/null
-    source "$HOME/.nostr/${SCRIPT_NAME%.*}"
-else
-	die "No environment variables found in ~/.nostr/${SCRIPT_NAME%.*}"
-fi
-
-# Ensure that at least one key variable is set, otherwise exit with error
-if [[ -z "$NSEC_KEY" && -z "$KEY" && -z "$NCRYPT_KEY" ]]; then
-	die "Error: No key variable is set. Please set NSEC_KEY, KEY, or NCRYPT_KEY in ~/.nostr/${SCRIPT_NAME%.*}"
-fi
-
-# add EXTRA_RELAYS to RELAYS if exists
-if [[ -n "${EXTRA_RELAYS[*]}" ]]; then
-	for RELAY in "${EXTRA_RELAYS[@]}"; do
-		RELAYS="$RELAYS $RELAY"
+	
+	if [[ -z "$NSEC_KEY" && -z "$KEY" && -z "$NCRYPT_KEY" ]]; then
+		die "Error: No key variable is set. Please set NSEC_KEY, KEY, or NCRYPT_KEY"
+	fi
+	
+	# ========================================================================
+	# PROCESS RELAYS AND BLOSSOMS
+	# ========================================================================
+	local RELAYS_LIST="$RELAYS"
+	if [[ ${#EXTRA_RELAYS[@]} -gt 0 ]]; then
+		for RELAY in "${EXTRA_RELAYS[@]}"; do
+			RELAYS_LIST="$RELAYS_LIST $RELAY"
+		done
+	fi
+	
+	local BLOSSOMS_LIST=("${BLOSSOMS[@]}")
+	if [[ ${#EXTRA_BLOSSOMS[@]} -gt 0 ]]; then
+		BLOSSOMS_LIST=("${EXTRA_BLOSSOMS[@]}" "${BLOSSOMS_LIST[@]}")
+	fi
+	
+	# ========================================================================
+	# PARSE COMMAND-LINE ARGUMENTS
+	# ========================================================================
+	local ALL_MEDIA_FILES=()
+	local CONVERT_VIDEO="${CONVERT_VIDEO:-1}"
+	local SEND_TO_RELAY="${SEND_TO_RELAY:-1}"
+	local DISABLE_HASH_CHECK="${DISABLE_HASH_CHECK:-0}"
+	local MAX_FILE_SEARCH="${MAX_FILE_SEARCH:-10}"
+	local DESCRIPTION_CANDIDATE=""
+	local SOURCE_CANDIDATE=""
+	
+	local PARAM
+	local MIME_TYPE
+	local url
+	
+	while (( "$#" )); do
+		PARAM="$1"
+		PARAM=$(echo "$PARAM" | tr -d '\r\n\t' | sed 's/[[:space:]]\+$//')
+		if [ -f "$PARAM" ]; then
+			MIME_TYPE=$(file --mime-type -b "$PARAM")
+			if [[ "$MIME_TYPE" == image/* || "$MIME_TYPE" == video/* ]]; then
+				ALL_MEDIA_FILES+=("$PARAM")
+			else
+				echo "Unsupported file type: $PARAM => $MIME_TYPE"
+				exit 1
+			fi
+		elif [[ "$PARAM" =~ ^https?:// ]]; then
+			# Check if this contains multiple URLs (space-separated)
+			if [[ "$PARAM" =~ https?://.*[[:space:]]+https?:// ]]; then
+				# Contains multiple URLs, split and add each one
+				while read -r url; do
+					if [[ "$url" =~ ^https?:// ]]; then
+						# Remove ?utm_source=ig_web_copy_link if present at the end of the URL
+						url=$(clean_url "$url")
+						ALL_MEDIA_FILES+=("$url")
+					fi
+				done <<< "$(echo "$PARAM" | grep -oE 'https?://[^[:space:]]+' || echo "$PARAM")"
+			else
+				# Single URL
+				# Remove ?utm_source=ig_web_copy_link if present at the end of the URL
+				PARAM=$(clean_url "$PARAM")
+				ALL_MEDIA_FILES+=("$PARAM")
+			fi
+		elif [[ "$PARAM" == "--convert" || "$PARAM" == "-convert" ]]; then
+			CONVERT_VIDEO=1
+		elif [[ "$PARAM" == "--noconvert" || "$PARAM" == "-noconvert" ]]; then
+			CONVERT_VIDEO=0
+		elif [[ "$PARAM" == "--norelay" || "$PARAM" == "-norelay" ]]; then
+			SEND_TO_RELAY=0
+		elif [[ "$PARAM" == "--nopow" || "$PARAM" == "-nopow" ]]; then
+			POW_DIFF=0
+		elif [[ "$PARAM" == "--nocheck" || "$PARAM" == "-nocheck" ]]; then
+			DISABLE_HASH_CHECK=1
+		elif [[ "$PARAM" == "--comment" || "$PARAM" == "-comment" ]]; then
+			APPEND_ORIGINAL_COMMENT=1
+		elif [[ "$PARAM" == "--nocomment" || "$PARAM" == "-nocomment" ]]; then
+			APPEND_ORIGINAL_COMMENT=0
+		elif [[ "$PARAM" == "--firefox" || "$PARAM" == "-firefox" ]]; then
+			USE_COOKIES_FF=1
+		elif [[ "$PARAM" == "--source" || "$PARAM" == "-source" ]]; then
+			DISPLAY_SOURCE=1
+		elif [[ "$PARAM" == "--nosource" || "$PARAM" == "-nosource" ]]; then
+			DISPLAY_SOURCE=0
+		elif [[ "$PARAM" == "--password" || "$PARAM" == "-password" ]]; then
+			PASSWORD="$2"
+			if [ -z "$PASSWORD" ]; then
+				echo "Password is required after --password option"
+				exit 1
+			fi
+			shift  # shift to remove the password from the params
+		elif [[ "$PARAM" == "--max-file-search" || "$PARAM" == "-max-file-search" ]]; then
+			MAX_FILE_SEARCH="$2"
+			if [ -z "$MAX_FILE_SEARCH" ] || ! [[ "$MAX_FILE_SEARCH" =~ ^[0-9]+$ ]]; then
+				echo "Invalid value for --max-file-search: $MAX_FILE_SEARCH (must be a number)"
+				exit 1
+			fi
+			shift  # shift to remove the value from the params
+		else
+			# stop processing params if it's not a file or url
+			# do not shift to keep the description and source
+			break
+		fi
+		# param was used, shift
+		shift
 	done
-fi
 
-# add EXTRA_BLOSSOMS in front of BLOSSOMS if exists
-if [[ -n "${EXTRA_BLOSSOMS[*]}" ]]; then
-	BLOSSOMS=("${EXTRA_BLOSSOMS[@]}" "${BLOSSOMS[@]}")
-fi
-
-# parse command line params
-ALL_MEDIA_FILES=()
-CONVERT_VIDEO="${CONVERT_VIDEO:-1}"
-SEND_TO_RELAY="${SEND_TO_RELAY:-1}"
-DISABLE_HASH_CHECK="${DISABLE_HASH_CHECK:-0}"
-MAX_FILE_SEARCH="${MAX_FILE_SEARCH:-10}"
-
-while (( "$#" )); do
-	PARAM="$1"
-	PARAM=$(echo "$PARAM" | tr -d '\r\n\t' | sed 's/[[:space:]]\+$//')
-	if [ -f "$PARAM" ]; then
-		MIME_TYPE=$(file --mime-type -b "$PARAM")
-		if [[ "$MIME_TYPE" == image/* || "$MIME_TYPE" == video/* ]]; then
-			ALL_MEDIA_FILES+=("$PARAM")
-		else
-			echo "Unsupported file type: $PARAM => $MIME_TYPE"
-			exit 1
-		fi
-	elif [[ "$PARAM" =~ ^https?:// ]]; then
-		# Check if this contains multiple URLs (space-separated)
-		if [[ "$PARAM" =~ https?://.*[[:space:]]+https?:// ]]; then
-			# Contains multiple URLs, split and add each one
-			while read -r url; do
-				if [[ "$url" =~ ^https?:// ]]; then
-					# Remove ?utm_source=ig_web_copy_link if present at the end of the URL
-					url=$(clean_url "$url")
-					ALL_MEDIA_FILES+=("$url")
-				fi
-			done <<< "$(echo "$PARAM" | grep -oE 'https?://[^[:space:]]+' || echo "$PARAM")"
-		else
-			# Single URL
-		# Remove ?utm_source=ig_web_copy_link if present at the end of the URL
-		PARAM=$(clean_url "$PARAM")
-			ALL_MEDIA_FILES+=("$PARAM")
-		fi
-	elif [[ "$PARAM" == "--convert" || "$PARAM" == "-convert" ]]; then
-		CONVERT_VIDEO=1
-	elif [[ "$PARAM" == "--noconvert" || "$PARAM" == "-noconvert" ]]; then
-		CONVERT_VIDEO=0
-	elif [[ "$PARAM" == "--norelay" || "$PARAM" == "-norelay" ]]; then
-		SEND_TO_RELAY=0
-	elif [[ "$PARAM" == "--nopow" || "$PARAM" == "-nopow" ]]; then
-		POW_DIFF=0
-	elif [[ "$PARAM" == "--nocheck" || "$PARAM" == "-nocheck" ]]; then
-		DISABLE_HASH_CHECK=1
-	elif [[ "$PARAM" == "--comment" || "$PARAM" == "-comment" ]]; then
-		APPEND_ORIGINAL_COMMENT=1
-	elif [[ "$PARAM" == "--nocomment" || "$PARAM" == "-nocomment" ]]; then
-		APPEND_ORIGINAL_COMMENT=0
-	elif [[ "$PARAM" == "--firefox" || "$PARAM" == "-firefox" ]]; then
-		USE_COOKIES_FF=1
-	elif [[ "$PARAM" == "--source" || "$PARAM" == "-source" ]]; then
-		DISPLAY_SOURCE=1
-	elif [[ "$PARAM" == "--nosource" || "$PARAM" == "-nosource" ]]; then
-		DISPLAY_SOURCE=0
-	elif [[ "$PARAM" == "--password" || "$PARAM" == "-password" ]]; then
-		PASSWORD="$2"
-		if [ -z "$PASSWORD" ]; then
-			echo "Password is required after --password option"
-			exit 1
-		fi
-		shift  # shift to remove the password from the params
-	elif [[ "$PARAM" == "--max-file-search" || "$PARAM" == "-max-file-search" ]]; then
-		MAX_FILE_SEARCH="$2"
-		if [ -z "$MAX_FILE_SEARCH" ] || ! [[ "$MAX_FILE_SEARCH" =~ ^[0-9]+$ ]]; then
-			echo "Invalid value for --max-file-search: $MAX_FILE_SEARCH (must be a number)"
-			exit 1
-		fi
-		shift  # shift to remove the value from the params
-	else
-		# stop processing params if it's not a file or url
-		# do not shift to keep the description and source
-
-		break
-	fi
-	# param was used, shift
-	shift
-done
-
-# Check if at least one media file is provided
-if [ ${#ALL_MEDIA_FILES[@]} -eq 0 ]; then
-	echo "No image or video file provided"
-	exit 1
-fi
-
-# The remaining params are description and source
-# if there is another param, its description candidate
-if [ $# -gt 0 ]; then
-	DESCRIPTION_CANDIDATE="$1"
-	shift
-fi
-# if there is another param, its source candidate
-if [ $# -gt 0 ]; then
-	SOURCE_CANDIDATE="$1"
-	shift
-fi
-# Check if there are remaining parameters
-if [ $# -gt 0 ]; then
-	echo "Too many parameters provided"
-	exit 1
-fi
-
-# Check if the file names are present in the history file
-ORIGINAL_URLS=()
-for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
-	result=$(check_media_history "$MEDIA_FILE" "$HISTORY_FILE" "$DISABLE_HASH_CHECK")
-	if [ $? -ne 0 ]; then
-		# File is in history - result contains filename
-		echo "File name already processed: $result"
+	# Check if at least one media file is provided
+	if [ ${#ALL_MEDIA_FILES[@]} -eq 0 ]; then
+		echo "No image or video file provided"
 		exit 1
 	fi
 	
-	# Not in history - result contains normalized URL (empty if local file)
-	# Add normalized URL if it's not empty (it's a URL, not a local file)
-	if [ -n "$result" ]; then
-		ORIGINAL_URLS+=("$result")
+	# The remaining params are description and source
+	# if there is another param, its description candidate
+	if [ $# -gt 0 ]; then
+		DESCRIPTION_CANDIDATE="$1"
+		shift
 	fi
-done
-
-# Decrypt key from various formats
-KEY=$(decrypt_key "$NSEC_KEY" "$NCRYPT_KEY" "$KEY" "$PASSWORD")
-if [ $? -ne 0 ]; then
-	die "Decryption failed, key is empty"
-fi
-
-# Prepare gallery-dl params
-GALLERY_DL_PARAMS=()
-		if [ "$USE_COOKIES_FF" -eq 1 ]; then
-	GALLERY_DL_PARAMS+=(--cookies-from-browser firefox)
-fi
-GALLERY_DL_PARAMS+=(--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0")
-
-# Process all media files - download URLs if needed, keep local files
-PROCESSED_FILES=()
-FILE_CAPTIONS=()
-FILE_SOURCES=()
-FILE_GALLERIES=()  # Track which gallery/media item each file belongs to
-GALLERY_ID=0
+	# if there is another param, its source candidate
+	if [ $# -gt 0 ]; then
+		SOURCE_CANDIDATE="$1"
+		shift
+	fi
+	# Check if there are remaining parameters
+	if [ $# -gt 0 ]; then
+		echo "Too many parameters provided"
+		exit 1
+	fi
+	
+	# Check if the file names are present in the history file
+	local ORIGINAL_URLS=()
+	local result
+	local MEDIA_FILE
+	for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
+		result=$(check_media_history "$MEDIA_FILE" "$HISTORY_FILE" "$DISABLE_HASH_CHECK")
+		if [ $? -ne 0 ]; then
+			# File is in history - result contains filename
+			echo "File name already processed: $result"
+			exit 1
+		fi
+		
+		# Not in history - result contains normalized URL (empty if local file)
+		# Add normalized URL if it's not empty (it's a URL, not a local file)
+		if [ -n "$result" ]; then
+			ORIGINAL_URLS+=("$result")
+		fi
+	done
+	
+	# Decrypt key from various formats
+	local KEY_DECRYPTED
+	KEY_DECRYPTED=$(decrypt_key "$NSEC_KEY" "$NCRYPT_KEY" "$KEY" "$PASSWORD")
+	if [ $? -ne 0 ]; then
+		die "Decryption failed, key is empty"
+	fi
+	
+	# Prepare gallery-dl params
+	local GALLERY_DL_PARAMS=()
+	if [ "$USE_COOKIES_FF" -eq 1 ]; then
+		GALLERY_DL_PARAMS+=(--cookies-from-browser firefox)
+	fi
+	GALLERY_DL_PARAMS+=(--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0")
+	
+	# Process all media files - download URLs if needed, keep local files
+	local PROCESSED_FILES=()
+	local FILE_CAPTIONS=()
+	local FILE_SOURCES=()
+	local FILE_GALLERIES=()  # Track which gallery/media item each file belongs to
+	local GALLERY_ID=0
+	local MEDIA_ITEM
 	for MEDIA_ITEM in "${ALL_MEDIA_FILES[@]}"; do
-	if [[ "$MEDIA_ITEM" =~ ^https?:// ]]; then
-		# It's a URL - try to download as video first, then as image
-		echo "Processing URL: $MEDIA_ITEM"
-		
-		# Prepare gallery-dl params as string for passing to function
-		GALLERY_DL_PARAMS_STR=$(serialize_array "${GALLERY_DL_PARAMS[@]}")
-		
-		# Try video download first for any URL
-		# Initialize return variables
-		download_video_ret_files=()
-		download_video_ret_captions=()
-		download_video_ret_source=""
-		download_video_ret_success=1
-		
-		download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
-		VIDEO_DOWNLOAD_RESULT="${download_video_ret_success:-1}"
-		
-		# If video download succeeded, use its return values
-		if [ "$VIDEO_DOWNLOAD_RESULT" -eq 0 ]; then
-			# Append downloaded files and captions to parallel arrays
-			if [ ${#download_video_ret_files[@]} -gt 0 ]; then
-				idx=0
-				for file in "${download_video_ret_files[@]}"; do
-					PROCESSED_FILES+=("$file")
-					if [ $idx -lt ${#download_video_ret_captions[@]} ]; then
-						FILE_CAPTIONS+=("${download_video_ret_captions[$idx]}")
-					else
-						FILE_CAPTIONS+=("")
-					fi
-					FILE_GALLERIES+=("$GALLERY_ID")
-					((idx++))
-				done
-			fi
-			# Update source if provided
-			if [ -n "$download_video_ret_source" ]; then
-				cleaned_source=$(cleanup_source_url "$download_video_ret_source")
-				FILE_SOURCES+=("$cleaned_source")
-			fi
-			((GALLERY_ID++))
+		if [[ "$MEDIA_ITEM" =~ ^https?:// ]]; then
+			# It's a URL - try to download as video first, then as image
+			echo "Processing URL: $MEDIA_ITEM"
+			
+			# Prepare gallery-dl params as string for passing to function
+			local GALLERY_DL_PARAMS_STR
+			GALLERY_DL_PARAMS_STR=$(serialize_array "${GALLERY_DL_PARAMS[@]}")
+			
+			# Try video download first for any URL
+			# Initialize return variables (these are global return variables, not local)
+			download_video_ret_files=()
+			download_video_ret_captions=()
+			download_video_ret_source=""
+			download_video_ret_success=1
+			
+			download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
+			local VIDEO_DOWNLOAD_RESULT="${download_video_ret_success:-1}"
+			
+			# If video download succeeded, use its return values
+			if [ "$VIDEO_DOWNLOAD_RESULT" -eq 0 ]; then
+				# Append downloaded files and captions to parallel arrays
+				local idx
+				local file
+				if [ ${#download_video_ret_files[@]} -gt 0 ]; then
+					idx=0
+					for file in "${download_video_ret_files[@]}"; do
+						PROCESSED_FILES+=("$file")
+						if [ $idx -lt ${#download_video_ret_captions[@]} ]; then
+							FILE_CAPTIONS+=("${download_video_ret_captions[$idx]}")
+						else
+							FILE_CAPTIONS+=("")
+						fi
+						FILE_GALLERIES+=("$GALLERY_ID")
+						((idx++))
+					done
+				fi
+				# Update source if provided
+				local cleaned_source
+				if [ -n "$download_video_ret_source" ]; then
+					cleaned_source=$(cleanup_source_url "$download_video_ret_source")
+					FILE_SOURCES+=("$cleaned_source")
+				fi
+				((GALLERY_ID++))
 		else
 			# If video download failed, try image download with gallery-dl
 			echo "Video download failed, trying gallery-dl for images"
-			# Initialize return variables
+			# Initialize return variables (these are global return variables, not local)
 			download_images_ret_files=()
 			download_images_ret_captions=()
 			download_images_ret_source=""
@@ -1422,7 +1438,7 @@ GALLERY_ID=0
 			
 			# Call download_images function (Facebook URL handling is done inside)
 			download_images "$MEDIA_ITEM" "$GALLERY_DL_PARAMS_STR" "$APPEND_ORIGINAL_COMMENT" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE" "$MAX_FILE_SEARCH"
-			IMAGE_DOWNLOAD_RESULT="${download_images_ret_success:-1}"
+			local IMAGE_DOWNLOAD_RESULT="${download_images_ret_success:-1}"
 			
 			# Add temp directory to cleanup list if returned
 			if [ -n "$download_images_ret_temp_dir" ]; then
@@ -1432,10 +1448,14 @@ GALLERY_ID=0
 			if [ "$IMAGE_DOWNLOAD_RESULT" -eq 0 ]; then
 				# For gallery images, all files from same gallery share the same gallery ID and caption
 				# Use the first caption (they should all be the same or similar for gallery downloads)
+				local CAPTIONS_STR
+				local gallery_caption
 				CAPTIONS_STR=$(serialize_array "${download_images_ret_captions[@]}")
 				gallery_caption=$(get_first_non_empty_caption "$CAPTIONS_STR")
 				
 				# Append downloaded files to parallel arrays - all from same gallery
+				local current_gallery_id
+				local last_idx
 				if [ ${#download_images_ret_files[@]} -gt 0 ]; then
 					current_gallery_id=$GALLERY_ID
 					for file in "${download_images_ret_files[@]}"; do
@@ -1475,129 +1495,188 @@ GALLERY_ID=0
 		((GALLERY_ID++))
 		echo "Using local file: $MEDIA_ITEM"
 	fi
-done
+	done
 
 
-# Create an array to store file hashes
-FILE_HASHES=()
-if [ $DISABLE_HASH_CHECK -eq 0 ]; then
-	# Process all processed files
-	for FILE in "${PROCESSED_FILES[@]}"; do
-		if [ -f "$FILE" ]; then
-			# Calculate file hash
-			FILE_HASH=$(sha256sum "$FILE" | awk '{print $1}')
-			# Check if file hash exists in history file
-			if check_history "$FILE_HASH" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
-				die "File hash already processed: $FILE"
+	# Create an array to store file hashes
+	local FILE_HASHES=()
+	local FILE
+	local FILE_HASH
+	if [ $DISABLE_HASH_CHECK -eq 0 ]; then
+		# Process all processed files
+		for FILE in "${PROCESSED_FILES[@]}"; do
+			if [ -f "$FILE" ]; then
+				# Calculate file hash
+				FILE_HASH=$(sha256sum "$FILE" | awk '{print $1}')
+				# Check if file hash exists in history file
+				if check_history "$FILE_HASH" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
+					die "File hash already processed: $FILE"
+				fi
+				# Add file hash to the array
+				FILE_HASHES+=("$FILE_HASH")
 			fi
-			# Add file hash to the array
-			FILE_HASHES+=("$FILE_HASH")
-		fi
-	done
-fi
-
-if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
-	die "No files to upload"
-fi
-
-# Upload all files via blossom and collect URLs
-UPLOAD_URLS=()
-RESULT=0
-upload_success=0
-
-for TRIES in "${!BLOSSOMS[@]}"; do
-	BLOSSOM="${BLOSSOMS[$TRIES]}"
-	echo "Using blossom: $BLOSSOM, try: $((TRIES+1))"
-	
-	UPLOAD_URLS=()
-	upload_success=1
-	
-	for FILE in "${PROCESSED_FILES[@]}"; do
-		upload_url=$(upload_file_to_blossom "$FILE" "$BLOSSOM" "$KEY")
-		if [ $? -ne 0 ]; then
-			upload_success=0
-			break
-		fi
-		UPLOAD_URLS+=("$upload_url")
-	done
-
-	if [ $upload_success -eq 0 ]; then
-		RESULT=1
-		continue
-	fi
-
-	# Build content for kind 1 event: interleaved URL -> caption -> URL -> caption, then sources at bottom
-	# For gallery images: all URLs first, then caption for the gallery
-	# Formatting: empty line after images before caption, 2 empty lines after caption before next URL
-	UPLOAD_URLS_STR=$(serialize_array "${UPLOAD_URLS[@]}")
-	FILE_CAPTIONS_STR=$(serialize_array "${FILE_CAPTIONS[@]}")
-	FILE_GALLERIES_STR=$(serialize_array "${FILE_GALLERIES[@]}")
-	FILE_SOURCES_STR=$(serialize_array "${FILE_SOURCES[@]}")
-	CONTENT=$(build_event_content "$UPLOAD_URLS_STR" "$FILE_CAPTIONS_STR" "$FILE_GALLERIES_STR" "$FILE_SOURCES_STR" "$DISPLAY_SOURCE")
-
-	# Print content for debugging before creating event
-	echo "=== Event Content (Debug) ==="
-	echo "$CONTENT"
-	echo "=== End Event Content ==="
-
-	# Create kind 1 event with nak
-	echo "Creating kind 1 event with content length: ${#CONTENT}"
-	
-	NAK_CMD=("nak" "event" "--kind" "1" "-sec" "$KEY" "--pow" "$POW_DIFF")
-	if [ "$SEND_TO_RELAY" -eq 1 ]; then
-		NAK_CMD+=("--auth" "-sec" "$KEY")
-		for RELAY in $RELAYS; do
-			NAK_CMD+=("$RELAY")
 		done
 	fi
 	
-	if [ -n "$CONTENT" ]; then
-		NAK_CMD+=("--content" "$(echo -e "$CONTENT")")
-	else
-		NAK_CMD+=("--content" "")
+	if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
+		die "No files to upload"
 	fi
 	
-	echo "${NAK_CMD[@]}"
-	"${NAK_CMD[@]}"
-	RESULT=$?
+	# Upload all files via blossom and collect URLs
+	local UPLOAD_URLS=()
+	local RESULT=0
+	local upload_success=0
+	local TRIES
+	local BLOSSOM
+	local upload_url
+	local CONTENT
+	local NAK_CMD
+	local RELAY
 	
-	if [ $RESULT -eq 0 ]; then
-		echo "Successfully published kind 1 event"
-		break
-	else
-		echo "Failed to publish kind 1 event, trying next blossom server"
-		RESULT=1
-	fi
-done
-
-if [ $RESULT -ne 0 ]; then
-	die "Failed to upload files and publish event"
-fi
-
-# Add the file hash to history file only if the upload was successful
-# but only if sent to relays
-if [ "$SEND_TO_RELAY" -eq 1 ] && [ "$DISABLE_HASH_CHECK" -eq 0 ] && [ $RESULT -eq 0 ]; then
-	# Collect local files from ALL_MEDIA_FILES
-	LOCAL_FILES=()
-	for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
-		if [ -f "$MEDIA_FILE" ]; then
-			# It's a local file
-			LOCAL_FILES+=("$MEDIA_FILE")
+	for TRIES in "${!BLOSSOMS_LIST[@]}"; do
+		BLOSSOM="${BLOSSOMS_LIST[$TRIES]}"
+		echo "Using blossom: $BLOSSOM, try: $((TRIES+1))"
+		
+		UPLOAD_URLS=()
+		upload_success=1
+		
+		for FILE in "${PROCESSED_FILES[@]}"; do
+			upload_url=$(upload_file_to_blossom "$FILE" "$BLOSSOM" "$KEY_DECRYPTED")
+			if [ $? -ne 0 ]; then
+				upload_success=0
+				break
+			fi
+			UPLOAD_URLS+=("$upload_url")
+		done
+		
+		if [ $upload_success -eq 0 ]; then
+			RESULT=1
+			continue
+		fi
+		
+		# Build content for kind 1 event: interleaved URL -> caption -> URL -> caption, then sources at bottom
+		# For gallery images: all URLs first, then caption for the gallery
+		# Formatting: empty line after images before caption, 2 empty lines after caption before next URL
+		local UPLOAD_URLS_STR
+		local FILE_CAPTIONS_STR
+		local FILE_GALLERIES_STR
+		local FILE_SOURCES_STR
+		UPLOAD_URLS_STR=$(serialize_array "${UPLOAD_URLS[@]}")
+		FILE_CAPTIONS_STR=$(serialize_array "${FILE_CAPTIONS[@]}")
+		FILE_GALLERIES_STR=$(serialize_array "${FILE_GALLERIES[@]}")
+		FILE_SOURCES_STR=$(serialize_array "${FILE_SOURCES[@]}")
+		CONTENT=$(build_event_content "$UPLOAD_URLS_STR" "$FILE_CAPTIONS_STR" "$FILE_GALLERIES_STR" "$FILE_SOURCES_STR" "$DISPLAY_SOURCE")
+		
+		# Print content for debugging before creating event
+		echo "=== Event Content (Debug) ==="
+		echo "$CONTENT"
+		echo "=== End Event Content ==="
+		
+		# Create kind 1 event with nak
+		echo "Creating kind 1 event with content length: ${#CONTENT}"
+		
+		NAK_CMD=("nak" "event" "--kind" "1" "-sec" "$KEY_DECRYPTED" "--pow" "$POW_DIFF")
+		if [ "$SEND_TO_RELAY" -eq 1 ]; then
+			NAK_CMD+=("--auth" "-sec" "$KEY_DECRYPTED")
+			for RELAY in $RELAYS_LIST; do
+				NAK_CMD+=("$RELAY")
+			done
+		fi
+		
+		if [ -n "$CONTENT" ]; then
+			NAK_CMD+=("--content" "$(echo -e "$CONTENT")")
+		else
+			NAK_CMD+=("--content" "")
+		fi
+		
+		echo "${NAK_CMD[@]}"
+		"${NAK_CMD[@]}"
+		RESULT=$?
+		
+		if [ $RESULT -eq 0 ]; then
+			echo "Successfully published kind 1 event"
+			break
+		else
+			echo "Failed to publish kind 1 event, trying next blossom server"
+			RESULT=1
 		fi
 	done
 	
-	# Write hashes, URLs, and local files to history
-	FILE_HASHES_STR=$(serialize_array "${FILE_HASHES[@]}")
-	write_to_history "$HISTORY_FILE" "$FILE_HASHES_STR"
-	
-	ORIGINAL_URLS_STR=$(serialize_array "${ORIGINAL_URLS[@]}")
-	write_to_history "$HISTORY_FILE" "$ORIGINAL_URLS_STR"
-	
-	if [ ${#LOCAL_FILES[@]} -gt 0 ]; then
-		LOCAL_FILES_STR=$(serialize_array "${LOCAL_FILES[@]}")
-		write_to_history "$HISTORY_FILE" "$LOCAL_FILES_STR"
+	if [ $RESULT -ne 0 ]; then
+		die "Failed to upload files and publish event"
 	fi
+	
+	# Add the file hash to history file only if the upload was successful
+	# but only if sent to relays
+	if [ "$SEND_TO_RELAY" -eq 1 ] && [ "$DISABLE_HASH_CHECK" -eq 0 ] && [ $RESULT -eq 0 ]; then
+		# Collect local files from ALL_MEDIA_FILES
+		local LOCAL_FILES=()
+		for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
+			if [ -f "$MEDIA_FILE" ]; then
+				# It's a local file
+				LOCAL_FILES+=("$MEDIA_FILE")
+			fi
+		done
+		
+		# Write hashes, URLs, and local files to history
+		local FILE_HASHES_STR
+		local ORIGINAL_URLS_STR
+		local LOCAL_FILES_STR
+		FILE_HASHES_STR=$(serialize_array "${FILE_HASHES[@]}")
+		write_to_history "$HISTORY_FILE" "$FILE_HASHES_STR"
+		
+		ORIGINAL_URLS_STR=$(serialize_array "${ORIGINAL_URLS[@]}")
+		write_to_history "$HISTORY_FILE" "$ORIGINAL_URLS_STR"
+		
+		if [ ${#LOCAL_FILES[@]} -gt 0 ]; then
+			LOCAL_FILES_STR=$(serialize_array "${LOCAL_FILES[@]}")
+			write_to_history "$HISTORY_FILE" "$LOCAL_FILES_STR"
+		fi
+	fi
+	
+	# Cleanup is called automatically via trap
+}
+
+# ============================================================================
+# SCRIPT BODY
+# ============================================================================
+
+# Check if help option is provided (before loading env)
+for arg in "$@"; do
+	if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+		usage
+		exit 0
+	fi
+done
+
+# Check if any parameters are provided
+if [ $# -eq 0 ]; then
+	usage
+	exit 1
 fi
 
-# Remove the tempfile
-cleanup
+# Load environment variables from ~/.nostr/${SCRIPT_NAME%.*}
+# This sets exported variables that main() will read
+SCRIPT_NAME=$(basename "$0")
+ENV_FILE="$HOME/.nostr/${SCRIPT_NAME%.*}"
+if [[ -f "$ENV_FILE" ]]; then
+	# shellcheck source=/dev/null
+	source "$ENV_FILE"
+else
+	die "No environment variables found in $ENV_FILE"
+fi
+
+# Export variables for main() to read
+export DISPLAY_SOURCE
+export POW_DIFF
+export APPEND_ORIGINAL_COMMENT
+export USE_COOKIES_FF
+export NSEC_KEY
+export NCRYPT_KEY
+export KEY
+export PASSWORD
+export EXTRA_RELAYS
+export EXTRA_BLOSSOMS
+
+# Call main function
+main "$@"
