@@ -39,17 +39,14 @@ cleanup() {
 			fi
 		fi
 	done
-	# Clean up gallery-dl temp directories (fallback for any missed ones)
-	for TMP_DIR in /tmp/gallery_dl_*; do
-		if [ -d "$TMP_DIR" ]; then
-			rm -rf "$TMP_DIR" && echo "Deleted temp directory $TMP_DIR"
-		fi
-	done
-	# Clean up video-dl temp directories (fallback for any missed ones)
-	for TMP_DIR in /tmp/video_dl_*; do
-		if [ -d "$TMP_DIR" ]; then
-			rm -rf "$TMP_DIR" && echo "Deleted temp directory $TMP_DIR"
-		fi
+	# Clean up temp directories (fallback for any missed ones)
+	local CLEANUP_PATTERNS=("gallery_dl_*" "video_dl_*")
+	for PATTERN in "${CLEANUP_PATTERNS[@]}"; do
+		for TMP_DIR in /tmp/$PATTERN; do
+			if [ -d "$TMP_DIR" ]; then
+				rm -rf "$TMP_DIR" && echo "Deleted temp directory $TMP_DIR"
+			fi
+		done
 	done
 	echo "Cleanup done."
 }
@@ -149,6 +146,62 @@ write_to_history() {
 	for item in "${ITEMS[@]}"; do
 		echo "$item" >> "$HISTORY_FILE"
 	done
+}
+
+# Function to serialize an array for passing to functions
+# Parameters:
+#   $@ - array elements to serialize
+# Returns: serialized array string via stdout (suitable for eval)
+# Note: This function properly quotes array elements for safe serialization
+serialize_array() {
+	printf '%q ' "$@"
+}
+
+# Function to get sorted files from a directory
+# Parameters:
+#   $1: DIRECTORY - directory path to list files from
+# Returns: array of sorted filenames via stdout (suitable for array assignment)
+# Note: Sorts files numerically (version sort) and handles errors gracefully
+get_sorted_files() {
+	local DIRECTORY="$1"
+	if [ -d "$DIRECTORY" ]; then
+		ls "$DIRECTORY" 2>/dev/null | sort -V
+	fi
+}
+
+# Function to wait for a file to appear
+# Parameters:
+#   $1: FILE - path to file to wait for
+#   $2: MAX_WAIT - maximum number of wait iterations (default: 20)
+# Returns: 0 if file exists, 1 if timeout
+# Note: Waits up to MAX_WAIT * 0.1 seconds for file to appear
+wait_for_file() {
+	local file="$1"
+	local MAX_WAIT="${2:-20}"
+	
+	local wait_count=0
+	while [ $wait_count -lt "$MAX_WAIT" ] && [ ! -f "$file" ]; do
+		sleep 0.1
+		((wait_count++))
+	done
+	
+	if [ -f "$file" ]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+# Function to clean URL by removing common tracking parameters
+# Parameters:
+#   $1: URL - URL to clean
+# Returns: cleaned URL via stdout
+# Note: Removes utm_source=ig_web_copy_link and other common tracking params
+clean_url() {
+	local URL="$1"
+	# Remove ?utm_source=ig_web_copy_link if present at the end
+	URL=$(echo "$URL" | sed 's/\?utm_source=ig_web_copy_link$//')
+	echo "$URL"
 }
 
 # Function to extract 'id' field from JSON metadata file (for matching)
@@ -251,22 +304,6 @@ get_first_non_empty_caption() {
 	echo "$gallery_caption"
 }
 
-# Function to get metadata file path for an image file
-# Parameters:
-#   $1: FILE - path to image file
-# Returns: metadata file path via stdout (empty if not found)
-# Note: Tries both "${file}.json" and "${file%.*}.json" patterns
-get_metadata_file_path() {
-	local file="$1"
-	local meta="${file}.json"
-	if [ ! -f "$meta" ]; then
-		meta="${file%.*}.json"
-	fi
-	# Only return if file exists, otherwise return empty
-	if [ -f "$meta" ]; then
-		echo "$meta"
-	fi
-}
 
 # Function to wait for metadata file to appear
 # Parameters:
@@ -274,6 +311,7 @@ get_metadata_file_path() {
 #   $2: MAX_WAIT - maximum number of wait iterations (default: 10)
 # Returns: metadata file path via stdout if found, empty if timeout
 # Note: Waits up to MAX_WAIT * 0.1 seconds for metadata file to appear
+#       Uses wait_for_file() internally to wait for metadata file
 wait_for_metadata_file() {
 	local file="$1"
 	local MAX_WAIT="${2:-10}"
@@ -282,22 +320,14 @@ wait_for_metadata_file() {
 		return 1
 	fi
 	
-	local meta=$(get_metadata_file_path "$file")
-	if [ -f "$meta" ]; then
+	# Use the standard metadata file pattern
+	local meta="${file}.json"
+	
+	# Use wait_for_file() to wait for metadata file to appear
+	if wait_for_file "$meta" "$MAX_WAIT"; then
 		echo "$meta"
 		return 0
 	fi
-	
-	local wait_count=0
-	while [ $wait_count -lt "$MAX_WAIT" ]; do
-		sleep 0.1
-		((wait_count++))
-		meta=$(get_metadata_file_path "$file")
-		if [ -f "$meta" ]; then
-			echo "$meta"
-			return 0
-		fi
-	done
 	
 	return 1
 }
@@ -364,7 +394,7 @@ build_event_content() {
 			if [ "$current_gallery_id" != "$gallery_id" ]; then
 				current_gallery_id="$gallery_id"
 				# Count how many files belong to this gallery
-				local FILE_GALLERIES_FOR_COUNT_STR=$(printf '%q ' "${FILE_GALLERIES[@]}")
+				local FILE_GALLERIES_FOR_COUNT_STR=$(serialize_array "${FILE_GALLERIES[@]}")
 				gallery_count=$(count_gallery_files "$idx" "$gallery_id" "$FILE_GALLERIES_FOR_COUNT_STR" "$((${#UPLOAD_URLS[@]} - 1))")
 				last_idx_in_gallery=$((idx + gallery_count - 1))
 				
@@ -753,11 +783,7 @@ download_images() {
 							local file="$POSITION_TMPDIR/$filename"
 							
 							# Wait briefly for file to appear if it's mentioned in output
-							local wait_count=0
-							while [ $wait_count -lt 20 ] && [ ! -f "$file" ]; do
-								sleep 0.1
-								((wait_count++))
-							done
+							wait_for_file "$file" 20
 							
 							# Skip if file still doesn't exist
 							if [ ! -f "$file" ]; then
@@ -817,7 +843,7 @@ download_images() {
 				# Final check if we haven't found it yet
 				if [ $FOUND -eq 0 ] && [ -d "$POSITION_TMPDIR" ]; then
 					echo "Doing final check of all downloaded files..."
-					local files=($(ls "$POSITION_TMPDIR" 2>/dev/null | sort -V))
+					local files=($(get_sorted_files "$POSITION_TMPDIR"))
 					for fname in "${files[@]}"; do
 						local file="$POSITION_TMPDIR/$fname"
 						local result=$(check_file_for_fbid "$file" "$FBID")
@@ -840,7 +866,7 @@ download_images() {
 					
 					# Find the file at the matching position
 					local matching_filename=""
-					local files=($(ls "$POSITION_TMPDIR" 2>/dev/null | sort -V))
+					local files=($(get_sorted_files "$POSITION_TMPDIR"))
 					for fname in "${files[@]}"; do
 						local file="$POSITION_TMPDIR/$fname"
 						[[ "$file" == *.json ]] && continue
@@ -852,8 +878,8 @@ download_images() {
 							# Copy the image file and its metadata
 							cp "$file" "$MATCHING_FILE_DIR/" 2>/dev/null
 							# Copy metadata file if it exists
-							local meta=$(get_metadata_file_path "$file")
-							if [ -n "$meta" ] && [ -f "$meta" ]; then
+							local meta="${file}.json"
+							if [ -f "$meta" ]; then
 								cp "$meta" "$MATCHING_FILE_DIR/" 2>/dev/null
 							fi
 							break
@@ -904,7 +930,7 @@ download_images() {
 	
 	if [ $DOWNLOADED -eq 1 ] && [ "$(ls -A "$IMAGES_TMPDIR" 2>/dev/null)" ]; then
 		# Process downloaded images
-		local files=($(ls "$IMAGES_TMPDIR" | sort -V))
+		local files=($(get_sorted_files "$IMAGES_TMPDIR"))
 		for fname in "${files[@]}"; do
 			local file="$IMAGES_TMPDIR/$fname"
 			# Skip metadata files
@@ -916,8 +942,8 @@ download_images() {
 			
 			# Extract caption from metadata if available
 			local extracted_caption=""
-			local meta=$(get_metadata_file_path "$file")
-			if [ -n "$meta" ] && [ -f "$meta" ] && [ "$APPEND_ORIGINAL_COMMENT" -eq 1 ]; then
+			local meta="${file}.json"
+			if [ -f "$meta" ] && [ "$APPEND_ORIGINAL_COMMENT" -eq 1 ]; then
 				extracted_caption=$(jq -r '.caption // empty' "$meta" 2>/dev/null | sed 's/^"\|"$//g')
 			fi
 			local file_caption=$(build_caption "$DESCRIPTION_CANDIDATE" "$extracted_caption" "$APPEND_ORIGINAL_COMMENT")
@@ -929,6 +955,169 @@ download_images() {
 		fi
 		download_images_ret_success=0
 	fi
+}
+
+# Function to upload a file to a blossom server
+# Parameters:
+#   $1: FILE - path to file to upload
+#   $2: BLOSSOM - blossom server URL
+#   $3: KEY - private key for upload
+# Return variables (set at end of function):
+#   upload_file_ret_url - uploaded file URL (empty on failure)
+#   upload_file_ret_success - 0 on success, 1 on failure
+upload_file_to_blossom() {
+	local FILE="$1"
+	local BLOSSOM="$2"
+	local KEY="$3"
+	
+	upload_file_ret_url=""
+	upload_file_ret_success=1
+	
+	local FILE_WIN=$(cygpath -w "$FILE")
+	if [ ! -f "$FILE" ]; then
+		echo "File does not exist: $FILE"
+		return 1
+	fi
+	
+	echo "Uploading $FILE to $BLOSSOM"
+	local upload_output=$(nak blossom upload --server "$BLOSSOM" "$FILE_WIN" "--sec" "$KEY")
+	local RESULT=$?
+	if [ $RESULT -ne 0 ]; then
+		echo "Failed to upload file $FILE to $BLOSSOM with nak, trying with blossom-cli"
+		upload_output=$(blossom-cli upload -file "$FILE_WIN" -server "$BLOSSOM" -privkey "$KEY" 2>/dev/null)
+		RESULT=$?
+	fi
+	if [ $RESULT -ne 0 ]; then
+		echo "Failed to upload file $FILE to $BLOSSOM: $upload_output"
+		return 1
+	fi
+	
+	local file_url=$(echo "$upload_output" | jq -r '.url')
+	if [ -z "$file_url" ] || [ "$file_url" == "null" ]; then
+		echo "Failed to extract URL from upload output: $upload_output"
+		return 1
+	fi
+	
+	upload_file_ret_url="$file_url"
+	upload_file_ret_success=0
+	echo "Uploaded to: $file_url"
+}
+
+# Function to decrypt key from various formats
+# Parameters:
+#   $1: NSEC_KEY_VAL - NSEC key value (may be empty)
+#   $2: NCRYPT_KEY_VAL - NCRYPT key value (may be empty)
+#   $3: KEY_VAL - default key value (may be empty)
+#   $4: PASSWORD - password for decryption (may be empty, will prompt if needed)
+# Return variables (set at end of function):
+#   decrypt_key_ret_key - decrypted key (empty on failure)
+#   decrypt_key_ret_success - 0 on success, 1 on failure
+decrypt_key() {
+	local NSEC_KEY_VAL="$1"
+	local NCRYPT_KEY_VAL="$2"
+	local KEY_VAL="$3"
+	local PASSWORD="$4"
+	
+	decrypt_key_ret_key=""
+	decrypt_key_ret_success=1
+	
+	if [ -n "$NSEC_KEY_VAL" ]; then
+		echo "Using NSEC_KEY to decrypt the secret key"
+		local DECODED=$(nak decode $NSEC_KEY_VAL)
+		if [ $? -ne 0 ]; then
+			echo "Failed to decrypt the key"
+			return 1
+		fi
+		
+		# Check if the decoded output is JSON (starts with {) or a hex key
+		if echo "$DECODED" | grep -q '^{'; then
+			# It's JSON, extract the private_key field
+			decrypt_key_ret_key=$(echo "$DECODED" | jq -r .private_key)
+		else
+			# It's already a hex key, use it directly
+			decrypt_key_ret_key="$DECODED"
+		fi
+	elif [ -n "$NCRYPT_KEY_VAL" ]; then
+		echo "Using NCRYPT_KEY to decrypt the secret key"
+		if [ -z "$PASSWORD" ]; then
+			read -sp "Enter password to decrypt the secret key: " PASSWORD
+			echo
+		fi
+		decrypt_key_ret_key=$(nak key decrypt "$NCRYPT_KEY_VAL" "$PASSWORD")
+		if [ $? -ne 0 ]; then
+			echo "Failed to decrypt the key"
+			return 1
+		fi
+	else
+		echo "Using default key"
+		if [ -z "$KEY_VAL" ]; then
+			echo "Key is empty, cannot decrypt"
+			return 1
+		fi
+		if [ -z "$PASSWORD" ]; then
+			read -sp "Enter password to decrypt the secret key: " PASSWORD
+			echo
+		fi
+		decrypt_key_ret_key=$(echo "$KEY_VAL" | openssl enc -aes-256-cbc -pbkdf2 -d -a -pass pass:"$PASSWORD")
+		if [ $? -ne 0 ]; then
+			echo "Failed to decrypt the key"
+			return 1
+		fi
+	fi
+	
+	if [ -z "$decrypt_key_ret_key" ]; then
+		echo "Decryption failed, key is empty"
+		return 1
+	fi
+	
+	decrypt_key_ret_success=0
+}
+
+# Function to process URL for history checking
+# Parameters:
+#   $1: MEDIA_FILE - URL or file path to process
+#   $2: HISTORY_FILE - path to history file
+#   $3: DISABLE_HASH_CHECK - 1 to disable, 0 otherwise
+# Return variables (set at end of function):
+#   process_url_for_history_ret_original_url - original URL (normalized)
+#   process_url_for_history_ret_file_name - file name for history check
+#   process_url_for_history_ret_should_exit - 1 if already processed, 0 otherwise
+process_url_for_history() {
+	local MEDIA_FILE="$1"
+	local HISTORY_FILE="$2"
+	local DISABLE_HASH_CHECK="$3"
+	
+	process_url_for_history_ret_original_url=""
+	process_url_for_history_ret_file_name=""
+	process_url_for_history_ret_should_exit=0
+	
+	if [[ "$MEDIA_FILE" =~ ^https?:// ]]; then
+		# It's a URL
+		local TMP_FILE=$(echo "$MEDIA_FILE" | tr -d '\r\n')
+		# remove url params from the file but only if from instagram
+		if [[ "$TMP_FILE" =~ ^https?://.*instagram\.com/.* ]]; then
+			TMP_FILE=$(echo "$TMP_FILE" | sed 's/\?.*//')
+		fi
+		process_url_for_history_ret_original_url="$TMP_FILE"
+		# remove trailing "/" from FILE if it exists
+		TMP_FILE=$(echo "$TMP_FILE" | sed 's:/*$::')
+		local FILE_NAME=$(basename "$TMP_FILE")
+		process_url_for_history_ret_file_name="$FILE_NAME"
+		if check_history "$FILE_NAME" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
+			process_url_for_history_ret_should_exit=1
+			return 0
+		fi
+	else
+		# It's a local file
+		local FILE_NAME=$(basename "$MEDIA_FILE")
+		process_url_for_history_ret_file_name="$FILE_NAME"
+		if check_history "$FILE_NAME" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
+			process_url_for_history_ret_should_exit=1
+			return 0
+		fi
+	fi
+	
+	return 0
 }
 
 # Function to clean up source URL by removing problematic parameters
@@ -1054,14 +1243,14 @@ while (( "$#" )); do
 			while read -r url; do
 				if [[ "$url" =~ ^https?:// ]]; then
 					# Remove ?utm_source=ig_web_copy_link if present at the end of the URL
-					url=$(echo "$url" | sed 's/\?utm_source=ig_web_copy_link$//')
+					url=$(clean_url "$url")
 					ALL_MEDIA_FILES+=("$url")
 				fi
 			done <<< "$(echo "$PARAM" | grep -oE 'https?://[^[:space:]]+' || echo "$PARAM")"
 		else
 			# Single URL
 		# Remove ?utm_source=ig_web_copy_link if present at the end of the URL
-		PARAM=$(echo "$PARAM" | sed 's/\?utm_source=ig_web_copy_link$//')
+		PARAM=$(clean_url "$PARAM")
 			ALL_MEDIA_FILES+=("$PARAM")
 		fi
 	elif [[ "$PARAM" == "--convert" || "$PARAM" == "-convert" ]]; then
@@ -1134,79 +1323,22 @@ fi
 # Check if the file names are present in the history file
 ORIGINAL_URLS=()
 for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
-	if [[ "$MEDIA_FILE" =~ ^https?:// ]]; then
-		# It's a URL
-		TMP_FILE=$(echo "$MEDIA_FILE" | tr -d '\r\n')
-		# remove url params from the file but only if from instagram
-		if [[ "$TMP_FILE" =~ ^https?://.*instagram\.com/.* ]]; then
-			TMP_FILE=$(echo "$TMP_FILE" | sed 's/\?.*//')
-		fi
-		ORIGINAL_URLS+=("$TMP_FILE")
-		# remove trailing "/" from FILE if it exists
-		TMP_FILE=$(echo "$TMP_FILE" | sed 's:/*$::')
-		FILE_NAME=$(basename "$TMP_FILE")
-		if check_history "$FILE_NAME" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
-			echo "File name already processed: $FILE_NAME"
-			exit 1
-		fi
-	else
-		# It's a local file
-		FILE_NAME=$(basename "$MEDIA_FILE")
-		if check_history "$FILE_NAME" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
-			echo "File name already processed: $FILE_NAME"
-			exit 1
-		fi
+	process_url_for_history "$MEDIA_FILE" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"
+	if [ "$process_url_for_history_ret_should_exit" -eq 1 ]; then
+		echo "File name already processed: $process_url_for_history_ret_file_name"
+		exit 1
+	fi
+	if [ -n "$process_url_for_history_ret_original_url" ]; then
+		ORIGINAL_URLS+=("$process_url_for_history_ret_original_url")
 	fi
 done
 
-# if exists NPUB_KEY, use "nak decode | jq -r .private_key" to get it. 
-# bypass decrypting
-if [ -n "$NSEC_KEY" ]; then
-	echo "Using NSEC_KEY to decrypt the secret key"
-	DECODED=$(nak decode $NSEC_KEY)
-	if [ $? -ne 0 ]; then
-		echo "Failed to decrypt the key"
-		exit 1
-	fi
-	
-	# Check if the decoded output is JSON (starts with {) or a hex key
-	if echo "$DECODED" | grep -q '^{'; then
-		# It's JSON, extract the private_key field
-		KEY=$(echo "$DECODED" | jq -r .private_key)
-	else
-		# It's already a hex key, use it directly
-		KEY="$DECODED"
-	fi
-elif [ -n "$NCRYPT_KEY" ]; then
-	echo "Using NCRYPT_KEY to decrypt the secret key"
-	if [ -z "$PASSWORD" ]; then
-		read -sp "Enter password to decrypt the secret key: " PASSWORD
-		echo
-	fi
-	KEY=$(nak key decrypt "$NCRYPT_KEY" "$PASSWORD")
-	if [ $? -ne 0 ]; then
-		echo "Failed to decrypt the key"
-		exit 1
-	fi
-else
-    echo "Using default key"
-	if [ -z "$KEY" ]; then
-		echo "Key is empty, cannot decrypt"
-		exit 1
-	fi
-	read -sp "Enter password to decrypt the secret key: " PASSWORD
-	echo
-	KEY=$(echo "$KEY" | openssl enc -aes-256-cbc -pbkdf2 -d -a -pass pass:"$PASSWORD")
-	if [ $? -ne 0 ]; then
-		echo "Failed to decrypt the key"
-		exit 1
-	fi
+# Decrypt key from various formats
+decrypt_key "$NSEC_KEY" "$NCRYPT_KEY" "$KEY" "$PASSWORD"
+if [ $? -ne 0 ]; then
+	die "Decryption failed, key is empty"
 fi
-
-if [ -z "$KEY" ]; then
-	echo "Decryption failed, key is empty"
-	exit 1
-fi
+KEY="$decrypt_key_ret_key"
 
 # Prepare gallery-dl params
 GALLERY_DL_PARAMS=()
@@ -1227,7 +1359,7 @@ GALLERY_ID=0
 		echo "Processing URL: $MEDIA_ITEM"
 		
 		# Prepare gallery-dl params as string for passing to function
-		GALLERY_DL_PARAMS_STR=$(printf '%q ' "${GALLERY_DL_PARAMS[@]}")
+		GALLERY_DL_PARAMS_STR=$(serialize_array "${GALLERY_DL_PARAMS[@]}")
 		
 		# Try video download first for any URL
 		# Initialize return variables
@@ -1284,7 +1416,7 @@ GALLERY_ID=0
 			if [ "$IMAGE_DOWNLOAD_RESULT" -eq 0 ]; then
 				# For gallery images, all files from same gallery share the same gallery ID and caption
 				# Use the first caption (they should all be the same or similar for gallery downloads)
-				CAPTIONS_STR=$(printf '%q ' "${download_images_ret_captions[@]}")
+				CAPTIONS_STR=$(serialize_array "${download_images_ret_captions[@]}")
 				gallery_caption=$(get_first_non_empty_caption "$CAPTIONS_STR")
 				
 				# Append downloaded files to parallel arrays - all from same gallery
@@ -1365,35 +1497,12 @@ for TRIES in "${!BLOSSOMS[@]}"; do
 	upload_success=1
 	
 	for FILE in "${PROCESSED_FILES[@]}"; do
-		FILE_WIN=$(cygpath -w "$FILE")
-		if [ ! -f "$FILE" ]; then
-			echo "File does not exist: $FILE"
+		upload_file_to_blossom "$FILE" "$BLOSSOM" "$KEY"
+		if [ $? -ne 0 ]; then
 			upload_success=0
 			break
 		fi
-		
-		echo "Uploading $FILE to $BLOSSOM"
-		upload_output=$(nak blossom upload --server "$BLOSSOM" "$FILE_WIN" "--sec" "$KEY")
-		RESULT=$?
-		if [ $RESULT -ne 0 ] ; then
-			echo "Failed to upload file $FILE to $BLOSSOM with nak, trying with blossom-cli"
-			upload_output=$(blossom-cli upload -file "$FILE_WIN" -server "$BLOSSOM" -privkey "$KEY" 2>/dev/null)
-			RESULT=$?
-		fi
-		if [ $RESULT -ne 0 ]; then
-			echo "Failed to upload file $FILE to $BLOSSOM: $upload_output"
-			upload_success=0
-			break
-		fi
-		
-		file_url=$(echo "$upload_output" | jq -r '.url')
-		if [ -z "$file_url" ] || [ "$file_url" == "null" ]; then
-			echo "Failed to extract URL from upload output: $upload_output"
-			upload_success=0
-			break
-		fi
-		UPLOAD_URLS+=("$file_url")
-		echo "Uploaded to: $file_url"
+		UPLOAD_URLS+=("$upload_file_ret_url")
 	done
 
 	if [ $upload_success -eq 0 ]; then
@@ -1404,10 +1513,10 @@ for TRIES in "${!BLOSSOMS[@]}"; do
 	# Build content for kind 1 event: interleaved URL -> caption -> URL -> caption, then sources at bottom
 	# For gallery images: all URLs first, then caption for the gallery
 	# Formatting: empty line after images before caption, 2 empty lines after caption before next URL
-	UPLOAD_URLS_STR=$(printf '%q ' "${UPLOAD_URLS[@]}")
-	FILE_CAPTIONS_STR=$(printf '%q ' "${FILE_CAPTIONS[@]}")
-	FILE_GALLERIES_STR=$(printf '%q ' "${FILE_GALLERIES[@]}")
-	FILE_SOURCES_STR=$(printf '%q ' "${FILE_SOURCES[@]}")
+	UPLOAD_URLS_STR=$(serialize_array "${UPLOAD_URLS[@]}")
+	FILE_CAPTIONS_STR=$(serialize_array "${FILE_CAPTIONS[@]}")
+	FILE_GALLERIES_STR=$(serialize_array "${FILE_GALLERIES[@]}")
+	FILE_SOURCES_STR=$(serialize_array "${FILE_SOURCES[@]}")
 	CONTENT=$(build_event_content "$UPLOAD_URLS_STR" "$FILE_CAPTIONS_STR" "$FILE_GALLERIES_STR" "$FILE_SOURCES_STR" "$DISPLAY_SOURCE")
 
 	# Print content for debugging before creating event
@@ -1462,14 +1571,14 @@ if [ "$SEND_TO_RELAY" -eq 1 ] && [ "$DISABLE_HASH_CHECK" -eq 0 ] && [ $RESULT -e
 	done
 	
 	# Write hashes, URLs, and local files to history
-	FILE_HASHES_STR=$(printf '%q ' "${FILE_HASHES[@]}")
+	FILE_HASHES_STR=$(serialize_array "${FILE_HASHES[@]}")
 	write_to_history "$HISTORY_FILE" "$FILE_HASHES_STR"
 	
-	ORIGINAL_URLS_STR=$(printf '%q ' "${ORIGINAL_URLS[@]}")
+	ORIGINAL_URLS_STR=$(serialize_array "${ORIGINAL_URLS[@]}")
 	write_to_history "$HISTORY_FILE" "$ORIGINAL_URLS_STR"
 	
 	if [ ${#LOCAL_FILES[@]} -gt 0 ]; then
-		LOCAL_FILES_STR=$(printf '%q ' "${LOCAL_FILES[@]}")
+		LOCAL_FILES_STR=$(serialize_array "${LOCAL_FILES[@]}")
 		write_to_history "$HISTORY_FILE" "$LOCAL_FILES_STR"
 	fi
 fi
