@@ -19,7 +19,199 @@ readonly RELAYS
 # Global array to track files/directories for cleanup (used only by add_to_cleanup and cleanup functions)
 CLEANUP_FILES=()
 
+# Function to detect operating system type
+# Sets global variable OS_TYPE ("cygwin", "linux", or "unknown")
+# Currently supports Cygwin and Linux detection
+# Returns: 0 (always succeeds)
+detect_os() {
+	# Check if OSTYPE contains "cygwin" or if cygpath command exists
+	if [[ "${OSTYPE:-}" == *"cygwin"* ]] || command -v cygpath >/dev/null 2>&1; then
+		OS_TYPE="cygwin"
+	# Check if OSTYPE indicates Linux
+	elif [[ "${OSTYPE:-}" == *"linux"* ]] || [[ "$(uname -s 2>/dev/null)" == "Linux" ]]; then
+		OS_TYPE="linux"
+	else
+		# Unknown OS - cannot determine
+		OS_TYPE="unknown"
+	fi
+	return 0
+}
+
+# Detect OS and set global variable
+OS_TYPE="unknown"
+detect_os
+if [ "$OS_TYPE" = "unknown" ]; then
+	die "Unsupported operating system. This script requires Cygwin or Linux."
+fi
+readonly OS_TYPE
+
+# Function to check if required commands are installed and provide install instructions
+# Returns: 0 if all commands exist, 1 if any are missing
+check_required_commands() {
+	local MISSING_COMMANDS=()
+	local ALL_GOOD=1
+	
+	# Define required commands and their install instructions
+	declare -A COMMANDS
+	if [ "$OS_TYPE" = "cygwin" ]; then
+		COMMANDS[gallery-dl]="Install gallery-dl (requires >= 1.30.6): pip install gallery-dl==1.30.6"
+		COMMANDS[yt-dlp]="Install yt-dlp: pip install yt-dlp"
+	elif [ "$OS_TYPE" = "linux" ]; then
+		COMMANDS[gallery-dl]="Install gallery-dl (requires >= 1.30.6): pipx install gallery-dl==1.30.6 OR pip install --user gallery-dl==1.30.6 (DO NOT use apt - package is too old)"
+		COMMANDS[yt-dlp]="Install yt-dlp: pipx install yt-dlp OR pip install --user yt-dlp (DO NOT use apt - package is too old)"
+	fi
+	COMMANDS[ffmpeg]="Install ffmpeg: On Cygwin: apt-cyg install ffmpeg; On Linux: apt-get install ffmpeg or yum install ffmpeg"
+	COMMANDS[ffprobe]="Install ffprobe: Usually comes with ffmpeg package"
+	COMMANDS[jq]="Install jq: On Cygwin: apt-cyg install jq; On Linux: apt-get install jq or yum install jq"
+	COMMANDS[nak]="Install nak: See https://github.com/fiatjaf/nak"
+	COMMANDS[sha256sum]="Install sha256sum: Usually comes with coreutils package"
+	COMMANDS[file]="Install file: On Cygwin: apt-cyg install file; On Linux: apt-get install file or yum install file"
+	
+	# Check each command
+	for cmd in "${!COMMANDS[@]}"; do
+		local FOUND=0
+		local VERSION_OK=1
+		# First check if command exists in PATH
+		if command -v "$cmd" >/dev/null 2>&1; then
+			FOUND=1
+		# Special check for yt-dlp in hardcoded path (Cygwin specific)
+		elif [ "$cmd" = "yt-dlp" ] && [ -f "/usr/local/bin/yt-dlp" ]; then
+			FOUND=1
+		fi
+		
+		if [ $FOUND -eq 0 ]; then
+			MISSING_COMMANDS+=("$cmd")
+			ALL_GOOD=0
+		fi
+	done
+	
+	# Special version check for gallery-dl (requires >= 1.30.6, latest version that works with Facebook)
+	if command -v gallery-dl >/dev/null 2>&1; then
+		local VERSION_OUTPUT
+		VERSION_OUTPUT=$(gallery-dl --version 2>/dev/null | head -n 1)
+		if [ -n "$VERSION_OUTPUT" ]; then
+			# Extract version number (e.g., "1.26.9" from "gallery-dl 1.26.9" or just "1.26.9")
+			local VERSION
+			VERSION=$(echo "$VERSION_OUTPUT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+			if [ -n "$VERSION" ]; then
+				# Compare version: check if it's >= 1.30.6
+				# Split version into major.minor.patch
+				local MAJOR MINOR PATCH
+				MAJOR=$(echo "$VERSION" | cut -d. -f1)
+				MINOR=$(echo "$VERSION" | cut -d. -f2)
+				PATCH=$(echo "$VERSION" | cut -d. -f3)
+				
+				# Check if version is < 1.30.6
+				local VERSION_TOO_OLD=0
+				if [ "$MAJOR" -lt 1 ]; then
+					VERSION_TOO_OLD=1
+				elif [ "$MAJOR" -eq 1 ] && [ "$MINOR" -lt 30 ]; then
+					VERSION_TOO_OLD=1
+				elif [ "$MAJOR" -eq 1 ] && [ "$MINOR" -eq 30 ] && [ "$PATCH" -lt 6 ]; then
+					VERSION_TOO_OLD=1
+				fi
+				
+				if [ $VERSION_TOO_OLD -eq 1 ]; then
+					echo "Error: gallery-dl version $VERSION found, but version >= 1.30.6 is required (latest that works with Facebook)" >&2
+					echo "  Current version: $VERSION" >&2
+					echo "  Required version: >= 1.30.6" >&2
+					if [ "$OS_TYPE" = "linux" ]; then
+						echo "  To upgrade on Linux:" >&2
+						echo "    pipx install --force gallery-dl==1.30.6" >&2
+						echo "    OR pip install --user --upgrade gallery-dl==1.30.6" >&2
+					elif [ "$OS_TYPE" = "cygwin" ]; then
+						echo "  To upgrade on Cygwin:" >&2
+						echo "    pip install --upgrade gallery-dl==1.30.6" >&2
+					fi
+					echo "" >&2
+					ALL_GOOD=0
+				fi
+			fi
+		fi
+	fi
+	
+	# Check for blossom-cli (optional, used as fallback)
+	if ! command -v blossom-cli >/dev/null 2>&1; then
+		echo "Warning: blossom-cli not found (optional, used as fallback for uploads)" >&2
+	fi
+	
+	if [ $ALL_GOOD -eq 0 ]; then
+		echo "Error: Missing required commands:" >&2
+		echo "" >&2
+		for cmd in "${MISSING_COMMANDS[@]}"; do
+			echo "  - $cmd" >&2
+			echo "    ${COMMANDS[$cmd]}" >&2
+			echo "" >&2
+		done
+		
+		# Provide OS-specific installation hints
+		if [ "$OS_TYPE" = "cygwin" ]; then
+			echo "Cygwin installation tips:" >&2
+			echo "  - For Python packages (gallery-dl, yt-dlp): Use pip install <package>" >&2
+			echo "  - For gallery-dl: pip install gallery-dl==1.30.6 (requires >= 1.30.6)" >&2
+			echo "  - For yt-dlp: pip install yt-dlp" >&2
+			echo "  - Ensure Python 3 and pip are installed" >&2
+		elif [ "$OS_TYPE" = "linux" ]; then
+			echo "Linux installation tips:" >&2
+			echo "  - DO NOT use apt packages - they are too old" >&2
+			echo "  - Use pipx (recommended) or pip install --user" >&2
+			echo "" >&2
+			if command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
+				echo "  Debian/Ubuntu specific:" >&2
+				echo "  - Install pipx first: apt install pipx" >&2
+				echo "  - For gallery-dl: pipx install gallery-dl==1.30.6" >&2
+				echo "    OR pip install --user gallery-dl==1.30.6" >&2
+				echo "    (requires >= 1.30.6, latest version that works with Facebook)" >&2
+				echo "  - For yt-dlp: pipx install yt-dlp" >&2
+				echo "    OR pip install --user yt-dlp" >&2
+				echo "  - Note: Modern Linux systems use externally-managed Python environments" >&2
+				echo "    Always use --user flag or pipx, avoid 'pip install' without --user" >&2
+			elif command -v yum >/dev/null 2>&1; then
+				echo "  RHEL/CentOS specific:" >&2
+				echo "  - For gallery-dl: pip install --user gallery-dl==1.30.6" >&2
+				echo "  - For yt-dlp: pip install --user yt-dlp" >&2
+				echo "  - Or use virtualenv" >&2
+			elif command -v dnf >/dev/null 2>&1; then
+				echo "  Fedora specific:" >&2
+				echo "  - Install pipx: dnf install pipx" >&2
+				echo "  - For gallery-dl: pipx install gallery-dl==1.30.6" >&2
+				echo "    OR pip install --user gallery-dl==1.30.6" >&2
+				echo "  - For yt-dlp: pipx install yt-dlp" >&2
+				echo "    OR pip install --user yt-dlp" >&2
+			fi
+		fi
+		echo "" >&2
+		return 1
+	fi
+	
+	return 0
+}
+
+# Check required commands on initialization
+if ! check_required_commands; then
+	exit 1
+fi
+
 # functions 
+# Function to convert path for tools that need Windows paths on Cygwin
+# On Cygwin, converts Unix path to Windows path using cygpath
+# On native Linux, returns path as-is
+# Uses global OS_TYPE variable set during initialization
+# Parameters:
+#   $1: PATH - Unix-style path to convert
+# Returns converted path via stdout
+convert_path_for_tool() {
+	local PATH_TO_CONVERT="$1"
+	
+	if [ "$OS_TYPE" = "cygwin" ]; then
+		# We're on Cygwin, convert path to Windows format
+		cygpath -w "$PATH_TO_CONVERT"
+	else
+		# We're on native Linux (or other Unix-like OS), return path as-is
+		echo "$PATH_TO_CONVERT"
+	fi
+}
+
 # Function to add a file or directory to the cleanup list
 # Parameters:
 #   $1: FILE_OR_DIR - path to file or directory to add to cleanup list
@@ -548,6 +740,295 @@ check_file_for_fbid() {
 	return 1
 }
 
+# Function to check if a hardware encoder is actually usable
+# This performs pre-flight checks before attempting encoding
+# Parameters:
+#   $1: ENCODER_NAME - encoder name (e.g., "hevc_qsv", "hevc_nvenc")
+# Returns: 0 if encoder is likely usable, 1 if not
+check_hardware_encoder_available() {
+	local ENCODER_NAME="$1"
+	
+	# Software encoders are always available if compiled in
+	if [[ "$ENCODER_NAME" == libx264 ]] || [[ "$ENCODER_NAME" == libx265 ]]; then
+		return 0
+	fi
+	
+	# Check encoder-specific hardware requirements
+	case "$ENCODER_NAME" in
+		hevc_qsv|h264_qsv)
+			# Intel Quick Sync Video - check for Intel GPU and DRI devices
+			if [ "$OS_TYPE" = "linux" ]; then
+				# Check for DRI render nodes (Intel GPU)
+				if ls /dev/dri/renderD* >/dev/null 2>&1; then
+					# Verify it's Intel GPU by checking vendor IDs
+					if [ -d /sys/class/drm ]; then
+						# Check if any DRM device is Intel
+						for card in /sys/class/drm/card*/device/vendor; do
+							if [ -f "$card" ]; then
+								local VENDOR_ID
+								VENDOR_ID=$(cat "$card" 2>/dev/null | tr -d '\r\n' | tr '[:upper:]' '[:lower:]')
+								# Intel vendor ID is 0x8086 (hex) or 32902 (decimal)
+								# Normalize to lowercase hex for comparison
+								if [[ "$VENDOR_ID" == *"8086"* ]] || [ "$VENDOR_ID" = "32902" ]; then
+									return 0
+								fi
+							fi
+						done
+					fi
+				fi
+			elif [ "$OS_TYPE" = "cygwin" ]; then
+				# On Cygwin/Windows, QSV is available if Intel GPU is present
+				# Check for Intel GPU via wmic (Windows) or assume available if encoder exists
+				# Since we already checked the encoder exists, assume it might work
+				return 0
+			fi
+			# QSV not available
+			return 1
+			;;
+		hevc_nvenc|h264_nvenc)
+			# NVIDIA NVENC - check for NVIDIA GPU
+			# Try nvidia-smi first (most reliable)
+			if command -v nvidia-smi >/dev/null 2>&1; then
+				if nvidia-smi -L >/dev/null 2>&1; then
+					return 0
+				fi
+			fi
+			# Fallback: check for NVIDIA device
+			if [ "$OS_TYPE" = "linux" ]; then
+				# Check lspci for NVIDIA GPU
+				if command -v lspci >/dev/null 2>&1; then
+					if lspci | grep -qi "nvidia"; then
+						# Found NVIDIA GPU, assume NVENC might be available
+						return 0
+					fi
+				fi
+			fi
+			# NVENC not available
+			return 1
+			;;
+		hevc_videotoolbox|h264_videotoolbox)
+			# VideoToolbox is macOS-only
+			# We don't currently support macOS, but if we add it, check for macOS
+			# For now, skip it
+			return 1
+			;;
+		hevc_amf|h264_amf)
+			# AMD AMF - check for AMD GPU
+			if [ "$OS_TYPE" = "linux" ]; then
+				# Check for AMD GPU via lspci
+				if command -v lspci >/dev/null 2>&1; then
+					if lspci | grep -qiE "amd|radeon"; then
+						# Check for DRI render nodes (AMD GPU)
+						if ls /dev/dri/renderD* >/dev/null 2>&1; then
+							# Verify it's AMD GPU by checking vendor IDs
+							if [ -d /sys/class/drm ]; then
+								for card in /sys/class/drm/card*/device/vendor; do
+									if [ -f "$card" ]; then
+										local VENDOR_ID
+										VENDOR_ID=$(cat "$card" 2>/dev/null | tr -d '\r\n' | tr '[:upper:]' '[:lower:]')
+										# AMD vendor ID is 0x1002 (hex) or 4098 (decimal)
+										if [[ "$VENDOR_ID" == *"1002"* ]] || [ "$VENDOR_ID" = "4098" ]; then
+											return 0
+										fi
+									fi
+								done
+							fi
+						fi
+					fi
+				fi
+			elif [ "$OS_TYPE" = "cygwin" ]; then
+				# On Cygwin/Windows, AMF is available if AMD GPU is present
+				# Since we already checked the encoder exists, assume it might work
+				return 0
+			fi
+			# AMF not available
+			return 1
+			;;
+		*)
+			# Unknown encoder, assume not available
+			return 1
+			;;
+	esac
+}
+
+# Function to get all available encoders in priority order
+# Returns: serialized array of encoder specs via stdout
+# Format: "encoder_name:type:hw" where type is "h265" or "h264", hw is "1" or "0"
+get_available_encoders_priority() {
+	# Check available encoders - extract encoder names from ffmpeg output
+	# Format: "V..... libx264            H.264 / AVC / ..."
+	local AVAILABLE_ENCODERS
+	AVAILABLE_ENCODERS=$(ffmpeg -encoders 2>/dev/null | grep -E '^[[:space:]]*V' | awk '{print $2}' | tr '\n' ' ')
+	
+	local ENCODER_LIST=()
+	
+	# Priority order: h265 hardware > h264 hardware > h265 software > h264 software
+	# Check each encoder and add to list if available AND hardware is present
+	
+	# h265 hardware encoders
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_qsv\b'; then
+		if check_hardware_encoder_available "hevc_qsv"; then
+			ENCODER_LIST+=("hevc_qsv:h265:1")
+		fi
+	fi
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_nvenc\b'; then
+		if check_hardware_encoder_available "hevc_nvenc"; then
+			ENCODER_LIST+=("hevc_nvenc:h265:1")
+		fi
+	fi
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_videotoolbox\b'; then
+		if check_hardware_encoder_available "hevc_videotoolbox"; then
+			ENCODER_LIST+=("hevc_videotoolbox:h265:1")
+		fi
+	fi
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_amf\b'; then
+		if check_hardware_encoder_available "hevc_amf"; then
+			ENCODER_LIST+=("hevc_amf:h265:1")
+		fi
+	fi
+	
+	# h264 hardware encoders
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_qsv\b'; then
+		if check_hardware_encoder_available "h264_qsv"; then
+			ENCODER_LIST+=("h264_qsv:h264:1")
+		fi
+	fi
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_nvenc\b'; then
+		if check_hardware_encoder_available "h264_nvenc"; then
+			ENCODER_LIST+=("h264_nvenc:h264:1")
+		fi
+	fi
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_videotoolbox\b'; then
+		if check_hardware_encoder_available "h264_videotoolbox"; then
+			ENCODER_LIST+=("h264_videotoolbox:h264:1")
+		fi
+	fi
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_amf\b'; then
+		if check_hardware_encoder_available "h264_amf"; then
+			ENCODER_LIST+=("h264_amf:h264:1")
+		fi
+	fi
+	
+	# h265 software encoder
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\blibx265\b'; then
+		ENCODER_LIST+=("libx265:h265:0")
+	fi
+	
+	# h264 software encoder (fallback)
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\blibx264\b'; then
+		ENCODER_LIST+=("libx264:h264:0")
+	fi
+	
+	# Serialize array and return
+	if [ ${#ENCODER_LIST[@]} -eq 0 ]; then
+		return 1
+	fi
+	
+	serialize_array "${ENCODER_LIST[@]}"
+	return 0
+}
+
+# Function to convert video using selected encoder
+# Parameters:
+#   $1: INPUT_FILE - input video file path (will be converted via convert_path_for_tool)
+#   $2: OUTPUT_FILE - output video file path (will be converted via convert_path_for_tool)
+#   $3: ENCODER - encoder name (e.g., "hevc_qsv", "libx265", "h264_qsv", "libx264")
+#   $4: ENCODER_TYPE - "h265" or "h264"
+#   $5: IS_HARDWARE - "1" if hardware accelerated, "0" if software
+#   $6: BITRATE - source bitrate (will be adjusted based on encoder type)
+# Returns: 0 on success, 1 on failure
+convert_video_with_encoder() {
+	local INPUT_FILE="$1"
+	local OUTPUT_FILE="$2"
+	local ENCODER="$3"
+	local ENCODER_TYPE="$4"
+	local IS_HARDWARE="$5"
+	local BITRATE="$6"
+	
+	local WIN_INPUT=$(convert_path_for_tool "$INPUT_FILE")
+	local WIN_OUTPUT=$(convert_path_for_tool "$OUTPUT_FILE")
+	
+	# Calculate bitrate multiplier based on encoder type
+	local BITRATE_MULTIPLIER
+	if [ "$ENCODER_TYPE" = "h265" ]; then
+		# H265 is more efficient, use 1.5x bitrate
+		BITRATE_MULTIPLIER=150
+	else
+		# H264 needs 2x bitrate for similar quality
+		BITRATE_MULTIPLIER=200
+	fi
+	
+	local TARGET_BITRATE=$((BITRATE * BITRATE_MULTIPLIER / 100))
+	
+	# Build encoder-specific options
+	local ENCODER_OPTS=()
+	local PRESET=""
+	local PIX_FMT=""
+	local EXTRA_OPTS=()
+	
+	if [ "$ENCODER" = "hevc_qsv" ]; then
+		PRESET="slow"
+		PIX_FMT="nv12"
+		ENCODER_OPTS=(-c:v hevc_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
+	elif [ "$ENCODER" = "hevc_nvenc" ]; then
+		PRESET="slow"
+		ENCODER_OPTS=(-c:v hevc_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
+	elif [ "$ENCODER" = "hevc_videotoolbox" ]; then
+		ENCODER_OPTS=(-c:v hevc_videotoolbox -b:v "${TARGET_BITRATE}")
+	elif [ "$ENCODER" = "hevc_amf" ]; then
+		PRESET="speed"
+		ENCODER_OPTS=(-c:v hevc_amf -b:v "${TARGET_BITRATE}" -quality "$PRESET")
+	elif [ "$ENCODER" = "libx265" ]; then
+		PRESET="medium"
+		ENCODER_OPTS=(-c:v libx265 -b:v "${TARGET_BITRATE}" -preset "$PRESET")
+		EXTRA_OPTS=(-tag:v hvc1)
+	elif [ "$ENCODER" = "h264_qsv" ]; then
+		PRESET="slow"
+		PIX_FMT="nv12"
+		ENCODER_OPTS=(-c:v h264_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
+	elif [ "$ENCODER" = "h264_nvenc" ]; then
+		PRESET="slow"
+		ENCODER_OPTS=(-c:v h264_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
+	elif [ "$ENCODER" = "h264_videotoolbox" ]; then
+		ENCODER_OPTS=(-c:v h264_videotoolbox -b:v "${TARGET_BITRATE}")
+	elif [ "$ENCODER" = "h264_amf" ]; then
+		PRESET="speed"
+		ENCODER_OPTS=(-c:v h264_amf -b:v "${TARGET_BITRATE}" -quality "$PRESET")
+	elif [ "$ENCODER" = "libx264" ]; then
+		PRESET="medium"
+		ENCODER_OPTS=(-c:v libx264 -b:v "${TARGET_BITRATE}" -preset "$PRESET")
+	else
+		echo "Unknown encoder: $ENCODER" >&2
+		return 1
+	fi
+	
+	# Common options for all encoders
+	local HW_ACCEL=""
+	if [ "$IS_HARDWARE" = "1" ]; then
+		HW_ACCEL="(hardware accelerated)"
+	fi
+	
+	echo "Converting video using $ENCODER $HW_ACCEL at bitrate ${TARGET_BITRATE}" >&2
+	
+	# Run ffmpeg conversion - capture output for error reporting
+	local FFMPEG_OUTPUT
+	FFMPEG_OUTPUT=$(ffmpeg -y -i "$WIN_INPUT" "${ENCODER_OPTS[@]}" "${EXTRA_OPTS[@]}" -movflags +faststart -c:a copy "$WIN_OUTPUT" 2>&1)
+	local FFMPEG_EXIT=$?
+	
+	if [ $FFMPEG_EXIT -eq 0 ] && [ -f "$OUTPUT_FILE" ]; then
+		echo "Video conversion successful with $ENCODER" >&2
+		return 0
+	else
+		echo "Video conversion failed with encoder $ENCODER" >&2
+		# Show last few lines of error output for debugging
+		if [ -n "$FFMPEG_OUTPUT" ]; then
+			echo "ffmpeg error output:" >&2
+			echo "$FFMPEG_OUTPUT" | tail -n 15 >&2
+		fi
+		return 1
+	fi
+}
+
 # Function to download video from URL using yt-dlp
 # Parameters:
 #   $1: VIDEO_URL - URL to download
@@ -595,8 +1076,8 @@ download_video() {
 	add_to_cleanup "$DESC_FILE"
 	
 	echo "Attempting to download as video to $OUT_FILE_INT"
-	local WINFILE_INT=$(cygpath -w "$OUT_FILE_INT")
-	local WINFILE=$(cygpath -w "$OUT_FILE")
+	local WINFILE_INT=$(convert_path_for_tool "$OUT_FILE_INT")
+	local WINFILE=$(convert_path_for_tool "$OUT_FILE")
 	
 	local FORMATS='bestvideo[codec^=hevc]+bestaudio/bestvideo[codec^=avc]+bestaudio/best[codec^=hevc]/best[codec^=avc]/bestvideo+bestaudio/best'
 	if [ "$CONVERT_VIDEO" -eq 0 ]; then
@@ -608,9 +1089,22 @@ download_video() {
 		YT_DLP_OPTS+=(--cookies-from-browser firefox)
 	fi
 	
-	/usr/local/bin/yt-dlp "${YT_DLP_OPTS[@]}" "$VIDEO_URL" -f "$FORMATS" -S ext:mp4:m4a --merge-output-format mp4 --write-description -o "$WINFILE_INT" 2>/dev/null
+	# Find yt-dlp command dynamically (check PATH first, then fallback to hardcoded path for Cygwin)
+	local YT_DLP_CMD
+	if command -v yt-dlp >/dev/null 2>&1; then
+		YT_DLP_CMD="yt-dlp"
+	elif [ -f "/usr/local/bin/yt-dlp" ]; then
+		YT_DLP_CMD="/usr/local/bin/yt-dlp"
+	else
+		echo "Error: yt-dlp not found in PATH or at /usr/local/bin/yt-dlp" >&2
+		return 1
+	fi
 	
-	if [ $? -eq 0 ] && [ -f "$OUT_FILE_INT" ]; then
+	echo "yt-dlp stdout/stderr:" >&2
+	"$YT_DLP_CMD" "${YT_DLP_OPTS[@]}" "$VIDEO_URL" -f "$FORMATS" -S ext:mp4:m4a --merge-output-format mp4 --write-description -o "$WINFILE_INT" 2>&1
+	local YT_DLP_EXIT_CODE=$?
+	
+	if [ $YT_DLP_EXIT_CODE -eq 0 ] && [ -f "$OUT_FILE_INT" ]; then
 		DOWNLOADED=1
 		local file_caption=""
 		local extracted_caption=""
@@ -638,28 +1132,84 @@ download_video() {
 		
 		if [ "$VIDEO_CODEC" != "h264" ] && [ "$VIDEO_CODEC" != "hevc" ]; then
 			if [ "$CONVERT_VIDEO" -eq 1 ]; then
-				echo "Converting $OUT_FILE_INT to iOS compatible format"
+				echo "Converting $OUT_FILE_INT to compatible format (h264 or h265)"
+				
+				# Get source bitrate
 				local BITRATE=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "$WINFILE_INT" 2>/dev/null)
 				BITRATE=$(echo "$BITRATE" | tr -d '\r' | tr -cd '[:digit:]')
-				echo "Bitrate: '$BITRATE'"
 				
 				if [[ "$BITRATE" =~ ^[0-9]+$ ]]; then
-					local H264_BITRATE=$((BITRATE * 2))
-					ffmpeg -y -i "$WINFILE_INT" -c:v h264_qsv -b:v "${H264_BITRATE}" -preset slow -pix_fmt nv12 -movflags +faststart -c:a copy "$WINFILE" 2>/dev/null
-					if [ $? -ne 0 ]; then
-						local H265_BITRATE=$((BITRATE * 3 / 2))
-						ffmpeg -y -i "$WINFILE_INT" -c:v libx265 -b:v "${H265_BITRATE}" -preset ultrafast -c:a copy -movflags +faststart -tag:v hvc1 "$WINFILE" 2>/dev/null
+					echo "Source bitrate: ${BITRATE} bps"
+					
+					# Try conversion with fallback chain: h265 hardware > h264 hardware > h265 software > h264 software
+					echo "Trying video encoders in priority order..."
+					
+					# Get list of available encoders in priority order
+					local ENCODERS_STR
+					ENCODERS_STR=$(get_available_encoders_priority)
+					local ENCODER_LIST_RESULT=$?
+					
+					if [ $ENCODER_LIST_RESULT -ne 0 ]; then
+						echo "Error: No suitable video encoder found (h264 or h265 required)" >&2
+						die "Cannot convert video: no compatible encoder available. Please install ffmpeg with h264/h265 support."
 					fi
-					if [ -f "$OUT_FILE" ]; then
-						download_video_ret_files+=("$OUT_FILE")
-						download_video_ret_captions+=("$file_caption")
-					else
-						download_video_ret_files+=("$OUT_FILE_INT")
-						download_video_ret_captions+=("$file_caption")
+					
+					# Deserialize encoder list
+					local ENCODER_LIST=()
+					eval "ENCODER_LIST=($ENCODERS_STR)"
+					
+					local CONVERSION_SUCCESS=0
+					local LAST_ERROR=""
+					
+					# Try each encoder in order until one succeeds
+					for ENCODER_SPEC in "${ENCODER_LIST[@]}"; do
+						# Parse encoder spec: "encoder_name:type:hw"
+						local ENCODER_NAME ENCODER_TYPE IS_HARDWARE
+						ENCODER_NAME=$(echo "$ENCODER_SPEC" | cut -d: -f1)
+						ENCODER_TYPE=$(echo "$ENCODER_SPEC" | cut -d: -f2)
+						IS_HARDWARE=$(echo "$ENCODER_SPEC" | cut -d: -f3)
+						
+						if [ -z "$ENCODER_NAME" ] || [ -z "$ENCODER_TYPE" ]; then
+							continue
+						fi
+						
+						local HW_DESC="software"
+						if [ "$IS_HARDWARE" = "1" ]; then
+							HW_DESC="hardware-accelerated"
+						fi
+						
+						echo "Trying encoder: $ENCODER_NAME ($ENCODER_TYPE, $HW_DESC)"
+						
+						# Try conversion with this encoder
+						if convert_video_with_encoder "$OUT_FILE_INT" "$OUT_FILE" "$ENCODER_NAME" "$ENCODER_TYPE" "$IS_HARDWARE" "$BITRATE"; then
+							if [ -f "$OUT_FILE" ]; then
+								echo "Conversion successful with $ENCODER_NAME"
+								download_video_ret_files+=("$OUT_FILE")
+								download_video_ret_captions+=("$file_caption")
+								CONVERSION_SUCCESS=1
+								break
+							else
+								echo "Warning: Conversion reported success but output file not found, trying next encoder..." >&2
+								LAST_ERROR="Conversion succeeded but output file not found"
+							fi
+						else
+							echo "Encoder $ENCODER_NAME failed, trying next encoder..." >&2
+							LAST_ERROR="Encoder $ENCODER_NAME failed"
+							# Continue to next encoder
+						fi
+					done
+					
+					if [ $CONVERSION_SUCCESS -eq 0 ]; then
+						echo "Error: All video encoders failed - cannot convert incompatible codec ($VIDEO_CODEC)" >&2
+						echo "The video codec '$VIDEO_CODEC' is not compatible with iOS devices." >&2
+						echo "Tried ${#ENCODER_LIST[@]} encoder(s), all failed. Last error: $LAST_ERROR" >&2
+						die "Video conversion failed - cannot proceed with incompatible codec. Please ensure ffmpeg has working h264/h265 encoders."
 					fi
 				else
-					download_video_ret_files+=("$OUT_FILE_INT")
-					download_video_ret_captions+=("$file_caption")
+					echo "Error: Could not determine source bitrate for conversion" >&2
+					echo "Cannot convert video codec '$VIDEO_CODEC' without knowing source bitrate." >&2
+					echo "The video codec '$VIDEO_CODEC' is not compatible with iOS devices." >&2
+					die "Cannot convert video: source bitrate could not be determined. Cannot proceed with incompatible codec."
 				fi
 			else
 				die "Video codec is not h264 or hevc and conversion is disabled"
@@ -724,10 +1274,12 @@ download_images() {
 			# Try downloading to see if it works
 			echo "Trying to remove set param, new URL: $URL_NOSET"
 			local TEST_TMPDIR=$(mktemp -d /tmp/gallery_dl_test_XXXXXXXX)
-			local WIN_TEST_TMPDIR=$(cygpath -w "$TEST_TMPDIR")
+			local WIN_TEST_TMPDIR=$(convert_path_for_tool "$TEST_TMPDIR")
 			echo "Testing download: gallery-dl \"${URL_GALLERY_DL_PARAMS[@]}\" -f '{num}.{extension}' -D \"$WIN_TEST_TMPDIR\" --write-metadata \"$URL_NOSET\""
-			gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_TEST_TMPDIR" --write-metadata "$URL_NOSET" 2>&1 >/dev/null
-			if [ $? -eq 0 ] && [ "$(ls -A "$TEST_TMPDIR" 2>/dev/null)" ]; then
+			echo "gallery-dl stdout/stderr:" >&2
+			gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_TEST_TMPDIR" --write-metadata "$URL_NOSET" 2>&1
+			local GALLERY_DL_EXIT_CODE=$?
+			if [ $GALLERY_DL_EXIT_CODE -eq 0 ] && [ "$(ls -A "$TEST_TMPDIR" 2>/dev/null)" ]; then
 				PROCESSED_URL="$URL_NOSET"
 				echo "Download succeeded, removed set param, new URL: $PROCESSED_URL"
 				# Keep the test temp directory for later use (will be added to cleanup when used as IMAGES_TMPDIR)
@@ -751,7 +1303,7 @@ download_images() {
 				local FOUND_POSITION=0
 				
 				local POSITION_TMPDIR=$(mktemp -d /tmp/gallery_dl_position_XXXXXXXX)
-				local WIN_POSITION_TMPDIR=$(cygpath -w "$POSITION_TMPDIR")
+				local WIN_POSITION_TMPDIR=$(convert_path_for_tool "$POSITION_TMPDIR")
 				# Add temp directory to cleanup list
 				add_to_cleanup "$POSITION_TMPDIR"
 				
@@ -765,7 +1317,11 @@ download_images() {
 				# Run gallery-dl and read its output line by line using process substitution
 				# Process substitution doesn't create a subshell, so variables are accessible
 				# When we break out of the loop, gallery-dl will receive SIGPIPE on its next write
+				echo "gallery-dl stdout/stderr:" >&2
 				while IFS= read -r line; do
+					# Log all lines from gallery-dl for debugging (to stderr)
+					echo "$line" >&2
+					
 					# Parse the line to extract filename
 					# gallery-dl may output full paths or just filenames
 					local filename=""
@@ -819,6 +1375,7 @@ download_images() {
 								echo "Processed file: $filename (ID: $found_id)"
 							else
 								echo "Processed file: $filename (ID: not found)"
+								echo "Metadata file: $meta"
 							fi
 							
 							# Check if the 'id' field in metadata matches the FBID we're looking for (only check 'id' field)
@@ -863,7 +1420,7 @@ download_images() {
 					# We already downloaded the file, reuse it instead of redownloading
 					# Create a directory with just the matching file
 					local MATCHING_FILE_DIR=$(mktemp -d /tmp/gallery_dl_matching_XXXXXXXX)
-					local WIN_MATCHING_FILE_DIR=$(cygpath -w "$MATCHING_FILE_DIR")
+					local WIN_MATCHING_FILE_DIR=$(convert_path_for_tool "$MATCHING_FILE_DIR")
 					# Return directory for caller to add to cleanup list
 					download_images_ret_temp_dir="$MATCHING_FILE_DIR"
 					
@@ -920,13 +1477,15 @@ download_images() {
 	else
 		echo "Attempting to download as images using gallery-dl"
 		local IMAGES_TMPDIR=$(mktemp -d /tmp/gallery_dl_XXXXXXXX)
-		local WIN_IMAGES_TMPDIR=$(cygpath -w "$IMAGES_TMPDIR")
+		local WIN_IMAGES_TMPDIR=$(convert_path_for_tool "$IMAGES_TMPDIR")
 		# Add temp directory to cleanup list
 		add_to_cleanup "$IMAGES_TMPDIR"
 		
-		gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_IMAGES_TMPDIR" --write-metadata "$PROCESSED_URL" 2>/dev/null
+		echo "gallery-dl stdout/stderr:" >&2
+		gallery-dl "${URL_GALLERY_DL_PARAMS[@]}" -f '{num}.{extension}' -D "$WIN_IMAGES_TMPDIR" --write-metadata "$PROCESSED_URL" 2>&1
+		local GALLERY_DL_EXIT_CODE=$?
 		
-		if [ $? -eq 0 ] && [ "$(ls -A "$IMAGES_TMPDIR" 2>/dev/null)" ]; then
+		if [ $GALLERY_DL_EXIT_CODE -eq 0 ] && [ "$(ls -A "$IMAGES_TMPDIR" 2>/dev/null)" ]; then
 			DOWNLOADED=1
 		fi
 	fi
@@ -972,7 +1531,7 @@ upload_file_to_blossom() {
 	local BLOSSOM="$2"
 	local KEY="$3"
 	
-	local FILE_WIN=$(cygpath -w "$FILE")
+	local FILE_WIN=$(convert_path_for_tool "$FILE")
 	if [ ! -f "$FILE" ]; then
 		echo "File does not exist: $FILE" >&2
 		return 1
@@ -1207,11 +1766,18 @@ validate_configuration() {
 	local KEY="$3"
 	local NCRYPT_KEY="$4"
 	
+	# Create history file if it doesn't exist
 if [ ! -f "$HISTORY_FILE" ]; then
-	die "History file not found: $HISTORY_FILE"
-fi
+		# Ensure the directory exists
+		local HISTORY_DIR=$(dirname "$HISTORY_FILE")
+		if [ ! -d "$HISTORY_DIR" ]; then
+			mkdir -p "$HISTORY_DIR" || die "Failed to create history directory: $HISTORY_DIR"
+		fi
+		# Create empty history file
+		touch "$HISTORY_FILE" || die "Failed to create history file: $HISTORY_FILE"
+	fi
 
-	if [[ -z "$NSEC_KEY" && -z "$KEY" && -z "$NCRYPT_KEY" ]]; then
+if [[ -z "$NSEC_KEY" && -z "$KEY" && -z "$NCRYPT_KEY" ]]; then
 		die "Error: No key variable is set. Please set NSEC_KEY, KEY, or NCRYPT_KEY"
 	fi
 }
@@ -1246,10 +1812,30 @@ process_relays_and_blossoms() {
 	done
 fi
 
-	# Process BLOSSOMS
-	local BLOSSOMS_LIST=("${BLOSSOMS[@]}")
+	# Process BLOSSOMS - filter out empty entries
+	local BLOSSOMS_LIST=()
+	# Filter BLOSSOMS array to remove empty entries
+	for BLOSSOM in "${BLOSSOMS[@]}"; do
+		# Remove quotes if present and check if non-empty
+		BLOSSOM=$(echo "$BLOSSOM" | sed "s/^['\"]//;s/['\"]$//")
+		if [ -n "$BLOSSOM" ]; then
+			BLOSSOMS_LIST+=("$BLOSSOM")
+		fi
+	done
+	
+	# Add EXTRA_BLOSSOMS if any, also filtering out empty entries
 	if [[ ${#EXTRA_BLOSSOMS[@]} -gt 0 ]]; then
-		BLOSSOMS_LIST=("${EXTRA_BLOSSOMS[@]}" "${BLOSSOMS_LIST[@]}")
+		local EXTRA_FILTERED=()
+		for BLOSSOM in "${EXTRA_BLOSSOMS[@]}"; do
+			# Remove quotes if present and check if non-empty
+			BLOSSOM=$(echo "$BLOSSOM" | sed "s/^['\"]//;s/['\"]$//")
+			if [ -n "$BLOSSOM" ]; then
+				EXTRA_FILTERED+=("$BLOSSOM")
+			fi
+		done
+		if [[ ${#EXTRA_FILTERED[@]} -gt 0 ]]; then
+			BLOSSOMS_LIST=("${EXTRA_FILTERED[@]}" "${BLOSSOMS_LIST[@]}")
+		fi
 	fi
 	
 	# Return via return variables
@@ -1451,9 +2037,9 @@ for MEDIA_FILE in "${ALL_MEDIA_FILES[@]}"; do
 		# Add normalized URL if it's not empty (it's a URL, not a local file)
 		if [ -n "$result" ]; then
 			ORIGINAL_URLS+=("$result")
-		fi
-	done
-	
+	fi
+done
+
 	check_all_media_history_ret_original_urls=$(serialize_array "${ORIGINAL_URLS[@]}")
 }
 
@@ -1544,21 +2130,21 @@ process_media_items() {
 		if [[ "$MEDIA_ITEM" =~ ^https?:// ]]; then
 			# It's a URL - try to download as video first, then as image
 			echo "Processing URL: $MEDIA_ITEM"
-			
+		
 			# Prepare gallery-dl params as string for passing to function
 			local GALLERY_DL_PARAMS_STR_LOCAL
 			GALLERY_DL_PARAMS_STR_LOCAL=$(serialize_array "${GALLERY_DL_PARAMS[@]}")
-			
+		
 			# Try video download first for any URL
 			# Initialize return variables (these are global return variables, not local)
 			download_video_ret_files=()
 			download_video_ret_captions=()
 			download_video_ret_source=""
 			download_video_ret_success=1
-			
+		
 			download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
 			local VIDEO_DOWNLOAD_RESULT="${download_video_ret_success:-1}"
-			
+		
 			# If video download succeeded, use its return values
 			if [ "$VIDEO_DOWNLOAD_RESULT" -eq 0 ]; then
 				# Append downloaded files and captions to parallel arrays
@@ -1585,60 +2171,65 @@ process_media_items() {
 				fi
 				((GALLERY_ID++))
 			else
-				# If video download failed, try image download with gallery-dl
-				echo "Video download failed, trying gallery-dl for images"
-				# Initialize return variables (these are global return variables, not local)
-				download_images_ret_files=()
-				download_images_ret_captions=()
-				download_images_ret_source=""
-				download_images_ret_success=1
-				download_images_ret_temp_dir=""
+				# Video processing failed - check if it was a download failure or conversion failure
+				# If files array is empty or only has the original incompatible file, conversion likely failed
+				# Only try gallery-dl if no files were successfully processed (download failed)
+				if [ ${#download_video_ret_files[@]} -eq 0 ]; then
+					# No files were successfully processed - try gallery-dl as fallback
+					echo "Video download/processing failed, trying gallery-dl for images"
+					# Initialize return variables (these are global return variables, not local)
+					download_images_ret_files=()
+					download_images_ret_captions=()
+					download_images_ret_source=""
+					download_images_ret_success=1
+					download_images_ret_temp_dir=""
+			
+					# Call download_images function (Facebook URL handling is done inside)
+					download_images "$MEDIA_ITEM" "$GALLERY_DL_PARAMS_STR_LOCAL" "$APPEND_ORIGINAL_COMMENT" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE" "$MAX_FILE_SEARCH"
+					local IMAGE_DOWNLOAD_RESULT="${download_images_ret_success:-1}"
 				
-				# Call download_images function (Facebook URL handling is done inside)
-				download_images "$MEDIA_ITEM" "$GALLERY_DL_PARAMS_STR_LOCAL" "$APPEND_ORIGINAL_COMMENT" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE" "$MAX_FILE_SEARCH"
-				local IMAGE_DOWNLOAD_RESULT="${download_images_ret_success:-1}"
-				
-				# Add temp directory to cleanup list if returned
-				if [ -n "$download_images_ret_temp_dir" ]; then
-					add_to_cleanup "$download_images_ret_temp_dir"
-				fi
-				
-				if [ "$IMAGE_DOWNLOAD_RESULT" -eq 0 ]; then
-					# For gallery images, all files from same gallery share the same gallery ID and caption
-					# Use the first caption (they should all be the same or similar for gallery downloads)
-					local CAPTIONS_STR
-					local gallery_caption
-					CAPTIONS_STR=$(serialize_array "${download_images_ret_captions[@]}")
-					gallery_caption=$(get_first_non_empty_caption "$CAPTIONS_STR")
+					# Add temp directory to cleanup list if returned
+					if [ -n "$download_images_ret_temp_dir" ]; then
+						add_to_cleanup "$download_images_ret_temp_dir"
+					fi
+			
+					if [ "$IMAGE_DOWNLOAD_RESULT" -eq 0 ]; then
+						# For gallery images, all files from same gallery share the same gallery ID and caption
+						# Use the first caption (they should all be the same or similar for gallery downloads)
+						local CAPTIONS_STR
+						local gallery_caption
+						CAPTIONS_STR=$(serialize_array "${download_images_ret_captions[@]}")
+						gallery_caption=$(get_first_non_empty_caption "$CAPTIONS_STR")
 					
-					# Append downloaded files to parallel arrays - all from same gallery
-					local current_gallery_id
-					local last_idx
-					if [ ${#download_images_ret_files[@]} -gt 0 ]; then
-						current_gallery_id=$GALLERY_ID
-						for file in "${download_images_ret_files[@]}"; do
-							PROCESSED_FILES+=("$file")
-							# For gallery images, store caption once per gallery (will be used after all URLs)
-							FILE_CAPTIONS+=("")
-							FILE_GALLERIES+=("$current_gallery_id")
-						done
-						# Store gallery caption in the last file's position (we'll handle it differently during content building)
-						if [ ${#PROCESSED_FILES[@]} -gt 0 ] && [ -n "$gallery_caption" ]; then
-							last_idx=$((${#PROCESSED_FILES[@]} - 1))
-							FILE_CAPTIONS[$last_idx]="$gallery_caption"
+						# Append downloaded files to parallel arrays - all from same gallery
+						local current_gallery_id
+						local last_idx
+						if [ ${#download_images_ret_files[@]} -gt 0 ]; then
+							current_gallery_id=$GALLERY_ID
+							for file in "${download_images_ret_files[@]}"; do
+								PROCESSED_FILES+=("$file")
+								# For gallery images, store caption once per gallery (will be used after all URLs)
+								FILE_CAPTIONS+=("")
+								FILE_GALLERIES+=("$current_gallery_id")
+							done
+							# Store gallery caption in the last file's position (we'll handle it differently during content building)
+							if [ ${#PROCESSED_FILES[@]} -gt 0 ] && [ -n "$gallery_caption" ]; then
+								last_idx=$((${#PROCESSED_FILES[@]} - 1))
+								FILE_CAPTIONS[$last_idx]="$gallery_caption"
+							fi
 						fi
-					fi
-					# Update source if provided
-					if [ -n "$download_images_ret_source" ]; then
-						cleaned_source=$(cleanup_source_url "$download_images_ret_source")
-						FILE_SOURCES+=("$cleaned_source")
-					fi
-					((GALLERY_ID++))
-				else
-					if [ -n "$download_images_ret_error" ]; then
-						die "$download_images_ret_error"
+						# Update source if provided
+						if [ -n "$download_images_ret_source" ]; then
+							cleaned_source=$(cleanup_source_url "$download_images_ret_source")
+							FILE_SOURCES+=("$cleaned_source")
+						fi
+						((GALLERY_ID++))
 					else
-						die "Failed to download from URL: $MEDIA_ITEM"
+						if [ -n "$download_images_ret_error" ]; then
+							die "$download_images_ret_error"
+						else
+							die "Failed to download from URL: $MEDIA_ITEM"
+						fi
 					fi
 				fi
 			fi
@@ -1654,7 +2245,7 @@ process_media_items() {
 			echo "Using local file: $MEDIA_ITEM"
 		fi
 	done
-	
+
 	if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
 		die "No files to upload"
 	fi
@@ -1702,11 +2293,27 @@ upload_and_publish_event() {
 	eval "FILE_SOURCES=($FILE_SOURCES_STR)"
 	eval "FILE_GALLERIES=($FILE_GALLERIES_STR)"
 	eval "BLOSSOMS_LIST=($BLOSSOMS_LIST_STR)"
-	
-	if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
-		die "No files to upload"
+
+	# Filter out empty entries from BLOSSOMS_LIST
+	local FILTERED_BLOSSOMS=()
+	for BLOSSOM_ENTRY in "${BLOSSOMS_LIST[@]}"; do
+		# Remove quotes if present and check if non-empty
+		BLOSSOM_ENTRY=$(echo "$BLOSSOM_ENTRY" | sed "s/^['\"]//;s/['\"]$//")
+		if [ -n "$BLOSSOM_ENTRY" ]; then
+			FILTERED_BLOSSOMS+=("$BLOSSOM_ENTRY")
+		fi
+	done
+	BLOSSOMS_LIST=("${FILTERED_BLOSSOMS[@]}")
+
+if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
+	die "No files to upload"
+fi
+
+	# Check if we have any valid blossom servers
+	if [ ${#BLOSSOMS_LIST[@]} -eq 0 ]; then
+		die "No valid blossom servers configured. Please check your BLOSSOMS configuration."
 	fi
-	
+
 	local UPLOAD_URLS=()
 	local RESULT=0
 	local upload_success=0
@@ -1720,28 +2327,33 @@ upload_and_publish_event() {
 	
 	for TRIES in "${!BLOSSOMS_LIST[@]}"; do
 		BLOSSOM="${BLOSSOMS_LIST[$TRIES]}"
+		# Skip empty blossom URLs
+		if [ -z "$BLOSSOM" ]; then
+			echo "Skipping empty blossom server entry" >&2
+			continue
+		fi
 		echo "Using blossom: $BLOSSOM, try: $((TRIES+1))"
-		
+	
 		UPLOAD_URLS=()
 		upload_success=1
 		
 		for FILE in "${PROCESSED_FILES[@]}"; do
 			upload_url=$(upload_file_to_blossom "$FILE" "$BLOSSOM" "$KEY_DECRYPTED")
 			if [ $? -ne 0 ]; then
-				upload_success=0
-				break
-			fi
-			UPLOAD_URLS+=("$upload_url")
-		done
-		
-		if [ $upload_success -eq 0 ]; then
-			RESULT=1
-			continue
+			upload_success=0
+			break
 		fi
-		
-		# Build content for kind 1 event: interleaved URL -> caption -> URL -> caption, then sources at bottom
-		# For gallery images: all URLs first, then caption for the gallery
-		# Formatting: empty line after images before caption, 2 empty lines after caption before next URL
+			UPLOAD_URLS+=("$upload_url")
+	done
+
+	if [ $upload_success -eq 0 ]; then
+		RESULT=1
+		continue
+	fi
+
+	# Build content for kind 1 event: interleaved URL -> caption -> URL -> caption, then sources at bottom
+	# For gallery images: all URLs first, then caption for the gallery
+	# Formatting: empty line after images before caption, 2 empty lines after caption before next URL
 		local UPLOAD_URLS_STR
 		local FILE_CAPTIONS_STR_LOCAL
 		local FILE_GALLERIES_STR_LOCAL
@@ -1751,42 +2363,42 @@ upload_and_publish_event() {
 		FILE_GALLERIES_STR_LOCAL=$(serialize_array "${FILE_GALLERIES[@]}")
 		FILE_SOURCES_STR_LOCAL=$(serialize_array "${FILE_SOURCES[@]}")
 		CONTENT=$(build_event_content "$UPLOAD_URLS_STR" "$FILE_CAPTIONS_STR_LOCAL" "$FILE_GALLERIES_STR_LOCAL" "$FILE_SOURCES_STR_LOCAL" "$DISPLAY_SOURCE")
-		
-		# Print content for debugging before creating event
-		echo "=== Event Content (Debug) ==="
-		echo "$CONTENT"
-		echo "=== End Event Content ==="
-		
-		# Create kind 1 event with nak
-		echo "Creating kind 1 event with content length: ${#CONTENT}"
-		
+
+	# Print content for debugging before creating event
+	echo "=== Event Content (Debug) ==="
+	echo "$CONTENT"
+	echo "=== End Event Content ==="
+
+	# Create kind 1 event with nak
+	echo "Creating kind 1 event with content length: ${#CONTENT}"
+	
 		NAK_CMD=("nak" "event" "--kind" "1" "-sec" "$KEY_DECRYPTED" "--pow" "$POW_DIFF")
-		if [ "$SEND_TO_RELAY" -eq 1 ]; then
+	if [ "$SEND_TO_RELAY" -eq 1 ]; then
 			NAK_CMD+=("--auth" "-sec" "$KEY_DECRYPTED")
 			for RELAY in $RELAYS_LIST; do
-				NAK_CMD+=("$RELAY")
-			done
-		fi
-		
-		if [ -n "$CONTENT" ]; then
-			NAK_CMD+=("--content" "$(echo -e "$CONTENT")")
-		else
-			NAK_CMD+=("--content" "")
-		fi
-		
-		echo "${NAK_CMD[@]}"
-		"${NAK_CMD[@]}"
-		RESULT=$?
-		
-		if [ $RESULT -eq 0 ]; then
-			echo "Successfully published kind 1 event"
-			return 0
-		else
-			echo "Failed to publish kind 1 event, trying next blossom server"
-			RESULT=1
-		fi
-	done
+			NAK_CMD+=("$RELAY")
+		done
+	fi
 	
+	if [ -n "$CONTENT" ]; then
+		NAK_CMD+=("--content" "$(echo -e "$CONTENT")")
+	else
+		NAK_CMD+=("--content" "")
+	fi
+	
+	echo "${NAK_CMD[@]}"
+	"${NAK_CMD[@]}"
+	RESULT=$?
+	
+	if [ $RESULT -eq 0 ]; then
+		echo "Successfully published kind 1 event"
+			return 0
+	else
+		echo "Failed to publish kind 1 event, trying next blossom server"
+		RESULT=1
+	fi
+done
+
 	die "Failed to upload files and publish event"
 }
 
@@ -2018,15 +2630,13 @@ if [ $# -eq 0 ]; then
 	exit 1
 fi
 
-# Load environment variables from ~/.nostr/${SCRIPT_NAME%.*}
-# This sets exported variables that main() will read
+# Load environment variables from ~/.nostr/${SCRIPT_NAME%.*} if it exists
+# Variables can also be provided via environment variables or command-line parameters
 SCRIPT_NAME=$(basename "$0")
 ENV_FILE="$HOME/.nostr/${SCRIPT_NAME%.*}"
 if [[ -f "$ENV_FILE" ]]; then
 	# shellcheck source=/dev/null
 	source "$ENV_FILE"
-else
-	die "No environment variables found in $ENV_FILE"
 fi
 
 # Export variables for main() to read
@@ -2043,3 +2653,4 @@ export EXTRA_BLOSSOMS
 
 # Call main function
 main "$@"
+
