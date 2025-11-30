@@ -1,14 +1,2 @@
-refactoring_report*.txt
-
-unused_code_report.txt
-unused_code_report*.txt
-*_report.txt
-return_variables_refactoring_report.txt
-main_function_refactoring_plan*.txt
-
-# Scripts created for history rewrite task (removing hardcoded keys)
-cherry_pick_commits.sh
-complete_cherry_pick.sh
-final_cherry_pick.sh
-remove_old_commits.sh
-check_keys.sh
+# Reports and temporary scripts folder
+reports/
