@@ -1,0 +1,91 @@
+#!/bin/bash
+# Example environment configuration file for Nostr Media Uploader
+# Copy this file to ~/.nostr/nostr_media_uploader (or appropriate profile name)
+# and customize with your own values
+
+# =============================================================================
+# NOSTR KEY CONFIGURATION (REQUIRED - at least one must be set)
+# =============================================================================
+
+# Option 1: NSEC key (recommended - easiest to use)
+# Get your nsec key from your Nostr client (e.g., Amethyst, Damus)
+NSEC_KEY="nsec1..."
+
+# Option 2: Password-encrypted Nostr key (NCRYPT format)
+# Use: nak key encrypt <private_key_hex> <password>
+# NCRYPT_KEY="ncryptsec1..."
+# PASSWORD="your_password_here"
+
+# Option 3: OpenSSL-encrypted key (KEY format)
+# Use: echo "<private_key_hex>" | openssl enc -aes-256-cbc -pbkdf2 -a -pass pass:"<password>"
+# KEY="U2FsdGVkX1..."
+# PASSWORD="your_password_here"
+
+# =============================================================================
+# RELAY CONFIGURATION (OPTIONAL)
+# =============================================================================
+
+# Default relays (space-separated string)
+# RELAYS="wss://relay1.example.com wss://relay2.example.com"
+
+# Additional relays (bash array - added to default relays)
+# EXTRA_RELAYS=(
+#     "wss://relay3.example.com"
+#     "wss://relay4.example.com"
+# )
+
+# =============================================================================
+# BLOSSOM SERVER CONFIGURATION (OPTIONAL)
+# =============================================================================
+
+# Default blossom servers are set in the script
+# You can add additional servers here (bash array - added before defaults)
+# EXTRA_BLOSSOMS=(
+#     "https://your-blossom-server.com"
+# )
+
+# =============================================================================
+# BEHAVIOR CONFIGURATION (OPTIONAL - defaults shown)
+# =============================================================================
+
+# Display source URLs in posts (0 = no, 1 = yes)
+# Default: 0
+# DISPLAY_SOURCE=0
+
+# Proof of work difficulty for events
+# Default: 20
+# Set to 0 to disable proof of work
+# POW_DIFF=20
+
+# Append original captions from downloaded media
+# Default: 1
+# APPEND_ORIGINAL_COMMENT=1
+
+# Use Firefox cookies for authenticated downloads
+# Default: 0 (can also use --firefox flag on command line)
+# USE_COOKIES_FF=0
+
+# =============================================================================
+# EXAMPLES
+# =============================================================================
+
+# Example 1: Simple configuration with NSEC key only
+# NSEC_KEY="nsec1yourkeyhere"
+
+# Example 2: Configuration with encrypted key
+# NCRYPT_KEY="ncryptsec1..."
+# PASSWORD="my_secret_password"
+
+# Example 3: Full configuration with all options
+# NSEC_KEY="nsec1yourkeyhere"
+# EXTRA_RELAYS=(
+#     "wss://relay.damus.io"
+#     "wss://nos.lol"
+# )
+# EXTRA_BLOSSOMS=(
+#     "https://custom-blossom.example.com"
+# )
+# DISPLAY_SOURCE=1
+# POW_DIFF=10
+# USE_COOKIES_FF=1
+
