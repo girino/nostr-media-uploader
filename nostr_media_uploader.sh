@@ -682,22 +682,24 @@ build_event_content() {
 			fi
 		done
 		
-		if [ $source_count -eq 1 ]; then
-			# Only one source - use "Source: " prefix on same line
-			for source in "${FILE_SOURCES[@]}"; do
-				if [ -n "$source" ]; then
-					CONTENT="${CONTENT}Source: ${source}"
-					break
-				fi
-			done
-		else
-			# Multiple sources - use "Sources:" on its own line, then each source with "- " prefix
-			CONTENT="${CONTENT}Sources:"
-			for source in "${FILE_SOURCES[@]}"; do
-				if [ -n "$source" ]; then
-					CONTENT="${CONTENT}"$'\n'"- ${source}"
-				fi
-			done
+		if [ $source_count -gt 0 ]; then
+			if [ $source_count -eq 1 ]; then
+				# Only one source - use "Source: " prefix on same line
+				for source in "${FILE_SOURCES[@]}"; do
+					if [ -n "$source" ]; then
+						CONTENT="${CONTENT}Source: ${source}"
+						break
+					fi
+				done
+			else
+				# Multiple sources - use "Sources:" on its own line, then each source with "- " prefix
+				CONTENT="${CONTENT}Sources:"
+				for source in "${FILE_SOURCES[@]}"; do
+					if [ -n "$source" ]; then
+						CONTENT="${CONTENT}"$'\n'"- ${source}"
+					fi
+				done
+			fi
 		fi
 	fi
 	
@@ -1116,6 +1118,8 @@ download_video() {
 		
 		if [ -z "$SOURCE_CANDIDATE" ]; then
 			download_video_ret_source="$VIDEO_URL"
+		else
+			download_video_ret_source="$SOURCE_CANDIDATE"
 		fi
 		
 		# Calculate the sha256 hash
@@ -1514,6 +1518,8 @@ download_images() {
 		
 		if [ -z "$SOURCE_CANDIDATE" ]; then
 			download_images_ret_source="$PROCESSED_URL"
+		else
+			download_images_ret_source="$SOURCE_CANDIDATE"
 		fi
 		download_images_ret_success=0
 	fi
@@ -1685,10 +1691,15 @@ check_media_history() {
 	local DISABLE_HASH_CHECK="$3"
 	
 	local FILE_NAME=$(get_media_filename "$MEDIA_FILE")
-	if check_history "$FILE_NAME" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
-		# Found in history - return filename
-		echo "$FILE_NAME"
-		return 1  # Found in history - should exit
+	
+	# Check if filename is a simple 1-2 digit number (with optional extension)
+	# If so, skip filename check and rely only on hash check later
+	if [[ ! "$FILE_NAME" =~ ^[0-9]{1,2}(\.[a-zA-Z0-9]+)?$ ]]; then
+		if check_history "$FILE_NAME" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
+			# Found in history - return filename
+			echo "$FILE_NAME"
+			return 1  # Found in history - should exit
+		fi
 	fi
 	
 	# Not in history - return normalized URL (empty if local file)
@@ -2135,14 +2146,30 @@ process_media_items() {
 			local GALLERY_DL_PARAMS_STR_LOCAL
 			GALLERY_DL_PARAMS_STR_LOCAL=$(serialize_array "${GALLERY_DL_PARAMS[@]}")
 		
-			# Try video download first for any URL
+			# Try video download first for any URL, unless it looks like a photo URL
 			# Initialize return variables (these are global return variables, not local)
 			download_video_ret_files=()
 			download_video_ret_captions=()
 			download_video_ret_source=""
 			download_video_ret_success=1
-		
-			download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
+			
+			local SKIP_VIDEO_DOWNLOAD=0
+			# Check for explicit photo URLs
+			# Twitter/X: .../photo/1
+			# Facebook: .../photos/..., photo.php, .../photo/...
+			# Reddit: i.redd.it (direct images)
+			# Common image extensions (jpg, png, etc)
+			if [[ "$MEDIA_ITEM" =~ ^https?://(www\.)?(x\.com|twitter\.com)/.*/photo/[0-9]+ ]] || \
+			   [[ "$MEDIA_ITEM" =~ facebook\.com/.*(photos/|photo\.php|photo/) ]] || \
+			   [[ "$MEDIA_ITEM" =~ ^https?://i\.redd\.it/ ]] || \
+			   [[ "$MEDIA_ITEM" =~ \.(jpg|jpeg|png|webp|gif)$ ]]; then
+				echo "URL looks like a photo, skipping video download attempt"
+				SKIP_VIDEO_DOWNLOAD=1
+			fi
+			
+			if [ $SKIP_VIDEO_DOWNLOAD -eq 0 ]; then
+				download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
+			fi
 			local VIDEO_DOWNLOAD_RESULT="${download_video_ret_success:-1}"
 		
 			# If video download succeeded, use its return values
@@ -2239,9 +2266,19 @@ process_media_items() {
 				die "File does not exist: $MEDIA_ITEM"
 			fi
 			PROCESSED_FILES+=("$MEDIA_ITEM")
-			FILE_CAPTIONS+=("")
+			
+			# Use description candidate for local files
+			local file_caption=$(build_caption "$DESCRIPTION_CANDIDATE" "" "$APPEND_ORIGINAL_COMMENT")
+			FILE_CAPTIONS+=("$file_caption")
+			
 			FILE_GALLERIES+=("$GALLERY_ID")
 			((GALLERY_ID++))
+			
+			# Add source if provided
+			if [ -n "$SOURCE_CANDIDATE" ]; then
+				local cleaned_source=$(cleanup_source_url "$SOURCE_CANDIDATE")
+				FILE_SOURCES+=("$cleaned_source")
+			fi
 			echo "Using local file: $MEDIA_ITEM"
 		fi
 	done
@@ -2549,6 +2586,11 @@ main() {
 	
 	# Update POW_DIFF if it was changed via command line (parse_command_line reads from exported variable first)
 	POW_DIFF="$POW_DIFF_PARAM"
+	
+	# If not sending to relay (e.g. testing), disable hash check so we don't stop if already exists
+	if [ "$SEND_TO_RELAY" -eq 0 ]; then
+		DISABLE_HASH_CHECK=1
+	fi
 	
 	# ========================================================================
 	# CHECK MEDIA HISTORY
