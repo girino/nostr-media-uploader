@@ -1140,6 +1140,37 @@ download_video() {
 			die "File hash already processed: $DOWNLOADED_FILE_HASH"
 		fi
 		
+		# Check if the downloaded file is actually an image (yt-dlp sometimes downloads images as video.mp4)
+		local MIME_TYPE=$(file --mime-type -b "$OUT_FILE_INT")
+		if [[ "$MIME_TYPE" == image/* ]]; then
+			echo "Detected downloaded file as image (MIME: $MIME_TYPE), skipping video conversion"
+			
+			# Determine extension based on mime type
+			local EXT="jpg"
+			if [[ "$MIME_TYPE" == "image/png" ]]; then
+				EXT="png"
+			elif [[ "$MIME_TYPE" == "image/gif" ]]; then
+				EXT="gif"
+			elif [[ "$MIME_TYPE" == "image/webp" ]]; then
+				EXT="webp"
+			fi
+			
+			# Rename the file
+			local NEW_OUT_FILE="${VIDEO_TMPDIR}/image.${EXT}"
+			mv "$OUT_FILE_INT" "$NEW_OUT_FILE"
+			
+			# Update return variables
+			download_video_ret_files+=("$NEW_OUT_FILE")
+			download_video_ret_captions+=("$file_caption")
+			download_video_ret_success=0
+			
+			# Add to cleanup
+			add_to_cleanup "$NEW_OUT_FILE"
+			
+			echo "Downloaded as image: '$NEW_OUT_FILE'"
+			return 0
+		fi
+		
 		# Detect and convert video codec if needed
 		local VIDEO_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$WINFILE_INT" 2>/dev/null)
 		VIDEO_CODEC=$(echo "$VIDEO_CODEC" | tr -d '\r')
