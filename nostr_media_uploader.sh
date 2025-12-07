@@ -534,6 +534,7 @@ wait_for_metadata_file() {
 #   $3: FILE_GALLERIES_STR - array of gallery IDs passed as string to eval
 #   $4: FILE_SOURCES_STR - array of source URLs passed as string to eval
 #   $5: DISPLAY_SOURCE - 1 to display sources, 0 otherwise
+#   $6: DESCRIPTION - global description to append at the end
 # Returns: event content via stdout
 # Note: Interleaves URLs and captions, handles galleries, adds sources at bottom
 build_event_content() {
@@ -542,6 +543,7 @@ build_event_content() {
 	local FILE_GALLERIES_STR="$3"
 	local FILE_SOURCES_STR="$4"
 	local DISPLAY_SOURCE="$5"
+	local DESCRIPTION="$6"
 	
 	local UPLOAD_URLS=()
 	local FILE_CAPTIONS=()
@@ -665,6 +667,15 @@ build_event_content() {
 			
 			((idx++))
 		done
+	fi
+	
+	# Add global description at the bottom
+	if [ -n "$DESCRIPTION" ]; then
+		if [ -n "$CONTENT" ]; then
+			# One empty line before description (two newlines = one empty line)
+			CONTENT="${CONTENT}"$'\n\n'
+		fi
+		CONTENT="${CONTENT}${DESCRIPTION}"
 	fi
 	
 	# Add sources at the bottom (if any and if display_source is enabled)
@@ -2168,7 +2179,8 @@ process_media_items() {
 			fi
 			
 			if [ $SKIP_VIDEO_DOWNLOAD -eq 0 ]; then
-				download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE"
+				# Pass empty string for description to prevent per-file replication
+				download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "" "$SOURCE_CANDIDATE"
 			fi
 			local VIDEO_DOWNLOAD_RESULT="${download_video_ret_success:-1}"
 		
@@ -2212,7 +2224,8 @@ process_media_items() {
 					download_images_ret_temp_dir=""
 			
 					# Call download_images function (Facebook URL handling is done inside)
-					download_images "$MEDIA_ITEM" "$GALLERY_DL_PARAMS_STR_LOCAL" "$APPEND_ORIGINAL_COMMENT" "$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE" "$MAX_FILE_SEARCH"
+					# Pass empty string for description to prevent per-file replication
+					download_images "$MEDIA_ITEM" "$GALLERY_DL_PARAMS_STR_LOCAL" "$APPEND_ORIGINAL_COMMENT" "" "$SOURCE_CANDIDATE" "$MAX_FILE_SEARCH"
 					local IMAGE_DOWNLOAD_RESULT="${download_images_ret_success:-1}"
 				
 					# Add temp directory to cleanup list if returned
@@ -2267,8 +2280,8 @@ process_media_items() {
 			fi
 			PROCESSED_FILES+=("$MEDIA_ITEM")
 			
-			# Use description candidate for local files
-			local file_caption=$(build_caption "$DESCRIPTION_CANDIDATE" "" "$APPEND_ORIGINAL_COMMENT")
+			# Use empty string for description for local files
+			local file_caption=$(build_caption "" "" "$APPEND_ORIGINAL_COMMENT")
 			FILE_CAPTIONS+=("$file_caption")
 			
 			FILE_GALLERIES+=("$GALLERY_ID")
@@ -2306,6 +2319,7 @@ process_media_items() {
 #   $8: POW_DIFF - proof of work difficulty
 #   $9: DISPLAY_SOURCE - 1 to display, 0 otherwise
 #   $10: SEND_TO_RELAY - 1 to send, 0 otherwise
+#   $11: DESCRIPTION - global description to append at the end
 # Returns: Exit code (0=success, dies on failure)
 upload_and_publish_event() {
 	local PROCESSED_FILES_STR="$1"
@@ -2318,6 +2332,7 @@ upload_and_publish_event() {
 	local POW_DIFF="$8"
 	local DISPLAY_SOURCE="$9"
 	local SEND_TO_RELAY="${10}"
+	local DESCRIPTION="${11}"
 	
 	# Deserialize arrays
 	local PROCESSED_FILES=()
@@ -2399,8 +2414,8 @@ fi
 		FILE_CAPTIONS_STR_LOCAL=$(serialize_array "${FILE_CAPTIONS[@]}")
 		FILE_GALLERIES_STR_LOCAL=$(serialize_array "${FILE_GALLERIES[@]}")
 		FILE_SOURCES_STR_LOCAL=$(serialize_array "${FILE_SOURCES[@]}")
-		CONTENT=$(build_event_content "$UPLOAD_URLS_STR" "$FILE_CAPTIONS_STR_LOCAL" "$FILE_GALLERIES_STR_LOCAL" "$FILE_SOURCES_STR_LOCAL" "$DISPLAY_SOURCE")
-
+		CONTENT=$(build_event_content "$UPLOAD_URLS_STR" "$FILE_CAPTIONS_STR_LOCAL" "$FILE_GALLERIES_STR_LOCAL" "$FILE_SOURCES_STR_LOCAL" "$DISPLAY_SOURCE" "$DESCRIPTION")
+	
 	# Print content for debugging before creating event
 	echo "=== Event Content (Debug) ==="
 	echo "$CONTENT"
@@ -2643,7 +2658,7 @@ main() {
 	# ========================================================================
 	upload_and_publish_event "$PROCESSED_FILES_STR" "$FILE_CAPTIONS_STR" "$FILE_SOURCES_STR" \
 		"$FILE_GALLERIES_STR" "$BLOSSOMS_LIST_STR" "$RELAYS_LIST" "$KEY_DECRYPTED" \
-		"$POW_DIFF" "$DISPLAY_SOURCE" "$SEND_TO_RELAY"
+		"$POW_DIFF" "$DISPLAY_SOURCE" "$SEND_TO_RELAY" "$DESCRIPTION_CANDIDATE"
 	
 	# ========================================================================
 	# UPDATE HISTORY FILE
