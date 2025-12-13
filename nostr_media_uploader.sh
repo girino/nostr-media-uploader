@@ -2022,6 +2022,12 @@ while (( "$#" )); do
 			exit 1
 		fi
 		shift  # shift to remove the value from the params
+	elif [[ "$PARAM" =~ ^- ]]; then
+		# Unrecognized option starting with - or --
+		local SCRIPT_NAME_ERR=$(basename "$0")
+		echo "Error: Unrecognized option: $PARAM" >&2
+		echo "Use --help to see available options." >&2
+		exit 1
 	else
 		# stop processing params if it's not a file or url
 		# do not shift to keep the description and source

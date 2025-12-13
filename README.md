@@ -298,6 +298,86 @@ This project is licensed under **Girino's Anarchist License (GAL)**. See [LICENS
 - **yt-dlp**: https://github.com/yt-dlp/yt-dlp
 - **nak**: https://github.com/fiatjaf/nak
 
+## Telegram Bot
+
+The repository includes a Telegram bot (`telegram_bot.py`) that can automatically process links posted in a Telegram channel or group and upload them using `nostr_media_uploader.sh`.
+
+### Setup
+
+1. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Create a Telegram bot**:
+   - Talk to [@BotFather](https://t.me/BotFather) on Telegram
+   - Use `/newbot` command to create a new bot
+   - Save the bot token you receive
+
+3. **Get your Telegram User ID**:
+   - Talk to [@userinfobot](https://t.me/userinfobot) to get your user ID
+
+4. **Get Chat ID** (for channel/group):
+   - For channels: Use [@getidsbot](https://t.me/getidsbot) or add the bot to your channel and use [@RawDataBot](https://t.me/RawDataBot)
+   - For groups: Add the bot to the group and check the chat ID
+   - You can also use channel username format (e.g., `@channelname`)
+
+5. **Configure the bot**:
+   ```bash
+   cp telegram_bot.conf.example telegram_bot.conf
+   # Edit telegram_bot.conf with your settings:
+   # - bot_token: Your bot token from BotFather
+   # - owner_id: Your Telegram user ID
+   # - chat_id: Channel/group ID or @channelname
+   # - profile_name: Profile name to use (e.g., "tarado")
+   # - script_path: Path to nostr_media_uploader.sh (default: ./nostr_media_uploader.sh)
+   ```
+
+6. **Run the bot**:
+   ```bash
+   # Option 1: Use the convenience script (recommended)
+   ./run_telegram_bot.sh
+   
+   # Option 2: Manual setup
+   python3 -m venv venv
+   source venv/bin/activate  # On Cygwin/Windows: source venv/Scripts/activate
+   pip install -r requirements.txt
+   python3 telegram_bot.py
+   ```
+
+### Usage
+
+Once running, the bot will:
+- Monitor the specified channel/group
+- Process messages only from the owner (identified by `owner_id`)
+- Extract URLs from messages
+- Extract any additional text after URLs
+- Execute: `./nostr_media_uploader.sh -p <profile_name> <url1> <url2> ... "<extra_text>"`
+- Send status updates back to Telegram
+
+**Example**:
+- You post: `https://instagram.com/p/ABC123 hello world`
+- Bot executes: `./nostr_media_uploader.sh -p tarado "https://instagram.com/p/ABC123" "hello world"`
+
+### Configuration
+
+The bot configuration file (`telegram_bot.conf`) uses INI format:
+
+```ini
+[telegram]
+bot_token = YOUR_BOT_TOKEN
+owner_id = YOUR_TELEGRAM_USER_ID
+chat_id = YOUR_CHAT_ID
+profile_name = tarado
+script_path = ./nostr_media_uploader.sh
+```
+
+You can also set the config file path via environment variable:
+```bash
+export TELEGRAM_BOT_CONFIG=/path/to/telegram_bot.conf
+python3 telegram_bot.py
+```
+
 ## Support
 
 This project does not provide support or accept feature requests. If you encounter issues, please adapt the code yourself or refer to the documentation for troubleshooting guidance.

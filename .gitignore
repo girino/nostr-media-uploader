@@ -1,3 +1,7 @@
 # Reports and temporary scripts folder
 reports/
 *.history
+
+# Telegram bot configuration (contains secrets)
+telegram_bot.conf
+
