@@ -65,6 +65,14 @@ NSEC_KEY="nsec1..."
 # Default: 0 (can also use --firefox flag on command line)
 # USE_COOKIES_FF=0
 
+# Disable sending events to relays (useful for testing)
+# Default: 1 (send to relays)
+# Set SEND_TO_RELAY=0, NO_RELAY=1, or DISABLE_RELAY=1 to disable
+# Command-line --norelay flag takes precedence over these settings
+# SEND_TO_RELAY=1
+# NO_RELAY=0
+# DISABLE_RELAY=0
+
 # =============================================================================
 # EXAMPLES
 # =============================================================================

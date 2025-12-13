@@ -2624,7 +2624,16 @@ main() {
 	# ========================================================================
 	local ALL_MEDIA_FILES_STR="$PARSED_MEDIA_FILES"
 	local CONVERT_VIDEO="$PARSED_CONVERT_VIDEO"
-	local SEND_TO_RELAY="$PARSED_SEND_TO_RELAY"
+	# SEND_TO_RELAY: Command-line --norelay takes precedence, otherwise use environment variable (from profile)
+	# If profile sets SEND_TO_RELAY=0 or NO_RELAY=1, use that unless command-line overrode it
+	local SEND_TO_RELAY
+	if [ "$PARSED_SEND_TO_RELAY" -eq 0 ]; then
+		# Command-line --norelay was used, respect it
+		SEND_TO_RELAY=0
+	else
+		# Use environment variable if set (from profile), otherwise use parsed value (defaults to 1)
+		SEND_TO_RELAY="${SEND_TO_RELAY:-$PARSED_SEND_TO_RELAY}"
+	fi
 	local DISABLE_HASH_CHECK="$PARSED_DISABLE_HASH_CHECK"
 	local MAX_FILE_SEARCH="$PARSED_MAX_FILE_SEARCH"
 	local POW_DIFF_PARAM="$PARSED_POW_DIFF"
@@ -2761,11 +2770,22 @@ if [[ -f "$ENV_FILE" ]]; then
 	source "$ENV_FILE"
 fi
 
+# Support NO_RELAY environment variable as an alternative to SEND_TO_RELAY=0
+if [[ "${NO_RELAY:-0}" == "1" ]] || [[ "${NO_RELAY:-0}" == "true" ]] || [[ "${NO_RELAY:-0}" == "yes" ]]; then
+	SEND_TO_RELAY=0
+fi
+
+# Support DISABLE_RELAY environment variable as an alternative to SEND_TO_RELAY=0
+if [[ "${DISABLE_RELAY:-0}" == "1" ]] || [[ "${DISABLE_RELAY:-0}" == "true" ]] || [[ "${DISABLE_RELAY:-0}" == "yes" ]]; then
+	SEND_TO_RELAY=0
+fi
+
 # Export variables for main() to read
 export DISPLAY_SOURCE
 export POW_DIFF
 export APPEND_ORIGINAL_COMMENT
 export USE_COOKIES_FF
+export SEND_TO_RELAY
 export NSEC_KEY
 export NCRYPT_KEY
 export KEY

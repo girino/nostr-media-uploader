@@ -628,6 +628,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_owner:
             logger.info(f"Message from non-owner user {message.from_user.id}, ignoring")
             return
+        
+        # Check for /reload command in direct messages (private chats)
+        if message.chat.type == 'private':
+            text = message.text or message.caption or ""
+            if text.strip().startswith('/reload'):
+                # Reload configuration
+                config_path = context.bot_data.get('config_path', CONFIG_FILE)
+                use_firefox = context.bot_data.get('use_firefox', True)
+                
+                try:
+                    logger.info(f"Reloading configuration from {config_path}")
+                    new_config = load_config(config_path, use_firefox=use_firefox)
+                    
+                    # Validate new config
+                    if not new_config.get('bot_token'):
+                        await message.reply_text("❌ Error: bot_token is missing in reloaded configuration")
+                        return
+                    
+                    if new_config['owner_id'] == 0:
+                        await message.reply_text("❌ Error: owner_id is missing in reloaded configuration")
+                        return
+                    
+                    # Update bot_data with new config
+                    context.bot_data['config'] = new_config
+                    
+                    # Count channels
+                    channels_count = len(new_config.get('channels', {}))
+                    
+                    await message.reply_text(
+                        f"✅ Configuration reloaded successfully!\n\n"
+                        f"Channels: {channels_count}\n"
+                        f"Script path: {new_config['script_path']}\n"
+                        f"Use Firefox: {new_config.get('use_firefox', True)}"
+                    )
+                    logger.info(f"Configuration reloaded successfully. Channels: {channels_count}")
+                except Exception as e:
+                    error_msg = f"❌ Failed to reload configuration: {str(e)}"
+                    logger.exception(f"Error reloading configuration: {e}")
+                    await message.reply_text(error_msg)
+                return
         # For regular messages, try to find channel config based on chat
         chat_id = message.chat.id if message.chat.id else None
         chat_username = message.chat.username if message.chat.username else None
@@ -829,8 +869,10 @@ def main() -> None:
     # Create application
     application = Application.builder().token(config['bot_token']).build()
     
-    # Store config in bot_data for access in handlers
+    # Store config and config path in bot_data for access in handlers
     application.bot_data['config'] = config
+    application.bot_data['config_path'] = args.config
+    application.bot_data['use_firefox'] = use_firefox
     
     # Add message handler
     # With multi-channel support, we listen to all chats and filter in the handler
