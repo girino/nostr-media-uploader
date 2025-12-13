@@ -1780,6 +1780,8 @@ usage() {
 	echo
 	echo "Options:"
 	echo "  -h, --help        Show this help message and exit"
+	echo "  -p, --profile     Override config and history file names with specified profile"
+	echo "                    If not specified, uses script filename to determine profile name"
 	echo
 	echo "Arguments:"
 	echo "  file|url          One or more paths to image or video files, or URLs to download videos"
@@ -1793,16 +1795,15 @@ usage() {
 	echo
 }
 
-# Function to get script name and history file path
-# Parameters: None
+# Function to get history file path
+# Parameters:
+#   $1: PROFILE_NAME - profile name to use for history file
 # Return variables:
-#   get_script_metadata_ret_script_name - script name
 #   get_script_metadata_ret_history_file - history file path
 get_script_metadata() {
-	local SCRIPT_NAME=$(basename "$0")
-	local HISTORY_FILE="${SCRIPT_DIR}/${SCRIPT_NAME%.*}.history"
+	local PROFILE_PARAM="$1"
+	local HISTORY_FILE="${SCRIPT_DIR}/${PROFILE_PARAM}.history"
 	
-	get_script_metadata_ret_script_name="$SCRIPT_NAME"
 	get_script_metadata_ret_history_file="$HISTORY_FILE"
 }
 
@@ -1929,6 +1930,8 @@ prepare_gallery_dl_params() {
 #   parse_command_line_ret_password - password value
 #   parse_command_line_ret_description_candidate - description text
 #   parse_command_line_ret_source_candidate - source text
+#   parse_command_line_ret_profile_name - profile name if -p option was used
+# Side effects: Also exports PROFILE_NAME as a global variable for early use
 parse_command_line() {
 	# Initialize default values from exported variables (if available)
 	local CONVERT_VIDEO="${CONVERT_VIDEO:-1}"
@@ -1940,6 +1943,7 @@ parse_command_line() {
 	local USE_COOKIES_FF="${USE_COOKIES_FF:-0}"
 	local DISPLAY_SOURCE="${DISPLAY_SOURCE:-0}"
 	local PASSWORD="${PASSWORD:-}"
+	local PROFILE_NAME="${PROFILE_NAME:-}"
 	
 	local ALL_MEDIA_FILES=()
 	local DESCRIPTION_CANDIDATE=""
@@ -2004,13 +2008,20 @@ while (( "$#" )); do
 			exit 1
 		fi
 		shift  # shift to remove the password from the params
-		elif [[ "$PARAM" == "--max-file-search" || "$PARAM" == "-max-file-search" ]]; then
-			MAX_FILE_SEARCH="$2"
-			if [ -z "$MAX_FILE_SEARCH" ] || ! [[ "$MAX_FILE_SEARCH" =~ ^[0-9]+$ ]]; then
-				echo "Invalid value for --max-file-search: $MAX_FILE_SEARCH (must be a number)"
-				exit 1
-			fi
-			shift  # shift to remove the value from the params
+	elif [[ "$PARAM" == "--profile" || "$PARAM" == "-p" ]]; then
+		PROFILE_NAME="$2"
+		if [ -z "$PROFILE_NAME" ]; then
+			echo "Profile name is required after -p/--profile option"
+			exit 1
+		fi
+		shift  # shift to remove the profile name from the params
+	elif [[ "$PARAM" == "--max-file-search" || "$PARAM" == "-max-file-search" ]]; then
+		MAX_FILE_SEARCH="$2"
+		if [ -z "$MAX_FILE_SEARCH" ] || ! [[ "$MAX_FILE_SEARCH" =~ ^[0-9]+$ ]]; then
+			echo "Invalid value for --max-file-search: $MAX_FILE_SEARCH (must be a number)"
+			exit 1
+		fi
+		shift  # shift to remove the value from the params
 	else
 		# stop processing params if it's not a file or url
 		# do not shift to keep the description and source
@@ -2056,6 +2067,10 @@ fi
 	parse_command_line_ret_password="$PASSWORD"
 	parse_command_line_ret_description_candidate="$DESCRIPTION_CANDIDATE"
 	parse_command_line_ret_source_candidate="$SOURCE_CANDIDATE"
+	parse_command_line_ret_profile_name="$PROFILE_NAME"
+	
+	# Export PROFILE_NAME as a side effect for early use (before ENV loading)
+	export PROFILE_NAME
 }
 
 # Function to check all media files against history
@@ -2575,10 +2590,8 @@ main() {
 	# ========================================================================
 	# SCRIPT METADATA
 	# ========================================================================
-	local SCRIPT_NAME
 	local HISTORY_FILE
-	get_script_metadata
-	SCRIPT_NAME="$get_script_metadata_ret_script_name"
+	get_script_metadata "$PROFILE_NAME"
 	HISTORY_FILE="$get_script_metadata_ret_history_file"
 	
 	# ========================================================================
@@ -2601,37 +2614,27 @@ main() {
 	BLOSSOMS_LIST_STR="$process_relays_and_blossoms_ret_blossoms_list"
 	
 	# ========================================================================
-	# PARSE COMMAND-LINE ARGUMENTS
+	# USE PARSED COMMAND-LINE ARGUMENTS (parsed early before ENV loading)
 	# ========================================================================
-	parse_command_line "$@"
-	local ALL_MEDIA_FILES_STR
-	local CONVERT_VIDEO
-	local SEND_TO_RELAY
-	local DISABLE_HASH_CHECK
-	local MAX_FILE_SEARCH
-	local POW_DIFF_PARAM
-	local APPEND_ORIGINAL_COMMENT_PARAM
-	local USE_COOKIES_FF_PARAM
-	local DISPLAY_SOURCE_PARAM
-	local PASSWORD_PARAM
-	local DESCRIPTION_CANDIDATE
-	local SOURCE_CANDIDATE
+	local ALL_MEDIA_FILES_STR="$PARSED_MEDIA_FILES"
+	local CONVERT_VIDEO="$PARSED_CONVERT_VIDEO"
+	local SEND_TO_RELAY="$PARSED_SEND_TO_RELAY"
+	local DISABLE_HASH_CHECK="$PARSED_DISABLE_HASH_CHECK"
+	local MAX_FILE_SEARCH="$PARSED_MAX_FILE_SEARCH"
+	local POW_DIFF_PARAM="$PARSED_POW_DIFF"
+	local APPEND_ORIGINAL_COMMENT_PARAM="$PARSED_APPEND_ORIGINAL_COMMENT"
+	local USE_COOKIES_FF_PARAM="$PARSED_USE_COOKIES_FF"
+	local DISPLAY_SOURCE_PARAM="$PARSED_DISPLAY_SOURCE"
+	local PASSWORD_PARAM="$PARSED_PASSWORD"
+	local DESCRIPTION_CANDIDATE="$PARSED_DESCRIPTION_CANDIDATE"
+	local SOURCE_CANDIDATE="$PARSED_SOURCE_CANDIDATE"
 	
-	ALL_MEDIA_FILES_STR="$parse_command_line_ret_media_files"
-	CONVERT_VIDEO="$parse_command_line_ret_convert_video"
-	SEND_TO_RELAY="$parse_command_line_ret_send_to_relay"
-	DISABLE_HASH_CHECK="$parse_command_line_ret_disable_hash_check"
-	MAX_FILE_SEARCH="$parse_command_line_ret_max_file_search"
-	POW_DIFF_PARAM="$parse_command_line_ret_pow_diff"
-	APPEND_ORIGINAL_COMMENT="$parse_command_line_ret_append_original_comment"
-	USE_COOKIES_FF="$parse_command_line_ret_use_cookies_ff"
-	DISPLAY_SOURCE="$parse_command_line_ret_display_source"
-	PASSWORD="$parse_command_line_ret_password"
-	DESCRIPTION_CANDIDATE="$parse_command_line_ret_description_candidate"
-	SOURCE_CANDIDATE="$parse_command_line_ret_source_candidate"
-	
-	# Update POW_DIFF if it was changed via command line (parse_command_line reads from exported variable first)
+	# Update POW_DIFF if it was changed via command line
 	POW_DIFF="$POW_DIFF_PARAM"
+	APPEND_ORIGINAL_COMMENT="$APPEND_ORIGINAL_COMMENT_PARAM"
+	USE_COOKIES_FF="$USE_COOKIES_FF_PARAM"
+	DISPLAY_SOURCE="$DISPLAY_SOURCE_PARAM"
+	PASSWORD="$PASSWORD_PARAM"
 	
 	# If not sending to relay (e.g. testing), disable hash check so we don't stop if already exists
 	if [ "$SEND_TO_RELAY" -eq 0 ]; then
@@ -2718,10 +2721,35 @@ if [ $# -eq 0 ]; then
 	exit 1
 fi
 
-# Load environment variables from ~/.nostr/${SCRIPT_NAME%.*} if it exists
-# Variables can also be provided via environment variables or command-line parameters
+# Set PROFILE_NAME to script name (without extension) by default
+# It will be overridden if -p/--profile option is provided
 SCRIPT_NAME=$(basename "$0")
-ENV_FILE="$HOME/.nostr/${SCRIPT_NAME%.*}"
+PROFILE_NAME="${SCRIPT_NAME%.*}"
+
+# Parse command-line arguments early to extract PROFILE_NAME before loading ENV
+# Store all parsed results for use in main()
+parse_command_line "$@"
+PARSED_PROFILE_NAME="$parse_command_line_ret_profile_name"
+PARSED_MEDIA_FILES="$parse_command_line_ret_media_files"
+PARSED_CONVERT_VIDEO="$parse_command_line_ret_convert_video"
+PARSED_SEND_TO_RELAY="$parse_command_line_ret_send_to_relay"
+PARSED_DISABLE_HASH_CHECK="$parse_command_line_ret_disable_hash_check"
+PARSED_MAX_FILE_SEARCH="$parse_command_line_ret_max_file_search"
+PARSED_POW_DIFF="$parse_command_line_ret_pow_diff"
+PARSED_APPEND_ORIGINAL_COMMENT="$parse_command_line_ret_append_original_comment"
+PARSED_USE_COOKIES_FF="$parse_command_line_ret_use_cookies_ff"
+PARSED_DISPLAY_SOURCE="$parse_command_line_ret_display_source"
+PARSED_PASSWORD="$parse_command_line_ret_password"
+PARSED_DESCRIPTION_CANDIDATE="$parse_command_line_ret_description_candidate"
+PARSED_SOURCE_CANDIDATE="$parse_command_line_ret_source_candidate"
+
+# Use extracted PROFILE_NAME to load config
+if [ -n "$PARSED_PROFILE_NAME" ]; then
+	PROFILE_NAME="$PARSED_PROFILE_NAME"
+fi
+
+# Load environment variables from ~/.nostr/${PROFILE_NAME}
+ENV_FILE="$HOME/.nostr/${PROFILE_NAME}"
 if [[ -f "$ENV_FILE" ]]; then
 	# shellcheck source=/dev/null
 	source "$ENV_FILE"
@@ -2738,7 +2766,22 @@ export KEY
 export PASSWORD
 export EXTRA_RELAYS
 export EXTRA_BLOSSOMS
+export PROFILE_NAME
 
-# Call main function
-main "$@"
+# Export parsed command-line results for main() to use
+export PARSED_MEDIA_FILES
+export PARSED_CONVERT_VIDEO
+export PARSED_SEND_TO_RELAY
+export PARSED_DISABLE_HASH_CHECK
+export PARSED_MAX_FILE_SEARCH
+export PARSED_POW_DIFF
+export PARSED_APPEND_ORIGINAL_COMMENT
+export PARSED_USE_COOKIES_FF
+export PARSED_DISPLAY_SOURCE
+export PARSED_PASSWORD
+export PARSED_DESCRIPTION_CANDIDATE
+export PARSED_SOURCE_CANDIDATE
+
+# Call main function (no arguments needed, already parsed)
+main
 
