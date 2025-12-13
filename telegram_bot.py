@@ -11,6 +11,7 @@ import asyncio
 import logging
 import yaml
 import argparse
+import tempfile
 from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -491,6 +492,61 @@ def convert_path_for_cygwin(path, config=None):
     return path
 
 
+async def download_media_file(bot, file, file_extension=None):
+    """Download a media file from Telegram and save it to a temporary file.
+    
+    Args:
+        bot: The bot instance to use for downloading
+        file: The file object from Telegram (PhotoSize, Video, etc.)
+        file_extension: Optional file extension (e.g., 'jpg', 'mp4'). If not provided, will try to detect.
+    
+    Returns:
+        Path to the temporary file, or None if download failed
+    """
+    try:
+        # Get the file object
+        if hasattr(file, 'file_id'):
+            file_obj = await bot.get_file(file.file_id)
+        else:
+            # If it's already a File object
+            file_obj = file
+        
+        # Determine file extension if not provided
+        if not file_extension:
+            if hasattr(file, 'mime_type') and file.mime_type:
+                # Extract extension from mime type
+                mime_to_ext = {
+                    'image/jpeg': 'jpg',
+                    'image/png': 'png',
+                    'image/gif': 'gif',
+                    'image/webp': 'webp',
+                    'video/mp4': 'mp4',
+                    'video/quicktime': 'mov',
+                    'video/x-msvideo': 'avi',
+                }
+                file_extension = mime_to_ext.get(file.mime_type, 'bin')
+            else:
+                # Default based on file path if available
+                if hasattr(file_obj, 'file_path') and file_obj.file_path:
+                    file_extension = Path(file_obj.file_path).suffix.lstrip('.') or 'bin'
+                else:
+                    file_extension = 'bin'
+        
+        # Create temporary file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_extension}')
+        temp_path = temp_file.name
+        temp_file.close()
+        
+        # Download the file
+        await file_obj.download_to_drive(temp_path)
+        
+        logger.info(f"Downloaded media file to: {temp_path}")
+        return temp_path
+    except Exception as e:
+        logger.exception(f"Error downloading media file: {e}")
+        return None
+
+
 def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, config=None):
     """Build the command to execute nostr_media_uploader.sh."""
     # Convert script path to absolute path
@@ -522,8 +578,14 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
         cmd.append('--firefox')
         logger.info("Adding --firefox parameter")
     
-    # Add all URLs as separate arguments
-    cmd.extend(urls)
+    # Add all URLs or file paths as separate arguments
+    # Convert file paths to Cygwin paths if needed
+    for item in urls:
+        # Check if it's a file path (not a URL)
+        if not item.startswith(('http://', 'https://')):
+            # It's a file path, convert to Cygwin path if needed
+            item = convert_path_for_cygwin(item, config)
+        cmd.append(item)
     
     # Add extra text if present
     if extra_text:
@@ -708,6 +770,181 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Extract text from message
     text = message.text or message.caption or ""
     
+    # Check for direct media uploads (photos or videos)
+    media_files = []
+    if message.photo:
+        # Get the largest photo
+        largest_photo = max(message.photo, key=lambda p: p.file_size if p.file_size else 0)
+        logger.info(f"Received photo message, downloading...")
+        temp_file = await download_media_file(context.bot, largest_photo, 'jpg')
+        if temp_file:
+            media_files.append(temp_file)
+    elif message.video:
+        logger.info(f"Received video message, downloading...")
+        temp_file = await download_media_file(context.bot, message.video, 'mp4')
+        if temp_file:
+            media_files.append(temp_file)
+    elif message.document:
+        # Check if document is an image or video
+        if message.document.mime_type:
+            if message.document.mime_type.startswith('image/'):
+                # Extract extension from mime type or filename
+                ext = None
+                if message.document.file_name:
+                    ext = Path(message.document.file_name).suffix.lstrip('.')
+                if not ext:
+                    ext = message.document.mime_type.split('/')[-1]
+                logger.info(f"Received image document, downloading...")
+                temp_file = await download_media_file(context.bot, message.document, ext)
+                if temp_file:
+                    media_files.append(temp_file)
+            elif message.document.mime_type.startswith('video/'):
+                # Extract extension from mime type or filename
+                ext = None
+                if message.document.file_name:
+                    ext = Path(message.document.file_name).suffix.lstrip('.')
+                if not ext:
+                    ext = message.document.mime_type.split('/')[-1]
+                logger.info(f"Received video document, downloading...")
+                temp_file = await download_media_file(context.bot, message.document, ext)
+                if temp_file:
+                    media_files.append(temp_file)
+    
+    # If we have media files, process them
+    if media_files:
+        try:
+            # Send acknowledgment
+            status_msg = await message.reply_text(
+                f"Processing {len(media_files)} media file(s)..."
+            )
+            
+            # Build command with local files
+            cmd = build_command(
+                profile_name,
+                config['script_path'],
+                media_files,  # Pass file paths instead of URLs
+                text,  # Use full text as extra text (description)
+                config.get('use_firefox', True),
+                config
+            )
+            
+            # Execute script
+            result = await execute_script(cmd)
+            
+            # Clean up temporary files
+            for temp_file in media_files:
+                try:
+                    if os.path.exists(temp_file):
+                        os.unlink(temp_file)
+                        logger.debug(f"Cleaned up temporary file: {temp_file}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary file {temp_file}: {e}")
+            
+            # Format response (same as URL processing)
+            if result['success']:
+                # Log stdout/stderr for debugging
+                logger.info(f"Script execution successful. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
+                if result['stdout']:
+                    logger.debug(f"Full stdout: {result['stdout']}")
+                if result['stderr']:
+                    logger.debug(f"Full stderr: {result['stderr']}")
+                
+                # Try to extract event ID and convert to nevent
+                event_id = None
+                nevent = None
+                
+                # Try stdout first
+                if result['stdout']:
+                    event_id = extract_event_id(result['stdout'])
+                    if event_id:
+                        logger.info(f"Extracted event ID from stdout: {event_id}")
+                
+                # If not found in stdout, try stderr
+                if not event_id and result['stderr']:
+                    event_id = extract_event_id(result['stderr'])
+                    if event_id:
+                        logger.info(f"Extracted event ID from stderr: {event_id}")
+                
+                # Encode to nevent if we found an event ID
+                if event_id:
+                    nevent = await encode_to_nevent(event_id)
+                    logger.info(f"Encoded to nevent: {nevent}")
+                else:
+                    logger.warning(f"Could not extract event ID from stdout or stderr. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
+                    if result['stdout']:
+                        logger.warning(f"stdout content (first 500 chars): {result['stdout'][:500]}")
+                    if result['stderr']:
+                        logger.warning(f"stderr content (first 500 chars): {result['stderr'][:500]}")
+                
+                if nevent:
+                    # Format response with nostr client link if configured
+                    if config.get('nostr_client_url'):
+                        # Format the client URL with the nevent
+                        client_url_template = config['nostr_client_url']
+                        # Replace {nevent} placeholder if present, otherwise append nevent
+                        if '{nevent}' in client_url_template:
+                            client_url = client_url_template.format(nevent=nevent)
+                        else:
+                            # If no placeholder, append /e/nevent or just nevent depending on URL
+                            if client_url_template.endswith('/'):
+                                client_url = f"{client_url_template}e/{nevent}"
+                            else:
+                                client_url = f"{client_url_template}/e/{nevent}"
+                        
+                        # Create clickable link using Markdown format
+                        response_msg = f"✅ [View on Nostr]({client_url})\n\n`{nevent}`"
+                        await status_msg.edit_text(response_msg, parse_mode='Markdown')
+                        logger.info(f"Successfully processed media files, nevent: {nevent}, client_url: {client_url}")
+                    else:
+                        # Return only the nevent formatted ID if no client URL configured
+                        await status_msg.edit_text(nevent)
+                        logger.info(f"Successfully processed media files, nevent: {nevent}")
+                else:
+                    # Fallback if we couldn't extract/encode event ID
+                    logger.warning(f"Could not extract event ID from output for media files")
+                    success_msg = f"✅ Successfully processed {len(media_files)} media file(s)"
+                    if event_id:
+                        success_msg += f"\nEvent ID: {event_id} (could not encode to nevent)"
+                    await status_msg.edit_text(success_msg)
+            else:
+                # Combine stderr and stdout for error messages (bash scripts often use both)
+                error_parts = []
+                if result['stderr']:
+                    error_parts.append(f"Error:\n{result['stderr']}")
+                if result['stdout']:
+                    error_parts.append(f"Output:\n{result['stdout']}")
+                
+                error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
+                
+                # Telegram has a 4096 character limit per message, so limit to ~3500 to leave room for prefix
+                MAX_ERROR_LENGTH = 3500
+                if len(error_msg) > MAX_ERROR_LENGTH:
+                    # Truncate but keep the most important part (usually the end has the actual error)
+                    truncated_msg = error_msg[:MAX_ERROR_LENGTH]
+                    # Try to truncate at a newline if possible
+                    last_newline = truncated_msg.rfind('\n')
+                    if last_newline > MAX_ERROR_LENGTH * 0.8:  # If we can find a newline in the last 20%
+                        truncated_msg = truncated_msg[:last_newline]
+                    error_display = f"❌ Error processing media file(s)\n\n{truncated_msg}\n\n... (truncated, full error in logs)"
+                else:
+                    error_display = f"❌ Error processing media file(s)\n\n{error_msg}"
+                
+                await status_msg.edit_text(error_display)
+                logger.error(f"Error processing media files")
+                logger.error(f"stderr: {result['stderr']}")
+                logger.error(f"stdout: {result['stdout']}")
+        except Exception as e:
+            logger.exception(f"Exception while processing media files: {e}")
+            await message.reply_text(f"❌ Exception occurred: {str(e)}")
+            # Clean up temporary files on error
+            for temp_file in media_files:
+                try:
+                    if os.path.exists(temp_file):
+                        os.unlink(temp_file)
+                except Exception:
+                    pass
+        return
+    
     # Extract URLs
     urls = extract_urls(text)
     
@@ -877,7 +1114,8 @@ def main() -> None:
     # Add message handler
     # With multi-channel support, we listen to all chats and filter in the handler
     # based on channel configuration and owner_id
-    message_filter = filters.TEXT | filters.CAPTION
+    # Support text, captions, photos, videos, and documents
+    message_filter = filters.TEXT | filters.CAPTION | filters.PHOTO | filters.VIDEO | filters.Document.ALL
     
     application.add_handler(MessageHandler(message_filter, handle_message))
     
