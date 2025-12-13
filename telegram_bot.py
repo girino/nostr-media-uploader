@@ -5,10 +5,11 @@ Telegram bot that listens for links from the owner and calls nostr_media_uploade
 
 import os
 import re
+import sys
 import subprocess
 import asyncio
 import logging
-import configparser
+import yaml
 import argparse
 from pathlib import Path
 from telegram import Update
@@ -23,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-CONFIG_FILE = os.getenv('TELEGRAM_BOT_CONFIG', 'telegram_bot.conf')
+CONFIG_FILE = os.getenv('TELEGRAM_BOT_CONFIG', 'telegram_bot.yaml')
 
 # URL regex pattern to match http/https links
 URL_PATTERN = re.compile(
@@ -32,23 +33,79 @@ URL_PATTERN = re.compile(
 
 
 def load_config(config_path, use_firefox=True):
-    """Load configuration from file."""
-    config = configparser.ConfigParser()
+    """Load configuration from YAML file.
+    
+    Expected structure:
+    bot_token: YOUR_BOT_TOKEN
+    owner_id: YOUR_USER_ID
+    script_path: ./nostr_media_uploader.sh
+    channels:
+      channel1:
+        chat_id: -1001234567890
+        profile_name: tarado
+      channel2:
+        chat_id: @channelname
+        profile_name: another_profile
+    """
     if not os.path.exists(config_path):
         logger.error(f"Configuration file not found: {config_path}")
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
     
-    config.read(config_path)
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config_data = yaml.safe_load(f)
     
-    telegram_section = config['telegram']
+    if not config_data:
+        raise ValueError("Configuration file is empty or invalid")
+    
+    # Validate required global settings
+    if 'bot_token' not in config_data:
+        raise ValueError("bot_token is required in configuration")
+    if 'owner_id' not in config_data:
+        raise ValueError("owner_id is required in configuration")
+    
     return {
-        'bot_token': telegram_section.get('bot_token'),
-        'owner_id': int(telegram_section.get('owner_id', 0)),
-        'chat_id': telegram_section.get('chat_id'),
-        'profile_name': telegram_section.get('profile_name', 'tarado'),
-        'script_path': telegram_section.get('script_path', './nostr_media_uploader.sh'),
+        'bot_token': config_data.get('bot_token'),
+        'owner_id': int(config_data.get('owner_id', 0)),
+        'script_path': config_data.get('script_path', './nostr_media_uploader.sh'),
+        'cygwin_root': config_data.get('cygwin_root'),  # Optional: path to Cygwin installation
+        'nostr_client_url': config_data.get('nostr_client_url'),  # Optional: URL template for nostr client links
+        'channels': config_data.get('channels', {}),
         'use_firefox': use_firefox,
     }
+
+
+def find_channel_config(config, chat_id=None, chat_username=None):
+    """Find channel configuration matching the given chat_id or username.
+    
+    Returns the channel config dict if found, None otherwise.
+    """
+    channels = config.get('channels', {})
+    
+    if not chat_id and not chat_username:
+        return None
+    
+    chat_id_str = str(chat_id) if chat_id else None
+    chat_username_str = chat_username.lstrip('@') if chat_username else None
+    
+    # Search through channels for a match
+    for channel_name, channel_config in channels.items():
+        channel_chat_id = channel_config.get('chat_id')
+        if not channel_chat_id:
+            continue
+        
+        channel_chat_id_str = str(channel_chat_id).lstrip('@')
+        
+        # Match by numeric ID
+        if chat_id_str and chat_id_str == channel_chat_id_str:
+            logger.debug(f"Found channel config '{channel_name}' for chat_id={chat_id_str}")
+            return channel_config
+        
+        # Match by username
+        if chat_username_str and chat_username_str == channel_chat_id_str:
+            logger.debug(f"Found channel config '{channel_name}' for username={chat_username_str}")
+            return channel_config
+    
+    return None
 
 
 def extract_urls(text):
@@ -186,29 +243,255 @@ async def encode_to_nevent(event_id_hex):
     return None
 
 
-def convert_path_for_cygwin(path):
-    """Convert Windows path to Cygwin path if running on Cygwin."""
-    if not os.path.exists(path):
-        return path
-    
-    # Check if running on Cygwin
+def is_cygwin():
+    """Check if running on Cygwin."""
     try:
+        # Check for Cygwin-specific environment or commands
+        if os.path.exists('/usr/bin/cygpath') or os.path.exists('/cygdrive'):
+            return True
+        # Check OSTYPE environment variable
+        if os.environ.get('OSTYPE', '').startswith('cygwin'):
+            return True
+        # Try to run cygpath to verify
         result = subprocess.run(
-            ['cygpath', '-u', path],
+            ['cygpath', '-u', '/'],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=2
         )
         if result.returncode == 0:
-            return result.stdout.strip()
+            return True
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        # Not Cygwin or cygpath not available
         pass
+    
+    return False
+
+
+def find_cygwin_installation():
+    """Find Cygwin installation directory.
+    
+    Returns the path to Cygwin root directory (e.g., C:\\cygwin64 or F:\\cygwin64),
+    or None if not found.
+    """
+    # Common Cygwin installation locations
+    common_paths = [
+        r'C:\cygwin64',
+        r'C:\cygwin',
+        r'D:\cygwin64',
+        r'D:\cygwin',
+        r'E:\cygwin64',
+        r'E:\cygwin',
+        r'F:\cygwin64',
+        r'F:\cygwin',
+    ]
+    
+    # Check if CYGWIN_ROOT environment variable is set
+    cygwin_root = os.environ.get('CYGWIN_ROOT') or os.environ.get('CYGWIN_HOME')
+    if cygwin_root:
+        cygwin_root = os.path.normpath(cygwin_root)
+        if os.path.exists(cygwin_root):
+            bash_path = os.path.join(cygwin_root, 'bin', 'bash.exe')
+            bash_path = os.path.normpath(bash_path)
+            if os.path.exists(bash_path):
+                return cygwin_root
+    
+    # Check common locations
+    for cygwin_root in common_paths:
+        cygwin_root = os.path.normpath(cygwin_root)
+        bash_path = os.path.join(cygwin_root, 'bin', 'bash.exe')
+        bash_path = os.path.normpath(bash_path)
+        if os.path.exists(bash_path):
+            return cygwin_root
+    
+    # Try to detect from PATH if bash.exe is found
+    try:
+        # On Windows, prevent console window
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+        
+        result = subprocess.run(
+            ['where', 'bash.exe'] if os.name == 'nt' else ['which', 'bash'],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            startupinfo=startupinfo
+        )
+        if result.returncode == 0:
+            bash_exe_path = result.stdout.strip().split('\n')[0]
+            # Extract Cygwin root from path (e.g., C:\cygwin64\bin\bash.exe -> C:\cygwin64)
+            if 'cygwin' in bash_exe_path.lower():
+                # Try common patterns
+                for pattern in [r'\cygwin64\bin', r'\cygwin\bin']:
+                    if pattern in bash_exe_path:
+                        cygwin_root = bash_exe_path.split(pattern)[0]
+                        cygwin_root = os.path.normpath(cygwin_root)
+                        if os.path.exists(cygwin_root):
+                            return cygwin_root
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    
+    return None
+
+
+def get_bash_path(config=None):
+    """Get the correct bash path for the current environment.
+    
+    Args:
+        config: Optional config dict that may contain 'cygwin_root'
+    
+    Returns:
+        Path to bash executable (Windows path if running Windows Python, Unix path if running Cygwin Python)
+    """
+    cygwin_root = None
+    # Detect Windows Python - check both os.name and sys.platform for reliability
+    is_windows_python = (os.name == 'nt' or sys.platform.startswith('win'))
+    
+    # First, try to get from config
+    if config and config.get('cygwin_root'):
+        cygwin_root = config['cygwin_root']
+        cygwin_root = os.path.normpath(cygwin_root)
+        bash_path = os.path.join(cygwin_root, 'bin', 'bash.exe')
+        bash_path = os.path.normpath(bash_path)
+        if os.path.exists(bash_path):
+            logger.info(f"Using configured Cygwin bash: {bash_path}")
+            return bash_path
+        logger.warning(f"Configured cygwin_root '{cygwin_root}' not found or bash.exe missing at {bash_path}, trying auto-detection")
+    
+    # If running Windows Python, we MUST use Windows paths, even if Cygwin is detected
+    if is_windows_python:
+        # Find Cygwin installation
+        if not cygwin_root:
+            cygwin_root = find_cygwin_installation()
+        
+        if cygwin_root:
+            # Normalize the path for Windows
+            cygwin_root = os.path.normpath(cygwin_root)
+            bash_path = os.path.join(cygwin_root, 'bin', 'bash.exe')
+            bash_path = os.path.normpath(bash_path)
+            
+            if os.path.exists(bash_path):
+                logger.info(f"Using Cygwin bash from: {bash_path}")
+                return bash_path
+            else:
+                logger.warning(f"Found Cygwin root at {cygwin_root} but bash.exe not found at {bash_path}")
+        
+        # Default to 'bash' (will use system PATH)
+        logger.warning("Could not find Cygwin installation, falling back to 'bash' from PATH")
+        return 'bash'
+    
+    # If running from within Cygwin Python, use Unix paths
+    # Check if we're actually running from Cygwin (not just detecting Cygwin exists)
+    if is_cygwin() and os.path.exists('/usr/bin/bash'):
+        # Try common Cygwin bash locations
+        cygwin_bash_paths = [
+            '/usr/bin/bash',
+            '/bin/bash',
+        ]
+        for bash_path in cygwin_bash_paths:
+            if os.path.exists(bash_path):
+                return bash_path
+        # Fallback: try to find bash in PATH but prefer /usr/bin
+        try:
+            # On Windows, prevent console window
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+            
+            result = subprocess.run(
+                ['which', 'bash'],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                startupinfo=startupinfo
+            )
+            if result.returncode == 0:
+                bash_path = result.stdout.strip()
+                if bash_path and os.path.exists(bash_path):
+                    return bash_path
+                return '/usr/bin/bash'
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+    
+    # Default to 'bash' (will use system PATH)
+    logger.warning("Could not determine bash path, falling back to 'bash' from PATH")
+    return 'bash'
+
+
+def convert_path_for_cygwin(path, config=None):
+    """Convert Windows path to Cygwin path if running on Cygwin or using Cygwin bash.
+    
+    Args:
+        path: Windows path to convert
+        config: Optional config dict that may contain 'cygwin_root'
+    
+    Returns:
+        Cygwin-style path if conversion is possible, original path otherwise
+    """
+    # If running from within Cygwin, use cygpath
+    if is_cygwin():
+        if not os.path.exists(path):
+            return path
+        
+        try:
+            # On Windows, prevent console window
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+            
+            result = subprocess.run(
+                ['cygpath', '-u', path],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                startupinfo=startupinfo
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+    
+    # If using Cygwin bash from Windows Python, convert path manually
+    cygwin_root = None
+    if config and config.get('cygwin_root'):
+        cygwin_root = config['cygwin_root']
+    else:
+        cygwin_root = find_cygwin_installation()
+    
+    if cygwin_root and os.name == 'nt':
+        # Convert Windows path to Cygwin path
+        # e.g., F:\cygwin64\home\user\file -> /home/user/file
+        # or F:\other\path\to\file -> /cygdrive/f/other/path/to/file
+        cygwin_root_norm = os.path.normpath(cygwin_root).replace('\\', '/')
+        path_norm = os.path.normpath(path).replace('\\', '/')
+        
+        # Check if path is within Cygwin root
+        if path_norm.lower().startswith(cygwin_root_norm.lower()):
+            # Path is within Cygwin, convert directly
+            cygwin_path = path_norm[len(cygwin_root_norm):].replace('\\', '/')
+            if cygwin_path.startswith('/'):
+                return cygwin_path
+            return '/' + cygwin_path
+        else:
+            # Path is outside Cygwin, use /cygdrive/X/... format
+            # Extract drive letter (e.g., F:)
+            drive_match = re.match(r'^([A-Za-z]):', path_norm)
+            if drive_match:
+                drive_letter = drive_match.group(1).lower()
+                # Remove drive letter and convert
+                rest_path = path_norm[2:].replace('\\', '/')
+                return f'/cygdrive/{drive_letter}{rest_path}'
     
     return path
 
 
-def build_command(profile_name, script_path, urls, extra_text, use_firefox=True):
+def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, config=None):
     """Build the command to execute nostr_media_uploader.sh."""
     # Convert script path to absolute path
     script_path = Path(script_path)
@@ -218,11 +501,21 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True)
     
     script_path = str(script_path)
     
-    # Convert to Cygwin path if needed
-    script_path = convert_path_for_cygwin(script_path)
+    # Convert to Cygwin path if needed (using config if available)
+    script_path = convert_path_for_cygwin(script_path, config)
+    
+    # Get the correct bash path for the environment
+    bash_path = get_bash_path(config)
+    
+    # Validate bash path exists
+    if not os.path.exists(bash_path) and os.path.isabs(bash_path):
+        raise FileNotFoundError(f"Bash executable not found: {bash_path}")
+    
+    logger.info(f"Using bash: {bash_path}")
+    logger.info(f"Script path: {script_path}")
     
     # Build command: bash script_path -p profile_name [--firefox] url1 url2 ... "extra_text"
-    cmd = ['bash', script_path, '-p', profile_name]
+    cmd = [bash_path, script_path, '-p', profile_name]
     
     # Always add --firefox unless explicitly disabled
     if use_firefox:
@@ -242,13 +535,35 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True)
 async def execute_script(cmd, cwd=None):
     """Execute the script and capture output."""
     try:
-        logger.info(f"Executing: {' '.join(cmd)}")
+        # Log full command for debugging
+        logger.info(f"Executing command: {cmd}")
+        logger.info(f"Command string: {' '.join(str(arg) for arg in cmd)}")
+        
+        # Validate first argument (executable) exists if it's an absolute path
+        executable = cmd[0] if cmd else None
+        if executable and os.path.isabs(executable) and not os.path.exists(executable):
+            error_msg = f"Executable not found: {executable}"
+            logger.error(error_msg)
+            return {
+                'returncode': -1,
+                'stdout': '',
+                'stderr': error_msg,
+                'success': False
+            }
+        
+        # On Windows, prevent console window from appearing
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
         
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=cwd or Path(__file__).parent
+            cwd=cwd or Path(__file__).parent,
+            startupinfo=startupinfo
         )
         
         stdout_bytes, stderr_bytes = await process.communicate()
@@ -256,6 +571,15 @@ async def execute_script(cmd, cwd=None):
         # Decode bytes to strings
         stdout = stdout_bytes.decode('utf-8', errors='replace') if stdout_bytes else ''
         stderr = stderr_bytes.decode('utf-8', errors='replace') if stderr_bytes else ''
+        
+        # Log captured output for debugging
+        logger.debug(f"Script returncode: {process.returncode}")
+        logger.debug(f"Script stdout length: {len(stdout)} bytes")
+        logger.debug(f"Script stderr length: {len(stderr)} bytes")
+        if stdout:
+            logger.debug(f"Script stdout (first 500 chars): {stdout[:500]}")
+        if stderr:
+            logger.debug(f"Script stderr (first 500 chars): {stderr[:500]}")
         
         return {
             'returncode': process.returncode,
@@ -294,9 +618,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     # Check if message is from the owner
     # For regular messages: check from_user.id matches owner_id
-    # For channel posts: check if sender_chat matches configured chat_id
-    # (Channel posts don't have from_user, so we rely on chat_id match)
+    # For channel posts: check if sender_chat matches a configured channel
     is_owner = False
+    channel_config = None
     
     if message.from_user:
         # Regular message - check if user ID matches owner_id
@@ -304,44 +628,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_owner:
             logger.info(f"Message from non-owner user {message.from_user.id}, ignoring")
             return
+        # For regular messages, try to find channel config based on chat
+        chat_id = message.chat.id if message.chat.id else None
+        chat_username = message.chat.username if message.chat.username else None
+        channel_config = find_channel_config(config, chat_id=chat_id, chat_username=chat_username)
     elif message.sender_chat:
-        # Channel post - check if it's from the configured chat_id
-        # Since channel posts don't have from_user, we allow if chat_id matches
-        sender_chat_id = str(message.sender_chat.id)
-        chat_id_str = str(message.chat.id) if message.chat.id else None
-        if config['chat_id']:
-            expected_chat = str(config['chat_id'])
-            # Check both sender_chat.id and message.chat.id (they should be the same for channel posts)
-            is_owner = (sender_chat_id == expected_chat or 
-                       chat_id_str == expected_chat or
-                       (message.sender_chat.username and 
-                        message.sender_chat.username == expected_chat.lstrip('@')) or
-                       (message.chat.username and 
-                        message.chat.username == expected_chat.lstrip('@')))
-            if not is_owner:
-                logger.info(f"Channel post from sender_chat={sender_chat_id}, chat={chat_id_str}, expected={expected_chat}, ignoring")
-                return
-            else:
-                logger.info(f"Channel post accepted: sender_chat={sender_chat_id}, chat={chat_id_str} matches expected={expected_chat}")
+        # Channel post - find matching channel config
+        sender_chat_id = message.sender_chat.id
+        sender_chat_username = message.sender_chat.username if message.sender_chat.username else None
+        chat_id = message.chat.id if message.chat.id else None
+        chat_username = message.chat.username if message.chat.username else None
+        
+        # Try to find channel config
+        channel_config = find_channel_config(config, chat_id=sender_chat_id, chat_username=sender_chat_username)
+        if not channel_config:
+            channel_config = find_channel_config(config, chat_id=chat_id, chat_username=chat_username)
+        
+        if channel_config:
+            is_owner = True
+            logger.info(f"Channel post accepted: chat_id={sender_chat_id}, chat={chat_id}, found matching channel config")
         else:
-            # No chat_id configured, reject channel posts
-            logger.info(f"Channel post from chat {sender_chat_id} but no chat_id configured, ignoring")
+            logger.info(f"Channel post from chat_id={sender_chat_id}, chat={chat_id}, no matching channel config found, ignoring")
             return
     else:
         logger.info("Message has no from_user or sender_chat, ignoring")
         return
     
-    # Additional check: verify message is from the configured chat (if chat_id is set)
-    # This provides an extra layer of filtering
-    if config['chat_id']:
-        chat_id = str(message.chat.id) if message.chat.id else None
-        chat_username = message.chat.username if message.chat.username else None
-        expected_chat = str(config['chat_id'])
-        
-        # Allow numeric ID or username match
-        if chat_id != expected_chat and (not chat_username or chat_username != expected_chat.lstrip('@')):
-            logger.info(f"Message from chat {chat_id}/{chat_username}, expected {expected_chat}, ignoring")
-            return
+    # Require channel configuration - no default profile
+    if not channel_config:
+        logger.info("No channel configuration found for this chat, ignoring")
+        return
+    
+    # Get profile name from channel config (required, no default)
+    profile_name = channel_config.get('profile_name')
+    if not profile_name:
+        logger.error(f"Channel config found but profile_name is missing, ignoring")
+        return
     
     # Extract text from message
     text = message.text or message.caption or ""
@@ -364,11 +686,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         # Build command
         cmd = build_command(
-            config['profile_name'],
+            profile_name,
             config['script_path'],
             urls,
             extra_text,
-            config.get('use_firefox', True)
+            config.get('use_firefox', True),
+            config
         )
         
         # Execute script
@@ -376,20 +699,65 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         # Format response
         if result['success']:
+            # Log stdout/stderr for debugging
+            logger.info(f"Script execution successful. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
+            if result['stdout']:
+                logger.debug(f"Full stdout: {result['stdout']}")
+            if result['stderr']:
+                logger.debug(f"Full stderr: {result['stderr']}")
+            
             # Try to extract event ID and convert to nevent
+            # Check both stdout and stderr, as the script might output to either
             event_id = None
             nevent = None
             
+            # Try stdout first
             if result['stdout']:
                 event_id = extract_event_id(result['stdout'])
                 if event_id:
-                    nevent = await encode_to_nevent(event_id)
-                    logger.info(f"Extracted event ID: {event_id}, nevent: {nevent}")
+                    logger.info(f"Extracted event ID from stdout: {event_id}")
+            
+            # If not found in stdout, try stderr
+            if not event_id and result['stderr']:
+                event_id = extract_event_id(result['stderr'])
+                if event_id:
+                    logger.info(f"Extracted event ID from stderr: {event_id}")
+            
+            # Encode to nevent if we found an event ID
+            if event_id:
+                nevent = await encode_to_nevent(event_id)
+                logger.info(f"Encoded to nevent: {nevent}")
+            else:
+                logger.warning(f"Could not extract event ID from stdout or stderr. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
+                if result['stdout']:
+                    logger.warning(f"stdout content (first 500 chars): {result['stdout'][:500]}")
+                if result['stderr']:
+                    logger.warning(f"stderr content (first 500 chars): {result['stderr'][:500]}")
             
             if nevent:
-                # Return only the nevent formatted ID
-                await status_msg.edit_text(nevent)
-                logger.info(f"Successfully processed URLs: {urls}, nevent: {nevent}")
+                # Format response with nostr client link if configured
+                if config.get('nostr_client_url'):
+                    # Format the client URL with the nevent
+                    # Common formats: https://snort.social/e/{nevent} or https://primal.net/e/{nevent}
+                    client_url_template = config['nostr_client_url']
+                    # Replace {nevent} placeholder if present, otherwise append nevent
+                    if '{nevent}' in client_url_template:
+                        client_url = client_url_template.format(nevent=nevent)
+                    else:
+                        # If no placeholder, append /e/nevent or just nevent depending on URL
+                        if client_url_template.endswith('/'):
+                            client_url = f"{client_url_template}e/{nevent}"
+                        else:
+                            client_url = f"{client_url_template}/e/{nevent}"
+                    
+                    # Create clickable link using Markdown format
+                    response_msg = f"✅ [View on Nostr]({client_url})\n\n`{nevent}`"
+                    await status_msg.edit_text(response_msg, parse_mode='Markdown')
+                    logger.info(f"Successfully processed URLs: {urls}, nevent: {nevent}, client_url: {client_url}")
+                else:
+                    # Return only the nevent formatted ID if no client URL configured
+                    await status_msg.edit_text(nevent)
+                    logger.info(f"Successfully processed URLs: {urls}, nevent: {nevent}")
             else:
                 # Fallback if we couldn't extract/encode event ID
                 logger.warning(f"Could not extract event ID from output for URLs: {urls}")
@@ -465,27 +833,29 @@ def main() -> None:
     application.bot_data['config'] = config
     
     # Add message handler
-    # Filter by chat_id if specified, otherwise listen to all chats (only owner messages will be processed)
+    # With multi-channel support, we listen to all chats and filter in the handler
+    # based on channel configuration and owner_id
     message_filter = filters.TEXT | filters.CAPTION
-    if config['chat_id']:
-        try:
-            chat_id_int = int(config['chat_id'])
-            message_filter = message_filter & filters.Chat(chat_id=chat_id_int)
-        except ValueError:
-            # If CHAT_ID is not a number, assume it's a username (e.g., @channelname)
-            message_filter = message_filter & filters.Chat(username=config['chat_id'].lstrip('@'))
     
     application.add_handler(MessageHandler(message_filter, handle_message))
     
     # Start the bot
     logger.info("Starting bot...")
     logger.info(f"Owner ID: {config['owner_id']}")
-    logger.info(f"Chat ID: {config['chat_id'] or '(not set - will accept any chat)'}")
-    logger.info(f"Profile name: {config['profile_name']}")
     logger.info(f"Script path: {config['script_path']}")
     logger.info(f"Use Firefox: {config.get('use_firefox', True)}")
+    channels = config.get('channels', {})
+    if channels:
+        logger.info(f"Configured channels: {len(channels)}")
+        for channel_name, channel_config in channels.items():
+            chat_id = channel_config.get('chat_id', 'N/A')
+            profile_name = channel_config.get('profile_name', 'N/A')
+            logger.info(f"  - {channel_name}: chat_id={chat_id}, profile_name={profile_name}")
+    else:
+        logger.info("No channels configured - will only process messages from owner")
     logger.info("Bot is ready and listening for messages...")
     
+    # Run the bot
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

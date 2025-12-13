@@ -5,3 +5,4 @@ reports/
 # Telegram bot configuration (contains secrets)
 telegram_bot.conf
 
+telegram_bot.yaml

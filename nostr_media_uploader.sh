@@ -13,7 +13,7 @@ BLOSSOMS=(
 #BLOSSOMS=($(shuf -e "${BLOSSOMS[@]}"))
 readonly BLOSSOMS
 
-RELAYS="wss://bcast.girino.org wss://nip13.girino.org"
+RELAYS="wss://bcast.girino.org wss://nip13.girino.org wss://nostr.girino.org wss://wot.girino.org"
 readonly RELAYS
 
 # Global array to track files/directories for cleanup (used only by add_to_cleanup and cleanup functions)

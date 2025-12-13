@@ -1,0 +1,47 @@
+# Telegram Bot Configuration
+# Copy this file to telegram_bot.yaml and fill in your values
+
+# Bot token from @BotFather
+bot_token: YOUR_BOT_TOKEN_HERE
+
+# Your Telegram user ID (get from @userinfobot)
+owner_id: YOUR_TELEGRAM_USER_ID
+
+# Path to nostr_media_uploader.sh script
+script_path: ./nostr_media_uploader.sh
+
+# Optional: Path to Cygwin installation (e.g., C:\cygwin64 or F:\cygwin64)
+# If not specified, will try to auto-detect common locations
+# cygwin_root: F:\cygwin64
+
+# Optional: Nostr client URL template for creating clickable links
+# Use {nevent} as placeholder for the nevent, or the bot will append /e/{nevent}
+# Examples:
+#   nostr_client_url: https://snort.social/e/{nevent}
+#   nostr_client_url: https://primal.net/e/{nevent}
+#   nostr_client_url: https://nostr.com/e/{nevent}
+#   nostr_client_url: https://damus.io/{nevent}
+# If not specified, bot will return only the nevent string
+# nostr_client_url: https://snort.social/e/{nevent}
+
+# Channels configuration
+# Each channel can have its own chat_id and profile_name
+channels:
+  # Example channel 1: using numeric chat ID
+  channel1:
+    chat_id: -1001234567890  # Get numeric ID from @RawDataBot
+    profile_name: tarado
+  
+  # Example channel 2: using username
+  channel2:
+    chat_id: @channelname  # Use @channelname format
+    profile_name: girino
+  
+  # Example channel 3: another channel
+  channel3:
+    chat_id: -1009876543210
+    profile_name: another_profile
+
+# Note: If no channels are configured, the bot will only process messages
+# from the owner (owner_id). Messages from channels will be ignored.
+# Each channel MUST have a profile_name - there is no default.
