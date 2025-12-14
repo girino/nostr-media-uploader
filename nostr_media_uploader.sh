@@ -1933,17 +1933,18 @@ prepare_gallery_dl_params() {
 #   parse_command_line_ret_profile_name - profile name if -p option was used
 # Side effects: Also exports PROFILE_NAME as a global variable for early use
 parse_command_line() {
-	# Initialize default values from exported variables (if available)
-	local CONVERT_VIDEO="${CONVERT_VIDEO:-1}"
-	local SEND_TO_RELAY="${SEND_TO_RELAY:-1}"
-	local DISABLE_HASH_CHECK="${DISABLE_HASH_CHECK:-0}"
-	local MAX_FILE_SEARCH="${MAX_FILE_SEARCH:-10}"
-	local POW_DIFF="${POW_DIFF:-20}"
-	local APPEND_ORIGINAL_COMMENT="${APPEND_ORIGINAL_COMMENT:-1}"
-	local USE_COOKIES_FF="${USE_COOKIES_FF:-0}"
-	local DISPLAY_SOURCE="${DISPLAY_SOURCE:-0}"
-	local PASSWORD="${PASSWORD:-}"
-	local PROFILE_NAME="${PROFILE_NAME:-}"
+	# Initialize default values (hardcoded defaults, NOT from environment)
+	# Environment variables will be merged later after loading the profile file
+	local CONVERT_VIDEO=1
+	local SEND_TO_RELAY=1
+	local DISABLE_HASH_CHECK=0
+	local MAX_FILE_SEARCH=10
+	local POW_DIFF=20
+	local APPEND_ORIGINAL_COMMENT=1
+	local USE_COOKIES_FF=0
+	local DISPLAY_SOURCE=0
+	local PASSWORD=""
+	local PROFILE_NAME=""
 	
 	local ALL_MEDIA_FILES=()
 	local DESCRIPTION_CANDIDATE=""
@@ -2620,36 +2621,20 @@ main() {
 	BLOSSOMS_LIST_STR="$process_relays_and_blossoms_ret_blossoms_list"
 	
 	# ========================================================================
-	# USE PARSED COMMAND-LINE ARGUMENTS (parsed early before ENV loading)
+	# READ EXPORTED VARIABLES (merged from env file and command-line)
 	# ========================================================================
 	local ALL_MEDIA_FILES_STR="$PARSED_MEDIA_FILES"
-	local CONVERT_VIDEO="$PARSED_CONVERT_VIDEO"
-	# SEND_TO_RELAY: Command-line --norelay takes precedence, otherwise use environment variable (from profile)
-	# If profile sets SEND_TO_RELAY=0 or NO_RELAY=1, use that unless command-line overrode it
-	local SEND_TO_RELAY
-	if [ "$PARSED_SEND_TO_RELAY" -eq 0 ]; then
-		# Command-line --norelay was used, respect it
-		SEND_TO_RELAY=0
-	else
-		# Use environment variable if set (from profile), otherwise use parsed value (defaults to 1)
-		SEND_TO_RELAY="${SEND_TO_RELAY:-$PARSED_SEND_TO_RELAY}"
-	fi
-	local DISABLE_HASH_CHECK="$PARSED_DISABLE_HASH_CHECK"
-	local MAX_FILE_SEARCH="$PARSED_MAX_FILE_SEARCH"
-	local POW_DIFF_PARAM="$PARSED_POW_DIFF"
-	local APPEND_ORIGINAL_COMMENT_PARAM="$PARSED_APPEND_ORIGINAL_COMMENT"
-	local USE_COOKIES_FF_PARAM="$PARSED_USE_COOKIES_FF"
-	local DISPLAY_SOURCE_PARAM="$PARSED_DISPLAY_SOURCE"
-	local PASSWORD_PARAM="$PARSED_PASSWORD"
+	local CONVERT_VIDEO="${CONVERT_VIDEO:-1}"
+	local SEND_TO_RELAY="${SEND_TO_RELAY:-1}"
+	local DISABLE_HASH_CHECK="${DISABLE_HASH_CHECK:-0}"
+	local MAX_FILE_SEARCH="${MAX_FILE_SEARCH:-10}"
+	local POW_DIFF="${POW_DIFF:-20}"
+	local APPEND_ORIGINAL_COMMENT="${APPEND_ORIGINAL_COMMENT:-1}"
+	local USE_COOKIES_FF="${USE_COOKIES_FF:-0}"
+	local DISPLAY_SOURCE="${DISPLAY_SOURCE:-0}"
+	local PASSWORD="${PASSWORD:-}"
 	local DESCRIPTION_CANDIDATE="$PARSED_DESCRIPTION_CANDIDATE"
 	local SOURCE_CANDIDATE="$PARSED_SOURCE_CANDIDATE"
-	
-	# Update POW_DIFF if it was changed via command line
-	POW_DIFF="$POW_DIFF_PARAM"
-	APPEND_ORIGINAL_COMMENT="$APPEND_ORIGINAL_COMMENT_PARAM"
-	USE_COOKIES_FF="$USE_COOKIES_FF_PARAM"
-	DISPLAY_SOURCE="$DISPLAY_SOURCE_PARAM"
-	PASSWORD="$PASSWORD_PARAM"
 	
 	# If not sending to relay (e.g. testing), disable hash check so we don't stop if already exists
 	if [ "$SEND_TO_RELAY" -eq 0 ]; then
@@ -2763,12 +2748,19 @@ if [ -n "$PARSED_PROFILE_NAME" ]; then
 	PROFILE_NAME="$PARSED_PROFILE_NAME"
 fi
 
-# Load environment variables from ~/.nostr/${PROFILE_NAME}
+# ========================================================================
+# LOAD ENVIRONMENT VARIABLES FROM PROFILE FILE
+# ========================================================================
 ENV_FILE="$HOME/.nostr/${PROFILE_NAME}"
 if [[ -f "$ENV_FILE" ]]; then
 	# shellcheck source=/dev/null
 	source "$ENV_FILE"
 fi
+
+# ========================================================================
+# MERGE ENVIRONMENT VARIABLES WITH PARSED PARAMETERS
+# Command-line parameters take precedence over environment variables
+# ========================================================================
 
 # Support NO_RELAY environment variable as an alternative to SEND_TO_RELAY=0
 if [[ "${NO_RELAY:-0}" == "1" ]] || [[ "${NO_RELAY:-0}" == "true" ]] || [[ "${NO_RELAY:-0}" == "yes" ]]; then
@@ -2780,16 +2772,81 @@ if [[ "${DISABLE_RELAY:-0}" == "1" ]] || [[ "${DISABLE_RELAY:-0}" == "true" ]] |
 	SEND_TO_RELAY=0
 fi
 
-# Export variables for main() to read
+# Merge: Use parsed command-line value if it was explicitly set (differs from default),
+# otherwise use environment variable from profile file
+
+# CONVERT_VIDEO: default is 1, if parsed is 0, it was explicitly set (--noconvert)
+if [ "$PARSED_CONVERT_VIDEO" -eq 0 ]; then
+	CONVERT_VIDEO=0
+else
+	CONVERT_VIDEO="${CONVERT_VIDEO:-$PARSED_CONVERT_VIDEO}"
+fi
+
+# SEND_TO_RELAY: default is 1, if parsed is 0, it was explicitly set (--norelay)
+if [ "$PARSED_SEND_TO_RELAY" -eq 0 ]; then
+	SEND_TO_RELAY=0
+else
+	SEND_TO_RELAY="${SEND_TO_RELAY:-$PARSED_SEND_TO_RELAY}"
+fi
+
+# DISABLE_HASH_CHECK: default is 0, if parsed is 1, it was explicitly set (--nocheck)
+if [ "$PARSED_DISABLE_HASH_CHECK" -eq 1 ]; then
+	DISABLE_HASH_CHECK=1
+else
+	DISABLE_HASH_CHECK="${DISABLE_HASH_CHECK:-$PARSED_DISABLE_HASH_CHECK}"
+fi
+
+# POW_DIFF: default is 20, if parsed is 0, it was explicitly set (--nopow)
+# Otherwise use env if set, else use parsed value
+if [ "$PARSED_POW_DIFF" -eq 0 ] && [ "${POW_DIFF:-20}" -ne 0 ]; then
+	# --nopow was used, use 0
+	POW_DIFF=0
+else
+	POW_DIFF="${POW_DIFF:-$PARSED_POW_DIFF}"
+fi
+
+# APPEND_ORIGINAL_COMMENT: default is 1, if parsed is 0, it was explicitly set (--nocomment)
+if [ "$PARSED_APPEND_ORIGINAL_COMMENT" -eq 0 ]; then
+	APPEND_ORIGINAL_COMMENT=0
+else
+	APPEND_ORIGINAL_COMMENT="${APPEND_ORIGINAL_COMMENT:-$PARSED_APPEND_ORIGINAL_COMMENT}"
+fi
+
+# USE_COOKIES_FF: default is 0, if parsed is 1, it was explicitly set (--firefox)
+if [ "$PARSED_USE_COOKIES_FF" -eq 1 ]; then
+	USE_COOKIES_FF=1
+else
+	USE_COOKIES_FF="${USE_COOKIES_FF:-$PARSED_USE_COOKIES_FF}"
+fi
+
+# DISPLAY_SOURCE: default is 0, if parsed is 1, it was explicitly set (--source)
+if [ "$PARSED_DISPLAY_SOURCE" -eq 1 ]; then
+	DISPLAY_SOURCE=1
+else
+	DISPLAY_SOURCE="${DISPLAY_SOURCE:-$PARSED_DISPLAY_SOURCE}"
+fi
+
+# PASSWORD: use parsed if set, otherwise use env
+PASSWORD="${PARSED_PASSWORD:-${PASSWORD:-}}"
+
+# MAX_FILE_SEARCH: use parsed if set, otherwise use env
+MAX_FILE_SEARCH="${PARSED_MAX_FILE_SEARCH:-${MAX_FILE_SEARCH:-10}}"
+
+# ========================================================================
+# EXPORT MERGED VARIABLES FOR main() TO READ
+# ========================================================================
 export DISPLAY_SOURCE
 export POW_DIFF
 export APPEND_ORIGINAL_COMMENT
 export USE_COOKIES_FF
 export SEND_TO_RELAY
+export CONVERT_VIDEO
+export DISABLE_HASH_CHECK
+export MAX_FILE_SEARCH
+export PASSWORD
 export NSEC_KEY
 export NCRYPT_KEY
 export KEY
-export PASSWORD
 export EXTRA_RELAYS
 export EXTRA_BLOSSOMS
 export PROFILE_NAME
