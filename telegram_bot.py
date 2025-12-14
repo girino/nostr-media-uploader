@@ -578,6 +578,11 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
         cmd.append('--firefox')
         logger.info("Adding --firefox parameter")
     
+    # Add --nocomment if there is extra text after URLs
+    if extra_text and extra_text.strip():
+        cmd.append('--nocomment')
+        logger.info("Adding --nocomment parameter (extra text detected)")
+    
     # Add all URLs or file paths as separate arguments
     # Convert file paths to Cygwin paths if needed
     for item in urls:
@@ -620,15 +625,15 @@ async def execute_script(cmd, cwd=None):
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = subprocess.SW_HIDE
         
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd or Path(__file__).parent,
-            startupinfo=startupinfo
-        )
-        
-        stdout_bytes, stderr_bytes = await process.communicate()
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd or Path(__file__).parent,
+                startupinfo=startupinfo
+            )
+            
+            stdout_bytes, stderr_bytes = await process.communicate()
         
         # Decode bytes to strings
         stdout = stdout_bytes.decode('utf-8', errors='replace') if stdout_bytes else ''
@@ -729,7 +734,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     error_msg = f"❌ Failed to reload configuration: {str(e)}"
                     logger.exception(f"Error reloading configuration: {e}")
                     await message.reply_text(error_msg)
-                return
+            return
         # For regular messages, try to find channel config based on chat
         chat_id = message.chat.id if message.chat.id else None
         chat_username = message.chat.username if message.chat.username else None
@@ -1069,7 +1074,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.error(f"Error processing URLs {urls}")
             logger.error(f"stderr: {result['stderr']}")
             logger.error(f"stdout: {result['stdout']}")
-            
     except Exception as e:
         logger.exception(f"Exception while processing message: {e}")
         await message.reply_text(f"❌ Exception occurred: {str(e)}")

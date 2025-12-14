@@ -6,3 +6,4 @@ reports/
 telegram_bot.conf
 
 telegram_bot.yaml
+__pycache__/
