@@ -1567,6 +1567,246 @@ download_images() {
 	fi
 }
 
+# Function to download Facebook image using curl and parse og:image/twitter:image meta tags
+# Parameters:
+#   $1: FACEBOOK_URL - Facebook URL to download
+#   $2: APPEND_ORIGINAL_COMMENT - 1 to append original comment, 0 otherwise
+#   $3: DESCRIPTION_CANDIDATE - description candidate to use
+#   $4: SOURCE_CANDIDATE - source candidate to use
+# Return variables (set at end of function):
+#   download_facebook_og_ret_files - array of downloaded files
+#   download_facebook_og_ret_captions - array of captions (one per file)
+#   download_facebook_og_ret_source - source to set (empty if should keep current)
+#   download_facebook_og_ret_success - 0 on success, 1 on failure
+#   download_facebook_og_ret_error - error message if download failed (empty on success)
+download_facebook_og_image() {
+	local FACEBOOK_URL="$1"
+	local APPEND_ORIGINAL_COMMENT="$2"
+	local DESCRIPTION_CANDIDATE="$3"
+	local SOURCE_CANDIDATE="$4"
+	
+	# Return variables (global, set at end of function)
+	download_facebook_og_ret_files=()
+	download_facebook_og_ret_captions=()
+	download_facebook_og_ret_source=""
+	download_facebook_og_ret_success=1
+	download_facebook_og_ret_error=""
+	
+	# Check if URL matches Facebook patterns
+	if [[ ! "$FACEBOOK_URL" =~ ^https?://(www\.)?facebook\.com/(share/p/[^/]+|groups/[^/]+/permalink/[^/]+) ]]; then
+		download_facebook_og_ret_error="URL does not match Facebook share/p or groups/permalink pattern"
+		return 1
+	fi
+	
+	echo "Attempting to download Facebook page using curl: $FACEBOOK_URL"
+	
+	# Create temporary directory for HTML and image
+	local TMPDIR=$(mktemp -d /tmp/facebook_og_XXXXXXXX)
+	add_to_cleanup "$TMPDIR"
+	
+	local HTML_FILE="${TMPDIR}/page.html"
+	local IMAGE_FILE="${TMPDIR}/image.jpg"
+	
+	# Download the HTML page using curl
+	echo "Downloading HTML page with curl..."
+	if ! curl -s -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$FACEBOOK_URL" -o "$HTML_FILE" 2>&1; then
+		download_facebook_og_ret_error="Failed to download Facebook page with curl"
+		return 1
+	fi
+	
+	if [ ! -f "$HTML_FILE" ] || [ ! -s "$HTML_FILE" ]; then
+		download_facebook_og_ret_error="Downloaded HTML file is empty or missing"
+		return 1
+	fi
+	
+	# Parse for og:image or twitter:image meta tag
+	local IMAGE_URL=""
+	
+	# Try og:image first - extract just the meta tag that has property="og:image" (not og:image:something)
+	# Since HTML might be minified on one line, we need to extract just the specific meta tag
+	# Pattern: <meta ... property="og:image" ... content="URL" ... />
+	local META_TAG=$(grep -oE '<meta[^>]*property=["'\'']og:image["'\''][^>]*>' "$HTML_FILE" | grep -v 'og:image:' | head -1)
+	
+	if [ -z "$META_TAG" ]; then
+		# Try with single quotes
+		META_TAG=$(grep -oE "<meta[^>]*property=['\"]og:image['\"][^>]*>" "$HTML_FILE" | grep -v 'og:image:' | head -1)
+	fi
+	
+	if [ -n "$META_TAG" ]; then
+		echo "Found og:image meta tag: $META_TAG" >&2
+		# Extract content attribute value from this specific tag
+		# Try double quotes first: content="URL"
+		if [[ "$META_TAG" =~ content\s*=\s*\"([^\"]+)\" ]]; then
+			IMAGE_URL="${BASH_REMATCH[1]}"
+		# Try single quotes: content='URL'
+		elif [[ "$META_TAG" =~ content\s*=\s*\'([^\']+)\' ]]; then
+			IMAGE_URL="${BASH_REMATCH[1]}"
+		# Try without quotes (rare but possible): content=URL
+		elif [[ "$META_TAG" =~ content\s*=\s*([^\s\>]+) ]]; then
+			IMAGE_URL="${BASH_REMATCH[1]}"
+		fi
+		
+		# Convert &amp; to & in the image URL immediately after extraction
+		if [ -n "$IMAGE_URL" ]; then
+			IMAGE_URL=$(echo "$IMAGE_URL" | sed "s/&amp;/\&/g")
+		fi
+		
+		# Validate it's a URL
+		if [[ ! "$IMAGE_URL" =~ ^https?:// ]]; then
+			IMAGE_URL=""
+		fi
+	fi
+	
+	# If not found, try twitter:image
+	if [ -z "$IMAGE_URL" ]; then
+		local TWITTER_TAG=$(grep -oE '<meta[^>]*name=["'\'']twitter:image["'\''][^>]*>' "$HTML_FILE" | head -1)
+		
+		if [ -z "$TWITTER_TAG" ]; then
+			# Try with single quotes
+			TWITTER_TAG=$(grep -oE "<meta[^>]*name=['\"]twitter:image['\"][^>]*>" "$HTML_FILE" | head -1)
+		fi
+		
+		if [ -n "$TWITTER_TAG" ]; then
+			echo "Found twitter:image meta tag: $TWITTER_TAG" >&2
+			# Extract content attribute value
+			if [[ "$TWITTER_TAG" =~ content\s*=\s*\"([^\"]+)\" ]]; then
+				IMAGE_URL="${BASH_REMATCH[1]}"
+			elif [[ "$TWITTER_TAG" =~ content\s*=\s*\'([^\']+)\' ]]; then
+				IMAGE_URL="${BASH_REMATCH[1]}"
+			elif [[ "$TWITTER_TAG" =~ content\s*=\s*([^\s\>]+) ]]; then
+				IMAGE_URL="${BASH_REMATCH[1]}"
+			fi
+			
+			# Convert &amp; to & in the image URL immediately after extraction
+			if [ -n "$IMAGE_URL" ]; then
+				IMAGE_URL=$(echo "$IMAGE_URL" | sed "s/&amp;/\&/g")
+			fi
+			
+			# Validate it's a URL
+			if [[ ! "$IMAGE_URL" =~ ^https?:// ]]; then
+				IMAGE_URL=""
+			fi
+		fi
+	fi
+	
+	if [ -z "$IMAGE_URL" ] || [[ ! "$IMAGE_URL" =~ ^https?:// ]]; then
+		download_facebook_og_ret_error="Could not find og:image or twitter:image meta tag with valid URL in HTML"
+		return 1
+	fi
+	
+	# URL should already have &amp; converted to &, but do it again to be safe
+	IMAGE_URL=$(echo "$IMAGE_URL" | sed "s/&amp;/\&/g")
+	
+	echo "Found image URL: $IMAGE_URL"
+	
+	# Download the image using curl
+	echo "Downloading image with curl..."
+	if ! curl -s -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$IMAGE_URL" -o "$IMAGE_FILE" 2>&1; then
+		download_facebook_og_ret_error="Failed to download image from $IMAGE_URL"
+		return 1
+	fi
+	
+	if [ ! -f "$IMAGE_FILE" ] || [ ! -s "$IMAGE_FILE" ]; then
+		download_facebook_og_ret_error="Downloaded image file is empty or missing"
+		return 1
+	fi
+	
+	# Verify the downloaded file is actually an image
+	local MIME_TYPE=$(file --mime-type -b "$IMAGE_FILE" 2>/dev/null)
+	if [[ ! "$MIME_TYPE" =~ ^image/ ]]; then
+		download_facebook_og_ret_error="Downloaded file is not an image (MIME type: ${MIME_TYPE:-unknown}). This might be an error page or invalid content."
+		return 1
+	fi
+	echo "Verified downloaded file is an image (MIME type: $MIME_TYPE)"
+	
+	# Determine file extension from image URL or MIME type
+	local EXT="jpg"
+	if [[ "$IMAGE_URL" =~ \.(jpg|jpeg|png|webp|gif)(\?|$) ]]; then
+		EXT="${BASH_REMATCH[1]}"
+		# Normalize jpeg to jpg
+		if [ "$EXT" = "jpeg" ]; then
+			EXT="jpg"
+		fi
+	else
+		# Try to detect from file command (MIME_TYPE already set above)
+		if [[ "$MIME_TYPE" == image/png ]]; then
+			EXT="png"
+		elif [[ "$MIME_TYPE" == image/webp ]]; then
+			EXT="webp"
+		elif [[ "$MIME_TYPE" == image/gif ]]; then
+			EXT="gif"
+		elif [[ "$MIME_TYPE" == image/jpeg ]]; then
+			EXT="jpg"
+		fi
+	fi
+	
+	# Rename file with correct extension if needed
+	local FINAL_IMAGE_FILE="${TMPDIR}/image.${EXT}"
+	if [ "$IMAGE_FILE" != "$FINAL_IMAGE_FILE" ]; then
+		mv "$IMAGE_FILE" "$FINAL_IMAGE_FILE"
+	fi
+	
+	# Parse for og:description or twitter:description as comment
+	local EXTRACTED_CAPTION=""
+	if [ "$APPEND_ORIGINAL_COMMENT" -eq 1 ]; then
+		# Try og:description first
+		local DESC_LINE=$(grep -i '<meta' "$HTML_FILE" | grep -i 'property' | grep -i 'og:description' | grep -i 'content' | head -1)
+		if [ -n "$DESC_LINE" ]; then
+			# Extract content attribute value
+			if [[ "$DESC_LINE" =~ content\s*=\s*\"([^\"]+)\" ]]; then
+				EXTRACTED_CAPTION="${BASH_REMATCH[1]}"
+			elif [[ "$DESC_LINE" =~ content\s*=\s*\'([^\']+)\' ]]; then
+				EXTRACTED_CAPTION="${BASH_REMATCH[1]}"
+			elif [[ "$DESC_LINE" =~ content\s*=\s*([^\s\>]+) ]]; then
+				EXTRACTED_CAPTION="${BASH_REMATCH[1]}"
+			fi
+		fi
+		
+		# If not found, try twitter:description
+		if [ -z "$EXTRACTED_CAPTION" ]; then
+			local TWITTER_DESC_LINE=$(grep -i '<meta' "$HTML_FILE" | grep -i 'name' | grep -i 'twitter:description' | grep -i 'content' | head -1)
+			if [ -n "$TWITTER_DESC_LINE" ]; then
+				# Extract content attribute value
+				if [[ "$TWITTER_DESC_LINE" =~ content\s*=\s*\"([^\"]+)\" ]]; then
+					EXTRACTED_CAPTION="${BASH_REMATCH[1]}"
+				elif [[ "$TWITTER_DESC_LINE" =~ content\s*=\s*\'([^\']+)\' ]]; then
+					EXTRACTED_CAPTION="${BASH_REMATCH[1]}"
+				elif [[ "$TWITTER_DESC_LINE" =~ content\s*=\s*([^\s\>]+) ]]; then
+					EXTRACTED_CAPTION="${BASH_REMATCH[1]}"
+				fi
+			fi
+		fi
+		
+		# Decode HTML entities
+		if [ -n "$EXTRACTED_CAPTION" ]; then
+			# First decode common named entities (must be before &amp;)
+			EXTRACTED_CAPTION=$(echo "$EXTRACTED_CAPTION" | sed 's/&lt;/</g' | sed 's/&gt;/>/g' | sed 's/&quot;/"/g' | sed "s/&#39;/'/g" | sed 's/&nbsp;/ /g')
+			# Decode hex entities (&#xXXXX; format) - handle common emoji and characters
+			# This is a basic implementation - for full support, would need perl/python
+			EXTRACTED_CAPTION=$(echo "$EXTRACTED_CAPTION" | sed 's/&#x2764;&#xfe0f;/❤️/g' | sed 's/&#x2764;/❤/g')
+			# Decode numeric entities (&#NNN; format) - basic support
+			# Finally decode &amp; (must be last)
+			EXTRACTED_CAPTION=$(echo "$EXTRACTED_CAPTION" | sed 's/&amp;/&/g')
+		fi
+	fi
+	
+	# Build caption
+	local file_caption=$(build_caption "$DESCRIPTION_CANDIDATE" "$EXTRACTED_CAPTION" "$APPEND_ORIGINAL_COMMENT")
+	
+	# Set return variables
+	download_facebook_og_ret_files+=("$FINAL_IMAGE_FILE")
+	download_facebook_og_ret_captions+=("$file_caption")
+	
+	if [ -z "$SOURCE_CANDIDATE" ]; then
+		download_facebook_og_ret_source="$FACEBOOK_URL"
+	else
+		download_facebook_og_ret_source="$SOURCE_CANDIDATE"
+	fi
+	
+	download_facebook_og_ret_success=0
+	echo "Successfully downloaded Facebook image: $FINAL_IMAGE_FILE"
+}
+
 # Function to upload a file to a blossom server
 # Parameters:
 #   $1: FILE - path to file to upload
@@ -2319,10 +2559,72 @@ process_media_items() {
 						fi
 						((GALLERY_ID++))
 					else
-						if [ -n "$download_images_ret_error" ]; then
-							die "$download_images_ret_error"
+						# Gallery-dl failed - try Facebook OG image fallback if URL matches pattern
+						if [[ "$MEDIA_ITEM" =~ ^https?://(www\.)?facebook\.com/(share/p/[^/]+|groups/[^/]+/permalink/[^/]+) ]]; then
+							echo "gallery-dl failed, trying Facebook OG image fallback for: $MEDIA_ITEM"
+							
+							# Initialize return variables
+							download_facebook_og_ret_files=()
+							download_facebook_og_ret_captions=()
+							download_facebook_og_ret_source=""
+							download_facebook_og_ret_success=1
+							download_facebook_og_ret_error=""
+							
+							# Call Facebook OG image download function
+							download_facebook_og_image "$MEDIA_ITEM" "$APPEND_ORIGINAL_COMMENT" "" "$SOURCE_CANDIDATE"
+							local FACEBOOK_OG_RESULT="${download_facebook_og_ret_success:-1}"
+							
+							if [ "$FACEBOOK_OG_RESULT" -eq 0 ]; then
+								# Success - add files to processed arrays
+								if [ ${#download_facebook_og_ret_files[@]} -gt 0 ]; then
+									for file in "${download_facebook_og_ret_files[@]}"; do
+										PROCESSED_FILES+=("$file")
+										# Add the downloaded file to cleanup list
+										add_to_cleanup "$file"
+									done
+									
+									# Add captions
+									for caption in "${download_facebook_og_ret_captions[@]}"; do
+										FILE_CAPTIONS+=("$caption")
+									done
+									
+									# Add gallery IDs (single image, so same gallery ID)
+									for file in "${download_facebook_og_ret_files[@]}"; do
+										FILE_GALLERIES+=("$GALLERY_ID")
+									done
+									
+									# Update source if provided
+									if [ -n "$download_facebook_og_ret_source" ]; then
+										cleaned_source=$(cleanup_source_url "$download_facebook_og_ret_source")
+										FILE_SOURCES+=("$cleaned_source")
+									fi
+									
+									((GALLERY_ID++))
+									echo "Successfully downloaded Facebook image using OG fallback"
+								else
+									if [ -n "$download_facebook_og_ret_error" ]; then
+										die "$download_facebook_og_ret_error"
+									else
+										die "Facebook OG fallback returned success but no files"
+									fi
+								fi
+							else
+								# Facebook OG fallback also failed
+								if [ -n "$download_facebook_og_ret_error" ]; then
+									die "$download_facebook_og_ret_error"
+								elif [ -n "$download_images_ret_error" ]; then
+									die "$download_images_ret_error"
+								else
+									die "Failed to download from URL: $MEDIA_ITEM (tried yt-dlp, gallery-dl, and Facebook OG fallback)"
+								fi
+							fi
 						else
-							die "Failed to download from URL: $MEDIA_ITEM"
+							# Not a Facebook URL matching the pattern, just die with original error
+							if [ -n "$download_images_ret_error" ]; then
+								die "$download_images_ret_error"
+							else
+								die "Failed to download from URL: $MEDIA_ITEM"
+							fi
 						fi
 					fi
 				fi
