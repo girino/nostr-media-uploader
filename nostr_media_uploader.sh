@@ -1697,6 +1697,12 @@ download_facebook_og_image() {
 	# URL should already have &amp; converted to &, but do it again to be safe
 	IMAGE_URL=$(echo "$IMAGE_URL" | sed "s/&amp;/\&/g")
 	
+	# Remove size constraints from URL (e.g., &ctp=p600x600) to get higher resolution
+	# Remove &ctp=... pattern (can be any value like p600x600, p1080x1080, etc.)
+	IMAGE_URL=$(echo "$IMAGE_URL" | sed 's/[&?]ctp=[^&]*//g')
+	# Also handle if it was the first parameter and left a trailing ? or &
+	IMAGE_URL=$(echo "$IMAGE_URL" | sed 's/?&/\?/g' | sed 's/&&/\&/g' | sed 's/?$//')
+	
 	echo "Found image URL: $IMAGE_URL"
 	
 	# Download the image using curl
@@ -2461,10 +2467,12 @@ process_media_items() {
 			local SKIP_VIDEO_DOWNLOAD=0
 			# Check for explicit photo URLs
 			# Twitter/X: .../photo/1
-			# Facebook: .../photos/..., photo.php, .../photo/...
+			# Facebook: .../share/p/... (photos), .../photos/..., photo.php, .../photo/...
+			# Note: Facebook videos use /v/ (videos) or /r/ (reels), not /p/
 			# Reddit: i.redd.it (direct images)
 			# Common image extensions (jpg, png, etc)
 			if [[ "$MEDIA_ITEM" =~ ^https?://(www\.)?(x\.com|twitter\.com)/.*/photo/[0-9]+ ]] || \
+			   [[ "$MEDIA_ITEM" =~ ^https?://(www\.)?facebook\.com/share/p/ ]] || \
 			   [[ "$MEDIA_ITEM" =~ facebook\.com/.*(photos/|photo\.php|photo/) ]] || \
 			   [[ "$MEDIA_ITEM" =~ ^https?://i\.redd\.it/ ]] || \
 			   [[ "$MEDIA_ITEM" =~ \.(jpg|jpeg|png|webp|gif)$ ]]; then
