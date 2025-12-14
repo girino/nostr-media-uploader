@@ -300,7 +300,16 @@ This project is licensed under **Girino's Anarchist License (GAL)**. See [LICENS
 
 ## Telegram Bot
 
-The repository includes a Telegram bot (`telegram_bot.py`) that can automatically process links posted in a Telegram channel or group and upload them using `nostr_media_uploader.sh`.
+The repository includes a Telegram bot (`telegram_bot.py`) that can automatically process links and media files posted in Telegram channels or groups and upload them using `nostr_media_uploader.sh`.
+
+### Features
+
+- **Multi-Channel Support**: Configure multiple channels, each with its own profile
+- **Media File Processing**: Automatically downloads and processes photos, videos, and documents sent to the bot
+- **URL Processing**: Extracts and processes URLs from messages
+- **Configuration Reload**: Use `/reload` command in private chat to reload configuration without restarting
+- **Firefox Cookie Support**: Optional `--firefox` flag support (can be disabled with `--no-firefox`)
+- **Cross-Platform**: Works on Linux, Cygwin/Windows, and macOS
 
 ### Setup
 
@@ -317,20 +326,15 @@ The repository includes a Telegram bot (`telegram_bot.py`) that can automaticall
 3. **Get your Telegram User ID**:
    - Talk to [@userinfobot](https://t.me/userinfobot) to get your user ID
 
-4. **Get Chat ID** (for channel/group):
+4. **Get Chat ID** (for channels/groups):
    - For channels: Use [@getidsbot](https://t.me/getidsbot) or add the bot to your channel and use [@RawDataBot](https://t.me/RawDataBot)
    - For groups: Add the bot to the group and check the chat ID
    - You can also use channel username format (e.g., `@channelname`)
 
 5. **Configure the bot**:
    ```bash
-   cp telegram_bot.conf.example telegram_bot.conf
-   # Edit telegram_bot.conf with your settings:
-   # - bot_token: Your bot token from BotFather
-   # - owner_id: Your Telegram user ID
-   # - chat_id: Channel/group ID or @channelname
-   # - profile_name: Profile name to use (e.g., "tarado")
-   # - script_path: Path to nostr_media_uploader.sh (default: ./nostr_media_uploader.sh)
+   cp telegram_bot.yaml.example telegram_bot.yaml
+   # Edit telegram_bot.yaml with your settings
    ```
 
 6. **Run the bot**:
@@ -343,38 +347,85 @@ The repository includes a Telegram bot (`telegram_bot.py`) that can automaticall
    source venv/bin/activate  # On Cygwin/Windows: source venv/Scripts/activate
    pip install -r requirements.txt
    python3 telegram_bot.py
+   
+   # Option 3: Disable Firefox cookie support
+   python3 telegram_bot.py --no-firefox
+   
+   # Option 4: Use custom config file
+   python3 telegram_bot.py --config /path/to/custom_config.yaml
    ```
 
 ### Usage
 
 Once running, the bot will:
-- Monitor the specified channel/group
-- Process messages only from the owner (identified by `owner_id`)
+- Monitor configured channels/groups
+- Process messages only from the owner (identified by `owner_id`) or from configured channels
 - Extract URLs from messages
-- Extract any additional text after URLs
+- Download media files (photos, videos, documents) and process them
+- Extract any additional text after URLs or from captions
 - Execute: `./nostr_media_uploader.sh -p <profile_name> <url1> <url2> ... "<extra_text>"`
-- Send status updates back to Telegram
+- Send status updates back to Telegram with clickable Nostr links
 
-**Example**:
-- You post: `https://instagram.com/p/ABC123 hello world`
-- Bot executes: `./nostr_media_uploader.sh -p tarado "https://instagram.com/p/ABC123" "hello world"`
+**Examples**:
+- **URL with text**: You post `https://instagram.com/p/ABC123 hello world`
+  - Bot executes: `./nostr_media_uploader.sh -p tarado "https://instagram.com/p/ABC123" "hello world"`
+- **Photo with caption**: You send a photo with caption "Beautiful sunset"
+  - Bot downloads the photo and executes: `./nostr_media_uploader.sh -p tarado photo.jpg "Beautiful sunset"`
+- **Video file**: You send a video file
+  - Bot downloads the video and processes it with the uploader script
 
 ### Configuration
 
-The bot configuration file (`telegram_bot.conf`) uses INI format:
+The bot configuration file (`telegram_bot.yaml`) uses YAML format:
 
-```ini
-[telegram]
-bot_token = YOUR_BOT_TOKEN
-owner_id = YOUR_TELEGRAM_USER_ID
-chat_id = YOUR_CHAT_ID
-profile_name = tarado
-script_path = ./nostr_media_uploader.sh
+```yaml
+# Bot token from @BotFather
+bot_token: YOUR_BOT_TOKEN_HERE
+
+# Your Telegram user ID (get from @userinfobot)
+owner_id: YOUR_TELEGRAM_USER_ID
+
+# Path to nostr_media_uploader.sh script
+script_path: ./nostr_media_uploader.sh
+
+# Optional: Path to Cygwin installation (auto-detected if not specified)
+# cygwin_root: F:\cygwin64
+
+# Optional: Nostr client URL template for creating clickable links
+# nostr_client_url: https://snort.social/e/{nevent}
+
+# Channels configuration - each channel can have its own profile
+channels:
+  channel1:
+    chat_id: -1001234567890  # Numeric chat ID
+    profile_name: tarado
+  channel2:
+    chat_id: @channelname     # Channel username
+    profile_name: girino
 ```
+
+**Important Notes**:
+- Each channel **must** have a `profile_name` - there is no default profile
+- If no channels are configured, the bot will only process messages from the owner in private chats
+- Channel posts are only processed if the channel is configured in `channels`
+- You can use either numeric chat IDs or channel usernames (e.g., `@channelname`)
+
+### Configuration Reload
+
+You can reload the configuration without restarting the bot by sending `/reload` in a private chat with the bot. The bot will:
+- Reload the configuration file
+- Validate the new configuration
+- Report the number of configured channels
+- Continue running with the new settings
+
+### Command-Line Options
+
+- `--no-firefox`: Disable `--firefox` parameter when calling `nostr_media_uploader.sh`
+- `--config <path>`: Specify custom configuration file path (default: `telegram_bot.yaml`)
 
 You can also set the config file path via environment variable:
 ```bash
-export TELEGRAM_BOT_CONFIG=/path/to/telegram_bot.conf
+export TELEGRAM_BOT_CONFIG=/path/to/telegram_bot.yaml
 python3 telegram_bot.py
 ```
 
