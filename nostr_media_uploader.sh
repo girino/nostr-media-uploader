@@ -1802,7 +1802,8 @@ usage() {
 #   get_script_metadata_ret_history_file - history file path
 get_script_metadata() {
 	local PROFILE_PARAM="$1"
-	local HISTORY_FILE="${SCRIPT_DIR}/${PROFILE_PARAM}.history"
+	# History file is stored in the same directory as the env file (~/.nostr/${PROFILE_NAME})
+	local HISTORY_FILE="$HOME/.nostr/${PROFILE_PARAM}.history"
 	
 	get_script_metadata_ret_history_file="$HISTORY_FILE"
 }
