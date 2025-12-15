@@ -1953,7 +1953,18 @@ get_media_filename() {
 	local MEDIA_FILE="$1"
 	
 	if [[ "$MEDIA_FILE" =~ ^https?:// ]]; then
-		# It's a URL - normalize first to get clean URL
+		# It's a URL
+		# Special handling for Instagram story URLs with story_media_id parameter
+		if [[ "$MEDIA_FILE" =~ ^https?://.*instagram\.com/s/.*story_media_id=([^&]+) ]]; then
+			# Extract story_media_id value from URL
+			local STORY_MEDIA_ID=$(echo "$MEDIA_FILE" | sed -n 's/.*story_media_id=\([^&]*\).*/\1/p')
+			if [ -n "$STORY_MEDIA_ID" ]; then
+				echo "$STORY_MEDIA_ID"
+				return
+			fi
+		fi
+		
+		# For other URLs, normalize first to get clean URL
 		local normalized=$(normalize_media_url "$MEDIA_FILE")
 		# remove trailing "/" from URL if it exists
 		local TMP_FILE=$(echo "$normalized" | sed 's:/*$::')
@@ -2394,7 +2405,7 @@ calculate_file_hashes() {
 				FILE_HASH=$(sha256sum "$FILE" | awk '{print $1}')
 				# Check if file hash exists in history file
 				if check_history "$FILE_HASH" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
-					die "File hash already processed: $FILE"
+					die "File hash already processed: $FILE_HASH"
 				fi
 				# Add file hash to the array
 				FILE_HASHES+=("$FILE_HASH")
