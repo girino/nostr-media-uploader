@@ -1594,6 +1594,102 @@ download_images() {
 #   download_facebook_og_ret_source - source to set (empty if should keep current)
 #   download_facebook_og_ret_success - 0 on success, 1 on failure
 #   download_facebook_og_ret_error - error message if download failed (empty on success)
+resolve_mobile_shared_url() {
+	local MOBILE_SHARED_URL="$1"
+	local GALLERY_DL_PARAMS_STR="$2"
+	
+	# Return variables (global, set at end of function)
+	resolve_mobile_shared_url_ret_photo_url=""
+	resolve_mobile_shared_url_ret_success=1
+	resolve_mobile_shared_url_ret_error=""
+	
+	# Check if URL matches mobile shared format (multiple chars after /share/, not single letter paths like /r/, /v/, /p/)
+	if [[ ! "$MOBILE_SHARED_URL" =~ ^https?://(www\.)?facebook\.com/share/[A-Za-z0-9]{2,} ]]; then
+		resolve_mobile_shared_url_ret_error="URL does not match mobile shared format (facebook.com/share/... with multiple chars)"
+		return 1
+	fi
+	
+	echo "Processing mobile shared URL: $MOBILE_SHARED_URL"
+	
+	# Step 1: Use curl to get the redirect URL
+	echo "Step 1: Getting redirect URL with curl..."
+	local REDIRECT_URL=""
+	
+	# First try: Use curl -w to get the effective (final) URL after following redirects
+	REDIRECT_URL=$(curl -s -L -I -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$MOBILE_SHARED_URL" -o /dev/null -w "%{url_effective}" 2>/dev/null)
+	
+	# If that didn't work, try with verbose output to extract Location headers
+	if [ -z "$REDIRECT_URL" ] || [ "$REDIRECT_URL" = "$MOBILE_SHARED_URL" ]; then
+		# Use curl with -L to follow redirects and -v to see them, then extract final URL
+		local CURL_OUTPUT=$(curl -s -L -v -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$MOBILE_SHARED_URL" -o /dev/null 2>&1)
+		
+		# Extract the final URL from curl output (look for "< Location: " or final URL)
+		# curl shows redirects like: < Location: https://www.facebook.com/...
+		if [[ "$CURL_OUTPUT" =~ \<\ Location:\ ([^\r\n]+) ]]; then
+			REDIRECT_URL="${BASH_REMATCH[1]}"
+			# Remove trailing whitespace
+			REDIRECT_URL=$(echo "$REDIRECT_URL" | sed 's/[[:space:]]*$//')
+		fi
+		
+		# If no Location header found, try to extract from verbose output
+		if [ -z "$REDIRECT_URL" ]; then
+			# Look for "> GET" lines which show the final request
+			local LAST_GET_LINE=$(echo "$CURL_OUTPUT" | grep "> GET" | tail -1)
+			if [[ "$LAST_GET_LINE" =~ \>\ GET\ ([^\ ]+) ]]; then
+				local PATH_PART="${BASH_REMATCH[1]}"
+				REDIRECT_URL="https://www.facebook.com$PATH_PART"
+			fi
+		fi
+		
+		if [ -z "$REDIRECT_URL" ]; then
+			resolve_mobile_shared_url_ret_error="Could not determine redirect URL from curl output"
+			echo "Debug: curl output was:" >&2
+			echo "$CURL_OUTPUT" >&2
+			return 1
+		fi
+	fi
+	
+	echo "Redirect URL: $REDIRECT_URL"
+	
+	# Step 2: Try gallery-dl with -v --range 1 --no-download to see debug output
+	echo "Step 2: Running gallery-dl with debug output to find photo URL..."
+	
+	# Reconstruct GALLERY_DL_PARAMS array from string
+	local GALLERY_DL_PARAMS=()
+	eval "GALLERY_DL_PARAMS=($GALLERY_DL_PARAMS_STR)"
+	
+	# Run gallery-dl with verbose output and no download
+	local GALLERY_DL_OUTPUT=$(gallery-dl "${GALLERY_DL_PARAMS[@]}" -v --range 1 --no-download "$REDIRECT_URL" 2>&1)
+	local GALLERY_DL_EXIT_CODE=$?
+	
+	echo "gallery-dl debug output:" >&2
+	echo "$GALLERY_DL_OUTPUT" >&2
+	
+	# Step 3: Parse output to find photo URL
+	# Look for lines like:
+	# [urllib3.connectionpool][debug] https://www.facebook.com:443 "GET /photo/?fbid=25751404924484140&set=pcb.25751405024484130 HTTP/11" 200 None
+	local PHOTO_URL=""
+	
+	# Extract the last GET request that matches /photo/?fbid= pattern
+	local PHOTO_LINES=$(echo "$GALLERY_DL_OUTPUT" | grep -E 'GET /photo/\?fbid=[0-9]+&set=' | tail -1)
+	if [[ "$PHOTO_LINES" =~ GET\ (/photo/\?fbid=[0-9]+&set=[^\ ]+) ]]; then
+		local PHOTO_PATH="${BASH_REMATCH[1]}"
+		# Remove quotes if present
+		PHOTO_PATH=$(echo "$PHOTO_PATH" | sed 's/"//g')
+		PHOTO_URL="https://www.facebook.com$PHOTO_PATH"
+		echo "Found photo URL from debug output: $PHOTO_URL"
+	fi
+	
+	if [ -z "$PHOTO_URL" ]; then
+		resolve_mobile_shared_url_ret_error="Could not find photo URL in gallery-dl debug output"
+		return 1
+	fi
+	
+	resolve_mobile_shared_url_ret_photo_url="$PHOTO_URL"
+	resolve_mobile_shared_url_ret_success=0
+	return 0
+}
+
 download_facebook_og_image() {
 	local FACEBOOK_URL="$1"
 	local APPEND_ORIGINAL_COMMENT="$2"
@@ -1608,8 +1704,9 @@ download_facebook_og_image() {
 	download_facebook_og_ret_error=""
 	
 	# Check if URL matches Facebook patterns
-	if [[ ! "$FACEBOOK_URL" =~ ^https?://(www\.)?facebook\.com/(share/p/[^/]+|groups/[^/]+/permalink/[^/]+) ]]; then
-		download_facebook_og_ret_error="URL does not match Facebook share/p or groups/permalink pattern"
+	# Accept: share/p/..., groups/.../permalink/..., and share/[A-Za-z0-9]{2,} (mobile shared)
+	if [[ ! "$FACEBOOK_URL" =~ ^https?://(www\.)?facebook\.com/(share/p/[^/]+|groups/[^/]+/permalink/[^/]+|share/[A-Za-z0-9]{2,}) ]]; then
+		download_facebook_og_ret_error="URL does not match Facebook share/p, groups/permalink, or mobile share pattern"
 		return 1
 	fi
 	
@@ -2540,6 +2637,15 @@ process_media_items() {
 				SKIP_VIDEO_DOWNLOAD=1
 			fi
 			
+			# Check for mobile shared URLs (bypass yt-dlp as it downloads ads with cookies)
+			# Format: https://www.facebook.com/share/********* (multiple chars after /share/)
+			# But NOT: https://www.facebook.com/share/r/... or /v/... or /p/... (single letter paths)
+			# Pattern: /share/ followed by 2+ alphanumeric chars (not a single letter + slash)
+			if [[ "$MEDIA_ITEM" =~ ^https?://(www\.)?facebook\.com/share/[A-Za-z0-9]{2,} ]]; then
+				echo "URL is a mobile shared link (multiple chars after /share/), skipping video download to avoid ads"
+				SKIP_VIDEO_DOWNLOAD=1
+			fi
+			
 			if [ $SKIP_VIDEO_DOWNLOAD -eq 0 ]; then
 				# Pass empty string for description to prevent per-file replication
 				download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$COOKIES_FILE" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "" "$SOURCE_CANDIDATE"
@@ -2576,7 +2682,97 @@ process_media_items() {
 				# If files array is empty or only has the original incompatible file, conversion likely failed
 				# Only try gallery-dl if no files were successfully processed (download failed)
 				if [ ${#download_video_ret_files[@]} -eq 0 ]; then
-					# No files were successfully processed - try gallery-dl as fallback
+					# No files were successfully processed - check if it's a mobile shared URL first
+					local MOBILE_SHARED_RESOLVED=0
+					local ORIGINAL_MEDIA_ITEM="$MEDIA_ITEM"  # Save original URL
+					# Check for mobile shared URLs (multiple chars after /share/, not single letter paths like /r/, /v/, /p/)
+					if [[ "$MEDIA_ITEM" =~ ^https?://(www\.)?facebook\.com/share/[A-Za-z0-9]{2,} ]]; then
+						echo "Video download failed, detected mobile shared URL, attempting to resolve..."
+						
+						# Initialize return variables
+						resolve_mobile_shared_url_ret_photo_url=""
+						resolve_mobile_shared_url_ret_success=1
+						resolve_mobile_shared_url_ret_error=""
+						
+						# Call mobile shared URL resolution function
+						resolve_mobile_shared_url "$MEDIA_ITEM" "$GALLERY_DL_PARAMS_STR_LOCAL"
+						local MOBILE_RESOLVE_RESULT="${resolve_mobile_shared_url_ret_success:-1}"
+						
+						if [ "$MOBILE_RESOLVE_RESULT" -eq 0 ] && [ -n "$resolve_mobile_shared_url_ret_photo_url" ]; then
+							# Successfully resolved to photo URL - check if it has set=a. or set=gm. pattern
+							echo "Resolved mobile shared URL to: $resolve_mobile_shared_url_ret_photo_url"
+							
+							# Check if resolved URL has set=a. or set=gm. pattern (gallery-dl won't work with these)
+							if [[ "$resolve_mobile_shared_url_ret_photo_url" =~ set=(a|gm)\.[0-9]+ ]]; then
+								echo "Resolved URL has set=a. or set=gm. pattern, using Facebook OG image download with original URL instead of gallery-dl"
+								
+								# Initialize return variables
+								download_facebook_og_ret_files=()
+								download_facebook_og_ret_captions=()
+								download_facebook_og_ret_source=""
+								download_facebook_og_ret_success=1
+								download_facebook_og_ret_error=""
+								
+								# Call Facebook OG image download function with ORIGINAL mobile shared URL
+								download_facebook_og_image "$ORIGINAL_MEDIA_ITEM" "$APPEND_ORIGINAL_COMMENT" "" "$SOURCE_CANDIDATE"
+								local FACEBOOK_OG_RESULT="${download_facebook_og_ret_success:-1}"
+								
+								if [ "$FACEBOOK_OG_RESULT" -eq 0 ]; then
+									# Success - add files to processed arrays
+									if [ ${#download_facebook_og_ret_files[@]} -gt 0 ]; then
+										for file in "${download_facebook_og_ret_files[@]}"; do
+											PROCESSED_FILES+=("$file")
+											# Add the downloaded file to cleanup list
+											add_to_cleanup "$file"
+										done
+										
+										# Add captions
+										for caption in "${download_facebook_og_ret_captions[@]}"; do
+											FILE_CAPTIONS+=("$caption")
+										done
+										
+										# Add gallery IDs (single image, so same gallery ID)
+										for file in "${download_facebook_og_ret_files[@]}"; do
+											FILE_GALLERIES+=("$GALLERY_ID")
+										done
+										
+										# Update source if provided
+										if [ -n "$download_facebook_og_ret_source" ]; then
+											cleaned_source=$(cleanup_source_url "$download_facebook_og_ret_source")
+											FILE_SOURCES+=("$cleaned_source")
+										fi
+										
+										((GALLERY_ID++))
+										echo "Successfully downloaded Facebook image using OG method from resolved mobile shared URL"
+										# Skip gallery-dl attempt since we already succeeded - continue to next media item
+										continue
+									else
+										if [ -n "$download_facebook_og_ret_error" ]; then
+											echo "Warning: Facebook OG download returned success but no files: $download_facebook_og_ret_error" >&2
+										fi
+										# Fall through to try gallery-dl
+									fi
+								else
+									# Facebook OG download failed
+									if [ -n "$download_facebook_og_ret_error" ]; then
+										echo "Warning: Facebook OG download failed: $download_facebook_og_ret_error" >&2
+									fi
+									# Fall through to try gallery-dl
+								fi
+							else
+								# No set=a./set=gm. pattern, use resolved URL for gallery-dl
+								MEDIA_ITEM="$resolve_mobile_shared_url_ret_photo_url"
+								MOBILE_SHARED_RESOLVED=1
+							fi
+						else
+							# Mobile shared URL resolution failed
+							if [ -n "$resolve_mobile_shared_url_ret_error" ]; then
+								echo "Warning: Mobile shared URL resolution failed: $resolve_mobile_shared_url_ret_error" >&2
+							fi
+						fi
+					fi
+					
+					# Try gallery-dl as fallback (with resolved URL if mobile shared was resolved)
 					echo "Video download/processing failed, trying gallery-dl for images"
 					# Initialize return variables (these are global return variables, not local)
 					download_images_ret_files=()
@@ -2638,8 +2834,8 @@ process_media_items() {
 							download_facebook_og_ret_success=1
 							download_facebook_og_ret_error=""
 							
-							# Call Facebook OG image download function
-							download_facebook_og_image "$MEDIA_ITEM" "$APPEND_ORIGINAL_COMMENT" "" "$SOURCE_CANDIDATE"
+							# Call Facebook OG image download function with ORIGINAL mobile shared URL
+							download_facebook_og_image "$ORIGINAL_MEDIA_ITEM" "$APPEND_ORIGINAL_COMMENT" "" "$SOURCE_CANDIDATE"
 							local FACEBOOK_OG_RESULT="${download_facebook_og_ret_success:-1}"
 							
 							if [ "$FACEBOOK_OG_RESULT" -eq 0 ]; then
