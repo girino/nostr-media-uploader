@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  telegram-bot:
+    build: .
+    container_name: nostr-telegram-bot
+    restart: unless-stopped
+    
+    # Mount .nostr directory from host to container
+    volumes:
+      - ${HOME}/.nostr:/root/.nostr:ro
+      # Mount firefox_cookies.txt
+      - ./firefox_cookies.txt:/app/firefox_cookies.txt:ro
+      # Mount telegram_bot.yaml config file
+      - ./telegram_bot.yaml:/app/telegram_bot.yaml:ro
+      # Mount nostr_media_uploader.sh and other scripts (needed by the bot)
+      # These override the copies in the image, allowing updates without rebuild
+      - ./nostr_media_uploader.sh:/app/nostr_media_uploader.sh:ro
+      - ./image_uploader.sh:/app/image_uploader.sh:ro
+      - ./aiart.sh:/app/aiart.sh:ro
+    
+    # Pass cookies file as command line parameter
+    command: python telegram_bot.py --cookies /app/firefox_cookies.txt
+    
+    # Environment variables
+    environment:
+      - TELEGRAM_BOT_CONFIG=/app/telegram_bot.yaml
+    
+    # Keep container running
+    stdin_open: true
+    tty: true
+

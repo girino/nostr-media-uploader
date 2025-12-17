@@ -1,0 +1,67 @@
+# Build stage: Build nak using Go (requires Go >= 1.25)
+FROM golang:1.25 AS nak-builder
+
+WORKDIR /build
+
+# Build nak from source
+RUN go install github.com/fiatjaf/nak@latest
+
+# Final stage: Python runtime with all dependencies
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies required by nostr_media_uploader.sh
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    curl \
+    ffmpeg \
+    jq \
+    file \
+    coreutils \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies for telegram bot
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Python dependencies for nostr_media_uploader.sh
+# gallery-dl requires >= 1.30.6 for Facebook support
+# yt-dlp for video downloads
+RUN pip install --no-cache-dir \
+    gallery-dl==1.30.6 \
+    yt-dlp
+
+# Copy nak binary from build stage
+COPY --from=nak-builder /go/bin/nak /usr/local/bin/nak
+RUN chmod +x /usr/local/bin/nak
+
+# Copy telegram bot script
+COPY telegram_bot.py .
+
+# Copy nostr_media_uploader.sh and make it executable
+COPY nostr_media_uploader.sh .
+RUN chmod +x nostr_media_uploader.sh
+
+# Copy other scripts that might be needed
+COPY image_uploader.sh .
+COPY aiart.sh .
+RUN chmod +x image_uploader.sh aiart.sh
+
+# Create directory for .nostr configs (will be mounted)
+RUN mkdir -p /root/.nostr
+
+# Verify installations
+RUN gallery-dl --version && \
+    yt-dlp --version && \
+    ffmpeg -version | head -n 1 && \
+    jq --version && \
+    file --version | head -n 1 && \
+    nak --version && \
+    echo "All dependencies installed successfully"
+
+# Set default command
+CMD ["python", "telegram_bot.py"]
+

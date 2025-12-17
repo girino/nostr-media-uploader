@@ -644,6 +644,8 @@ async def execute_script(cmd, cwd=None):
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = subprocess.SW_HIDE
         
+        # Execute subprocess (works on both Windows and Linux)
+        if os.name == 'nt':
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -651,8 +653,15 @@ async def execute_script(cmd, cwd=None):
                 cwd=cwd or Path(__file__).parent,
                 startupinfo=startupinfo
             )
-            
-            stdout_bytes, stderr_bytes = await process.communicate()
+        else:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd or Path(__file__).parent
+            )
+        
+        stdout_bytes, stderr_bytes = await process.communicate()
         
         # Decode bytes to strings
         stdout = stdout_bytes.decode('utf-8', errors='replace') if stdout_bytes else ''

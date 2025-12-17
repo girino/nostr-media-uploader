@@ -1102,7 +1102,16 @@ download_video() {
 	local YT_DLP_OPTS=()
 	if [ -n "$COOKIES_FILE" ]; then
 		# Use cookie file if provided (takes precedence over --firefox)
-		local WIN_COOKIES_FILE=$(convert_path_for_tool "$COOKIES_FILE")
+		# If cookies file is read-only, copy it to a writable temp location
+		# (yt-dlp tries to save cookies back to the file)
+		local COOKIES_FILE_TO_USE="$COOKIES_FILE"
+		if [ -f "$COOKIES_FILE" ] && [ ! -w "$COOKIES_FILE" ]; then
+			local TEMP_COOKIES=$(mktemp /tmp/cookies_XXXXXXXX.txt)
+			cp "$COOKIES_FILE" "$TEMP_COOKIES"
+			add_to_cleanup "$TEMP_COOKIES"
+			COOKIES_FILE_TO_USE="$TEMP_COOKIES"
+		fi
+		local WIN_COOKIES_FILE=$(convert_path_for_tool "$COOKIES_FILE_TO_USE")
 		YT_DLP_OPTS+=(--cookies "$WIN_COOKIES_FILE")
 	elif [ "$USE_COOKIES_FF" -eq 1 ]; then
 		YT_DLP_OPTS+=(--cookies-from-browser firefox)
@@ -2177,7 +2186,16 @@ prepare_gallery_dl_params() {
 	local GALLERY_DL_PARAMS=()
 	if [ -n "$COOKIES_FILE" ]; then
 		# Use cookie file if provided (takes precedence over --firefox)
-		local WIN_COOKIES_FILE=$(convert_path_for_tool "$COOKIES_FILE")
+		# If cookies file is read-only, copy it to a writable temp location
+		# (gallery-dl may try to save cookies back to the file)
+		local COOKIES_FILE_TO_USE="$COOKIES_FILE"
+		if [ -f "$COOKIES_FILE" ] && [ ! -w "$COOKIES_FILE" ]; then
+			local TEMP_COOKIES=$(mktemp /tmp/cookies_XXXXXXXX.txt)
+			cp "$COOKIES_FILE" "$TEMP_COOKIES"
+			add_to_cleanup "$TEMP_COOKIES"
+			COOKIES_FILE_TO_USE="$TEMP_COOKIES"
+		fi
+		local WIN_COOKIES_FILE=$(convert_path_for_tool "$COOKIES_FILE_TO_USE")
 		GALLERY_DL_PARAMS+=(--cookies "$WIN_COOKIES_FILE")
 	elif [ "$USE_COOKIES_FF" -eq 1 ]; then
 		GALLERY_DL_PARAMS+=(--cookies-from-browser firefox)
