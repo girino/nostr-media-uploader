@@ -46,6 +46,7 @@ If you need different functionality or have questions, please adapt the code you
 - **Gallery Support**: Handles multi-image galleries with intelligent caption placement
 - **Facebook URL Processing**: Advanced Facebook URL handling with position inference
 - **Cookie Support**: Optional Firefox cookie integration for authenticated downloads
+- **Cookies File Support**: Use custom cookies files (Mozilla/Netscape format) for authenticated downloads
 - **Error Recovery**: Robust error handling with automatic server fallback
 - **Environment Configuration**: Flexible configuration via environment files or profiles
 
@@ -139,6 +140,7 @@ For detailed installation instructions, see [INSTALLATION.md](INSTALLATION.md).
 - `--nocheck`: Disable hash check (allows re-uploading)
 - `--comment` / `--nocomment`: Enable/disable original captions (default: enabled)
 - `--firefox`: Use Firefox cookies for authenticated downloads
+- `--cookies <file>`: Use cookies from specified file (Mozilla/Netscape format). Takes precedence over `--firefox`
 - `--source` / `--nosource`: Show/hide source URLs in posts
 - `--password <password>`: Provide password for encrypted keys
 - `--max-file-search <number>`: Maximum files to search when inferring Facebook image positions
@@ -149,6 +151,11 @@ For detailed installation instructions, see [INSTALLATION.md](INSTALLATION.md).
 #### Video Upload with Firefox Cookies
 ```bash
 ./nostr_media_uploader.sh -firefox https://web.facebook.com/reel/1174103824690243
+```
+
+#### Video Upload with Cookies File
+```bash
+./nostr_media_uploader.sh --cookies firefox_cookies.txt https://web.facebook.com/reel/1174103824690243
 ```
 
 #### Upload Without Relay Broadcast
@@ -219,6 +226,7 @@ See [example_env](example_env) for a complete configuration template.
 - **`DISPLAY_SOURCE`**: Show source URLs in posts (0/1, default: 0)
 - **`POW_DIFF`**: Proof of work difficulty (default: 20)
 - **`USE_COOKIES_FF`**: Use Firefox cookies by default (0/1, default: 0)
+- **`COOKIES_FILE`**: Path to cookies file (Mozilla/Netscape format). If set, takes precedence over `USE_COOKIES_FF` and `--firefox` option
 - **`APPEND_ORIGINAL_COMMENT`**: Append original captions (0/1, default: 1)
 
 ## Platform Support
@@ -254,6 +262,81 @@ The script automatically detects available hardware and selects the best encoder
 The script maintains a history file (`${SCRIPT_NAME%.*}.history`) in the script directory to prevent duplicate uploads. Hashes of processed files and URLs are stored to avoid re-processing.
 
 To disable history checking, use the `--nocheck` option.
+
+## Cookie Management
+
+The script supports using cookies for authenticated downloads from social media platforms. You can use cookies in three ways:
+
+### 1. Firefox Browser Cookies (Automatic)
+
+Use the `--firefox` flag to automatically extract cookies from your Firefox browser:
+
+```bash
+./nostr_media_uploader.sh --firefox https://web.facebook.com/reel/1234567890
+```
+
+Or set `USE_COOKIES_FF=1` in your configuration file to enable by default.
+
+### 2. Cookies File (Recommended)
+
+You can extract cookies from Firefox and save them to a file for reuse. This is useful for:
+- Sharing cookies across multiple scripts
+- Using cookies without having Firefox running
+- Better control over cookie management
+
+**Extract cookies from Firefox:**
+
+A Python script (`extract_firefox_cookies.py`) is provided to extract all cookies from Firefox:
+
+```bash
+# Extract cookies to default file (firefox_cookies.txt)
+python extract_firefox_cookies.py
+
+# Extract cookies to custom file
+python extract_firefox_cookies.py my_cookies.txt
+```
+
+The script will:
+- Automatically find your Firefox profile
+- Extract all cookies from the cookies database
+- Save them in Mozilla/Netscape cookie format
+
+**Use cookies file:**
+
+```bash
+# Via command line
+./nostr_media_uploader.sh --cookies firefox_cookies.txt https://example.com/media
+
+# Via environment variable
+export COOKIES_FILE=./firefox_cookies.txt
+./nostr_media_uploader.sh https://example.com/media
+
+# Via configuration file
+# Add to ~/.nostr/nostr_media_uploader:
+COOKIES_FILE="./firefox_cookies.txt"
+```
+
+**Priority order:**
+1. Command line `--cookies` (highest priority)
+2. Environment variable `COOKIES_FILE`
+3. Configuration file `COOKIES_FILE`
+4. Command line `--firefox`
+5. Configuration file `USE_COOKIES_FF`
+
+If `COOKIES_FILE` is set (via env var or config), the `--firefox` option will be ignored.
+
+### 3. Cookie File Format
+
+The cookies file must be in Mozilla/Netscape cookie format:
+
+```
+# Netscape HTTP Cookie File
+# This is a generated file! Do not edit.
+
+.domain.com	TRUE	/path	FALSE	1234567890	cookie_name	cookie_value
+```
+
+The format is: `domain`, `flag`, `path`, `secure`, `expiration`, `name`, `value` (tab-separated).
 
 ## Troubleshooting
 
@@ -309,6 +392,7 @@ The repository includes a Telegram bot (`telegram_bot.py`) that can automaticall
 - **URL Processing**: Extracts and processes URLs from messages
 - **Configuration Reload**: Use `/reload` command in private chat to reload configuration without restarting
 - **Firefox Cookie Support**: Optional `--firefox` flag support (can be disabled with `--no-firefox`)
+- **Cookies File Support**: Use custom cookies files via `--cookies` option or `cookies_file` config setting
 - **Cross-Platform**: Works on Linux, Cygwin/Windows, and macOS
 
 ### Setup
@@ -391,6 +475,10 @@ script_path: ./nostr_media_uploader.sh
 # Optional: Path to Cygwin installation (auto-detected if not specified)
 # cygwin_root: F:\cygwin64
 
+# Optional: Path to cookies file (Mozilla/Netscape format)
+# If specified, will use --cookies option instead of --firefox
+# cookies_file: ./firefox_cookies.txt
+
 # Optional: Nostr client URL template for creating clickable links
 # nostr_client_url: https://snort.social/e/{nevent}
 
@@ -421,6 +509,7 @@ You can reload the configuration without restarting the bot by sending `/reload`
 ### Command-Line Options
 
 - `--no-firefox`: Disable `--firefox` parameter when calling `nostr_media_uploader.sh`
+- `--cookies <file>` / `--cookies-file <file>`: Use cookies from specified file (Mozilla/Netscape format). Takes precedence over `--firefox`
 - `--config <path>`: Specify custom configuration file path (default: `telegram_bot.yaml`)
 
 You can also set the config file path via environment variable:

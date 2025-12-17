@@ -1048,10 +1048,11 @@ convert_video_with_encoder() {
 #   $2: HISTORY_FILE - path to history file
 #   $3: CONVERT_VIDEO - 1 to convert, 0 otherwise
 #   $4: USE_COOKIES_FF - 1 to use Firefox cookies, 0 otherwise
-#   $5: APPEND_ORIGINAL_COMMENT - 1 to append, 0 otherwise
-#   $6: DISABLE_HASH_CHECK - 1 to disable, 0 otherwise
-#   $7: DESCRIPTION_CANDIDATE - current description candidate
-#   $8: SOURCE_CANDIDATE - current source candidate
+#   $5: COOKIES_FILE - path to cookies file (empty if not provided)
+#   $6: APPEND_ORIGINAL_COMMENT - 1 to append, 0 otherwise
+#   $7: DISABLE_HASH_CHECK - 1 to disable, 0 otherwise
+#   $8: DESCRIPTION_CANDIDATE - current description candidate
+#   $9: SOURCE_CANDIDATE - current source candidate
 # Return variables (set at end of function):
 #   download_video_ret_files - array of downloaded files
 #   download_video_ret_captions - array of captions (one per file, empty string if no caption)
@@ -1062,10 +1063,11 @@ download_video() {
 	local HISTORY_FILE="$2"
 	local CONVERT_VIDEO="$3"
 	local USE_COOKIES_FF="$4"
-	local APPEND_ORIGINAL_COMMENT="$5"
-	local DISABLE_HASH_CHECK="$6"
-	local DESCRIPTION_CANDIDATE="$7"
-	local SOURCE_CANDIDATE="$8"
+	local COOKIES_FILE="$5"
+	local APPEND_ORIGINAL_COMMENT="$6"
+	local DISABLE_HASH_CHECK="$7"
+	local DESCRIPTION_CANDIDATE="$8"
+	local SOURCE_CANDIDATE="$9"
 	
 	local DOWNLOADED=0
 	# Return variables (global, set at end of function)
@@ -1098,7 +1100,11 @@ download_video() {
 	fi
 	
 	local YT_DLP_OPTS=()
-	if [ "$USE_COOKIES_FF" -eq 1 ]; then
+	if [ -n "$COOKIES_FILE" ]; then
+		# Use cookie file if provided (takes precedence over --firefox)
+		local WIN_COOKIES_FILE=$(convert_path_for_tool "$COOKIES_FILE")
+		YT_DLP_OPTS+=(--cookies "$WIN_COOKIES_FILE")
+	elif [ "$USE_COOKIES_FF" -eq 1 ]; then
 		YT_DLP_OPTS+=(--cookies-from-browser firefox)
 	fi
 	
@@ -2039,6 +2045,9 @@ usage() {
 	echo "  -h, --help        Show this help message and exit"
 	echo "  -p, --profile     Override config and history file names with specified profile"
 	echo "                    If not specified, uses script filename to determine profile name"
+	echo "  -cookies, --cookies FILE  Use cookies from specified file (Mozilla/Netscape format)"
+	echo "                    Takes precedence over --firefox option"
+	echo "  --firefox         Use cookies from Firefox browser"
 	echo
 	echo "Arguments:"
 	echo "  file|url          One or more paths to image or video files, or URLs to download videos"
@@ -2158,13 +2167,19 @@ fi
 # Function to prepare gallery-dl parameters
 # Parameters:
 #   $1: USE_COOKIES_FF - 1 to use Firefox cookies, 0 otherwise
+#   $2: COOKIES_FILE - path to cookies file (empty if not provided)
 # Return variables:
 #   prepare_gallery_dl_params_ret_params - serialized array of gallery-dl parameters
 prepare_gallery_dl_params() {
 	local USE_COOKIES_FF="$1"
+	local COOKIES_FILE="$2"
 	
 	local GALLERY_DL_PARAMS=()
-	if [ "$USE_COOKIES_FF" -eq 1 ]; then
+	if [ -n "$COOKIES_FILE" ]; then
+		# Use cookie file if provided (takes precedence over --firefox)
+		local WIN_COOKIES_FILE=$(convert_path_for_tool "$COOKIES_FILE")
+		GALLERY_DL_PARAMS+=(--cookies "$WIN_COOKIES_FILE")
+	elif [ "$USE_COOKIES_FF" -eq 1 ]; then
 		GALLERY_DL_PARAMS+=(--cookies-from-browser firefox)
 	fi
 	GALLERY_DL_PARAMS+=(--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0")
@@ -2184,6 +2199,7 @@ prepare_gallery_dl_params() {
 #   parse_command_line_ret_pow_diff - proof of work difficulty
 #   parse_command_line_ret_append_original_comment - 1 to append, 0 otherwise
 #   parse_command_line_ret_use_cookies_ff - 1 to use Firefox cookies, 0 otherwise
+#   parse_command_line_ret_cookies_file - path to cookies file (empty if not provided)
 #   parse_command_line_ret_display_source - 1 to display, 0 otherwise
 #   parse_command_line_ret_password - password value
 #   parse_command_line_ret_description_candidate - description text
@@ -2200,6 +2216,7 @@ parse_command_line() {
 	local POW_DIFF=20
 	local APPEND_ORIGINAL_COMMENT=1
 	local USE_COOKIES_FF=0
+	local COOKIES_FILE=""
 	local DISPLAY_SOURCE=0
 	local PASSWORD=""
 	local PROFILE_NAME=""
@@ -2256,6 +2273,17 @@ while (( "$#" )); do
 		APPEND_ORIGINAL_COMMENT=0
 	elif [[ "$PARAM" == "--firefox" || "$PARAM" == "-firefox" ]]; then
 		USE_COOKIES_FF=1
+	elif [[ "$PARAM" == "--cookies" || "$PARAM" == "-cookies" ]]; then
+		COOKIES_FILE="$2"
+		if [ -z "$COOKIES_FILE" ]; then
+			echo "Cookie file path is required after --cookies option"
+			exit 1
+		fi
+		if [ ! -f "$COOKIES_FILE" ]; then
+			echo "Cookie file does not exist: $COOKIES_FILE"
+			exit 1
+		fi
+		shift  # shift to remove the cookie file path from the params
 	elif [[ "$PARAM" == "--source" || "$PARAM" == "-source" ]]; then
 		DISPLAY_SOURCE=1
 	elif [[ "$PARAM" == "--nosource" || "$PARAM" == "-nosource" ]]; then
@@ -2328,6 +2356,7 @@ fi
 	parse_command_line_ret_pow_diff="$POW_DIFF"
 	parse_command_line_ret_append_original_comment="$APPEND_ORIGINAL_COMMENT"
 	parse_command_line_ret_use_cookies_ff="$USE_COOKIES_FF"
+	parse_command_line_ret_cookies_file="$COOKIES_FILE"
 	parse_command_line_ret_display_source="$DISPLAY_SOURCE"
 	parse_command_line_ret_password="$PASSWORD"
 	parse_command_line_ret_description_candidate="$DESCRIPTION_CANDIDATE"
@@ -2422,12 +2451,13 @@ done
 #   $2: HISTORY_FILE - path to history file
 #   $3: CONVERT_VIDEO - 1 to convert, 0 otherwise
 #   $4: USE_COOKIES_FF - 1 to use Firefox cookies, 0 otherwise
-#   $5: APPEND_ORIGINAL_COMMENT - 1 to append, 0 otherwise
-#   $6: DISABLE_HASH_CHECK - 1 to disable, 0 otherwise
-#   $7: DESCRIPTION_CANDIDATE - description text
-#   $8: SOURCE_CANDIDATE - source text
-#   $9: GALLERY_DL_PARAMS_STR - serialized array of gallery-dl parameters
-#   $10: MAX_FILE_SEARCH - maximum files to search
+#   $5: COOKIES_FILE - path to cookies file (empty if not provided)
+#   $6: APPEND_ORIGINAL_COMMENT - 1 to append, 0 otherwise
+#   $7: DISABLE_HASH_CHECK - 1 to disable, 0 otherwise
+#   $8: DESCRIPTION_CANDIDATE - description text
+#   $9: SOURCE_CANDIDATE - source text
+#   $10: GALLERY_DL_PARAMS_STR - serialized array of gallery-dl parameters
+#   $11: MAX_FILE_SEARCH - maximum files to search
 # Return variables:
 #   process_media_items_ret_files - serialized array of processed files
 #   process_media_items_ret_captions - serialized array of captions
@@ -2438,12 +2468,13 @@ process_media_items() {
 	local HISTORY_FILE="$2"
 	local CONVERT_VIDEO="$3"
 	local USE_COOKIES_FF="$4"
-	local APPEND_ORIGINAL_COMMENT="$5"
-	local DISABLE_HASH_CHECK="$6"
-	local DESCRIPTION_CANDIDATE="$7"
-	local SOURCE_CANDIDATE="$8"
-	local GALLERY_DL_PARAMS_STR="$9"
-	local MAX_FILE_SEARCH="${10}"
+	local COOKIES_FILE="$5"
+	local APPEND_ORIGINAL_COMMENT="$6"
+	local DISABLE_HASH_CHECK="$7"
+	local DESCRIPTION_CANDIDATE="$8"
+	local SOURCE_CANDIDATE="$9"
+	local GALLERY_DL_PARAMS_STR="${10}"
+	local MAX_FILE_SEARCH="${11}"
 	
 	# Deserialize arrays
 	local ALL_MEDIA_FILES=()
@@ -2493,7 +2524,7 @@ process_media_items() {
 			
 			if [ $SKIP_VIDEO_DOWNLOAD -eq 0 ]; then
 				# Pass empty string for description to prevent per-file replication
-				download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "" "$SOURCE_CANDIDATE"
+				download_video "$MEDIA_ITEM" "$HISTORY_FILE" "$CONVERT_VIDEO" "$USE_COOKIES_FF" "$COOKIES_FILE" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" "" "$SOURCE_CANDIDATE"
 			fi
 			local VIDEO_DOWNLOAD_RESULT="${download_video_ret_success:-1}"
 		
@@ -2983,7 +3014,8 @@ main() {
 	# PREPARE GALLERY-DL PARAMS
 	# ========================================================================
 	local GALLERY_DL_PARAMS_STR
-	prepare_gallery_dl_params "$USE_COOKIES_FF"
+	# COOKIES_FILE is already set in the merge section above
+	prepare_gallery_dl_params "$USE_COOKIES_FF" "$COOKIES_FILE"
 	GALLERY_DL_PARAMS_STR="$prepare_gallery_dl_params_ret_params"
 	
 	# ========================================================================
@@ -2994,7 +3026,7 @@ main() {
 	local FILE_SOURCES_STR
 	local FILE_GALLERIES_STR
 	process_media_items "$ALL_MEDIA_FILES_STR" "$HISTORY_FILE" "$CONVERT_VIDEO" \
-		"$USE_COOKIES_FF" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" \
+		"$USE_COOKIES_FF" "$COOKIES_FILE" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" \
 		"$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE" "$GALLERY_DL_PARAMS_STR" \
 		"$MAX_FILE_SEARCH"
 	PROCESSED_FILES_STR="$process_media_items_ret_files"
@@ -3060,6 +3092,7 @@ PARSED_MAX_FILE_SEARCH="$parse_command_line_ret_max_file_search"
 PARSED_POW_DIFF="$parse_command_line_ret_pow_diff"
 PARSED_APPEND_ORIGINAL_COMMENT="$parse_command_line_ret_append_original_comment"
 PARSED_USE_COOKIES_FF="$parse_command_line_ret_use_cookies_ff"
+PARSED_COOKIES_FILE="$parse_command_line_ret_cookies_file"
 PARSED_DISPLAY_SOURCE="$parse_command_line_ret_display_source"
 PARSED_PASSWORD="$parse_command_line_ret_password"
 PARSED_DESCRIPTION_CANDIDATE="$parse_command_line_ret_description_candidate"
@@ -3134,11 +3167,23 @@ else
 	APPEND_ORIGINAL_COMMENT="${APPEND_ORIGINAL_COMMENT:-$PARSED_APPEND_ORIGINAL_COMMENT}"
 fi
 
-# USE_COOKIES_FF: default is 0, if parsed is 1, it was explicitly set (--firefox)
-if [ "$PARSED_USE_COOKIES_FF" -eq 1 ]; then
-	USE_COOKIES_FF=1
+# COOKIES_FILE: command line takes precedence, then env var
+# If COOKIES_FILE is set (from env or command line), it takes precedence over USE_COOKIES_FF
+COOKIES_FILE="${PARSED_COOKIES_FILE:-${COOKIES_FILE:-}}"
+if [ -n "$COOKIES_FILE" ]; then
+	# Cookies file is set, disable USE_COOKIES_FF and ignore --firefox
+	USE_COOKIES_FF=0
+	if [ "$PARSED_USE_COOKIES_FF" -eq 1 ]; then
+		echo "Ignoring --firefox option because COOKIES_FILE is set" >&2
+	fi
 else
-	USE_COOKIES_FF="${USE_COOKIES_FF:-$PARSED_USE_COOKIES_FF}"
+	# No cookies file, use USE_COOKIES_FF logic
+	# USE_COOKIES_FF: default is 0, if parsed is 1, it was explicitly set (--firefox)
+	if [ "$PARSED_USE_COOKIES_FF" -eq 1 ]; then
+		USE_COOKIES_FF=1
+	else
+		USE_COOKIES_FF="${USE_COOKIES_FF:-$PARSED_USE_COOKIES_FF}"
+	fi
 fi
 
 # DISPLAY_SOURCE: default is 0, if parsed is 1, it was explicitly set (--source)

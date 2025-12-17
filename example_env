@@ -65,6 +65,11 @@ NSEC_KEY="nsec1..."
 # Default: 0 (can also use --firefox flag on command line)
 # USE_COOKIES_FF=0
 
+# Path to cookies file (Mozilla/Netscape format)
+# If set, will use --cookies option instead of --firefox
+# Takes precedence over --firefox command line option and USE_COOKIES_FF
+# COOKIES_FILE="./firefox_cookies.txt"
+
 # Disable sending events to relays (useful for testing)
 # Default: 1 (send to relays)
 # Set SEND_TO_RELAY=0, NO_RELAY=1, or DISABLE_RELAY=1 to disable

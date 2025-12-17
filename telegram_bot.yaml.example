@@ -10,6 +10,11 @@ owner_id: YOUR_TELEGRAM_USER_ID
 # Path to nostr_media_uploader.sh script
 script_path: ./nostr_media_uploader.sh
 
+# Optional: Path to cookies file (Mozilla/Netscape format)
+# If specified, will use --cookies option instead of --firefox when calling nostr_media_uploader.sh
+# Takes precedence over --firefox option
+# cookies_file: ./firefox_cookies.txt
+
 # Optional: Path to Cygwin installation (e.g., C:\cygwin64 or F:\cygwin64)
 # If not specified, will try to auto-detect common locations
 # cygwin_root: F:\cygwin64

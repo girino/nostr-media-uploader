@@ -33,13 +33,14 @@ URL_PATTERN = re.compile(
 )
 
 
-def load_config(config_path, use_firefox=True):
+def load_config(config_path, use_firefox=True, cookies_file=None):
     """Load configuration from YAML file.
     
     Expected structure:
     bot_token: YOUR_BOT_TOKEN
     owner_id: YOUR_USER_ID
     script_path: ./nostr_media_uploader.sh
+    cookies_file: /path/to/cookies.txt  # Optional: path to cookies file (Mozilla format)
     channels:
       channel1:
         chat_id: -1001234567890
@@ -64,6 +65,17 @@ def load_config(config_path, use_firefox=True):
     if 'owner_id' not in config_data:
         raise ValueError("owner_id is required in configuration")
     
+    # Get cookies_file from config if not provided via command line
+    # Command line takes precedence
+    config_cookies_file = config_data.get('cookies_file')
+    if cookies_file is None:
+        cookies_file = config_cookies_file
+    
+    # Validate cookies file if provided
+    if cookies_file and not os.path.exists(cookies_file):
+        logger.warning(f"Cookies file specified but not found: {cookies_file}")
+        # Don't raise error, just log warning - user might fix it later
+    
     return {
         'bot_token': config_data.get('bot_token'),
         'owner_id': int(config_data.get('owner_id', 0)),
@@ -72,6 +84,7 @@ def load_config(config_path, use_firefox=True):
         'nostr_client_url': config_data.get('nostr_client_url'),  # Optional: URL template for nostr client links
         'channels': config_data.get('channels', {}),
         'use_firefox': use_firefox,
+        'cookies_file': cookies_file,
     }
 
 
@@ -547,7 +560,7 @@ async def download_media_file(bot, file, file_extension=None):
         return None
 
 
-def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, config=None):
+def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None):
     """Build the command to execute nostr_media_uploader.sh."""
     # Convert script path to absolute path
     script_path = Path(script_path)
@@ -570,11 +583,17 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
     logger.info(f"Using bash: {bash_path}")
     logger.info(f"Script path: {script_path}")
     
-    # Build command: bash script_path -p profile_name [--firefox] url1 url2 ... "extra_text"
+    # Build command: bash script_path -p profile_name [--cookies FILE|--firefox] url1 url2 ... "extra_text"
     cmd = [bash_path, script_path, '-p', profile_name]
     
-    # Always add --firefox unless explicitly disabled
-    if use_firefox:
+    # Use cookies file if provided (takes precedence over --firefox)
+    if cookies_file:
+        # Convert cookies file path to Cygwin path if needed
+        cookies_path = convert_path_for_cygwin(cookies_file, config)
+        cmd.extend(['--cookies', cookies_path])
+        logger.info(f"Adding --cookies parameter with file: {cookies_path}")
+    elif use_firefox:
+        # Only add --firefox if cookies_file is not set
         cmd.append('--firefox')
         logger.info("Adding --firefox parameter")
     
@@ -706,7 +725,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 
                 try:
                     logger.info(f"Reloading configuration from {config_path}")
-                    new_config = load_config(config_path, use_firefox=use_firefox)
+                    cookies_file = context.bot_data.get('cookies_file')
+                    new_config = load_config(config_path, use_firefox=use_firefox, cookies_file=cookies_file)
                     
                     # Validate new config
                     if not new_config.get('bot_token'):
@@ -723,12 +743,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     # Count channels
                     channels_count = len(new_config.get('channels', {}))
                     
-                    await message.reply_text(
-                        f"✅ Configuration reloaded successfully!\n\n"
-                        f"Channels: {channels_count}\n"
-                        f"Script path: {new_config['script_path']}\n"
-                        f"Use Firefox: {new_config.get('use_firefox', True)}"
-                    )
+                    # Build status message
+                    status_parts = [
+                        f"✅ Configuration reloaded successfully!",
+                        f"",
+                        f"Channels: {channels_count}",
+                        f"Script path: {new_config['script_path']}",
+                    ]
+                    if new_config.get('cookies_file'):
+                        status_parts.append(f"Cookies file: {new_config['cookies_file']}")
+                    else:
+                        status_parts.append(f"Use Firefox: {new_config.get('use_firefox', True)}")
+                    
+                    await message.reply_text("\n".join(status_parts))
                     logger.info(f"Configuration reloaded successfully. Channels: {channels_count}")
                 except Exception as e:
                     error_msg = f"❌ Failed to reload configuration: {str(e)}"
@@ -830,6 +857,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 media_files,  # Pass file paths instead of URLs
                 text,  # Use full text as extra text (description)
                 config.get('use_firefox', True),
+                config.get('cookies_file'),
                 config
             )
             
@@ -973,6 +1001,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             urls,
             extra_text,
             config.get('use_firefox', True),
+            config.get('cookies_file'),
             config
         )
         
@@ -1085,6 +1114,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Telegram bot for nostr_media_uploader')
     parser.add_argument('--no-firefox', action='store_true',
                         help='Disable --firefox parameter when calling nostr_media_uploader.sh')
+    parser.add_argument('--cookies', '--cookies-file', dest='cookies_file', default=None,
+                        help='Path to cookies file (Mozilla/Netscape format). Takes precedence over --firefox option.')
     parser.add_argument('--config', default=CONFIG_FILE,
                         help=f'Path to configuration file (default: {CONFIG_FILE})')
     args = parser.parse_args()
@@ -1092,9 +1123,14 @@ def main() -> None:
     # Determine if Firefox should be used
     use_firefox = not args.no_firefox
     
+    # Validate cookies file if provided
+    if args.cookies_file and not os.path.exists(args.cookies_file):
+        logger.warning(f"Cookies file specified but not found: {args.cookies_file}")
+        # Don't exit, just log warning - user might fix it later
+    
     # Load configuration
     try:
-        config = load_config(args.config, use_firefox=use_firefox)
+        config = load_config(args.config, use_firefox=use_firefox, cookies_file=args.cookies_file)
     except Exception as e:
         logger.error(f"Failed to load configuration: {e}")
         return
@@ -1114,6 +1150,7 @@ def main() -> None:
     application.bot_data['config'] = config
     application.bot_data['config_path'] = args.config
     application.bot_data['use_firefox'] = use_firefox
+    application.bot_data['cookies_file'] = args.cookies_file
     
     # Add message handler
     # With multi-channel support, we listen to all chats and filter in the handler
@@ -1127,7 +1164,10 @@ def main() -> None:
     logger.info("Starting bot...")
     logger.info(f"Owner ID: {config['owner_id']}")
     logger.info(f"Script path: {config['script_path']}")
-    logger.info(f"Use Firefox: {config.get('use_firefox', True)}")
+    if config.get('cookies_file'):
+        logger.info(f"Cookies file: {config['cookies_file']}")
+    else:
+        logger.info(f"Use Firefox: {config.get('use_firefox', True)}")
     channels = config.get('channels', {})
     if channels:
         logger.info(f"Configured channels: {len(channels)}")
