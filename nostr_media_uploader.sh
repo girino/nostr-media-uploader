@@ -5,7 +5,7 @@ SCRIPT_DIR=$(dirname "$0")
 readonly SCRIPT_DIR
 
 BLOSSOMS=(
-	"https://cdn.nostrcheck.me"
+	"https://blossom.band/"
 	"https://nostr.download"
 	"https://blossom.primal.net"
 )
@@ -961,6 +961,47 @@ convert_video_with_encoder() {
 	local WIN_INPUT=$(convert_path_for_tool "$INPUT_FILE")
 	local WIN_OUTPUT=$(convert_path_for_tool "$OUTPUT_FILE")
 	
+	# Get aspect ratio, resolution, and SAR from input video to preserve them
+	# This provides maximum hints to the blossom server for proper re-encoding
+	local ASPECT_RATIO
+	local INPUT_WIDTH INPUT_HEIGHT
+	local SAR="1:1"  # Default to square pixels if not found
+	
+	# Get display aspect ratio (DAR)
+	ASPECT_RATIO=$(ffprobe -v error -select_streams v:0 -show_entries stream=display_aspect_ratio -of default=noprint_wrappers=1:nokey=1 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	
+	# Get resolution (width and height)
+	INPUT_WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	INPUT_HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	
+	# Get sample aspect ratio (SAR)
+	local SAR_VALUE
+	SAR_VALUE=$(ffprobe -v error -select_streams v:0 -show_entries stream=sample_aspect_ratio -of default=noprint_wrappers=1:nokey=1 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	
+	# Use extracted SAR if available and valid, otherwise default to 1:1 (square pixels)
+	# SAR must be in format "num:num" and not be "0:1" or "1:0" or "N/A"
+	if [ -n "$SAR_VALUE" ] && [ "$SAR_VALUE" != "N/A" ] && [ "$SAR_VALUE" != "0:1" ] && [ "$SAR_VALUE" != "1:0" ] && [[ "$SAR_VALUE" =~ ^[0-9]+:[0-9]+$ ]]; then
+		SAR="$SAR_VALUE"
+	fi
+	
+	# If aspect ratio not found, try calculating from width/height
+	if [ -z "$ASPECT_RATIO" ] || [ "$ASPECT_RATIO" = "N/A" ]; then
+		if [ -n "$INPUT_WIDTH" ] && [ -n "$INPUT_HEIGHT" ] && [ "$INPUT_WIDTH" != "N/A" ] && [ "$INPUT_HEIGHT" != "N/A" ]; then
+			# Calculate aspect ratio (simplified to common ratio)
+			local GCD
+			GCD=$(awk "BEGIN {
+				a=$INPUT_WIDTH; b=$INPUT_HEIGHT;
+				while(b) {t=b; b=a%b; a=t}
+				print a
+			}")
+			if [ -n "$GCD" ] && [ "$GCD" -gt 0 ]; then
+				local W_RATIO=$((INPUT_WIDTH / GCD))
+				local H_RATIO=$((INPUT_HEIGHT / GCD))
+				ASPECT_RATIO="${W_RATIO}:${H_RATIO}"
+			fi
+		fi
+	fi
+	
 	# Calculate bitrate multiplier based on encoder type
 	local BITRATE_MULTIPLIER
 	if [ "$ENCODER_TYPE" = "h265" ]; then
@@ -1023,9 +1064,37 @@ convert_video_with_encoder() {
 	
 	echo "Converting video using $ENCODER $HW_ACCEL at bitrate ${TARGET_BITRATE}" >&2
 	
+	# Build ffmpeg command with comprehensive aspect ratio and resolution preservation
+	# This provides maximum hints to the blossom server for proper re-encoding
+	local FFMPEG_CMD=(-y -i "$WIN_INPUT" "${ENCODER_OPTS[@]}" "${EXTRA_OPTS[@]}")
+	
+	# Preserve resolution using scale filter (most important hint for server re-encoding)
+	if [ -n "$INPUT_WIDTH" ] && [ -n "$INPUT_HEIGHT" ] && [ "$INPUT_WIDTH" != "N/A" ] && [ "$INPUT_HEIGHT" != "N/A" ]; then
+		FFMPEG_CMD+=(-vf "scale=${INPUT_WIDTH}:${INPUT_HEIGHT}")
+		echo "Preserving resolution: ${INPUT_WIDTH}x${INPUT_HEIGHT}" >&2
+	fi
+	
+	# Set display aspect ratio (DAR) metadata (only if valid)
+	# DAR must be in format "num:num" (e.g., "16:9") - ffmpeg also accepts decimal but we'll use ratio format
+	if [ -n "$ASPECT_RATIO" ] && [ "$ASPECT_RATIO" != "N/A" ] && [[ "$ASPECT_RATIO" =~ ^[0-9]+:[0-9]+$ ]]; then
+		FFMPEG_CMD+=(-aspect "$ASPECT_RATIO")
+		echo "Setting display aspect ratio: $ASPECT_RATIO" >&2
+	fi
+	
+	# Set sample aspect ratio (SAR) metadata (only if valid)
+	if [ -n "$SAR" ] && [ "$SAR" != "N/A" ] && [[ "$SAR" =~ ^[0-9]+:[0-9]+$ ]]; then
+		FFMPEG_CMD+=(-sar "$SAR")
+		echo "Setting sample aspect ratio: $SAR" >&2
+	fi
+	
+	FFMPEG_CMD+=(-movflags +faststart -c:a copy "$WIN_OUTPUT")
+	
+	# Debug: Print the full ffmpeg command
+	echo "Debug: ffmpeg command: ffmpeg ${FFMPEG_CMD[*]}" >&2
+	
 	# Run ffmpeg conversion - capture output for error reporting
 	local FFMPEG_OUTPUT
-	FFMPEG_OUTPUT=$(ffmpeg -y -i "$WIN_INPUT" "${ENCODER_OPTS[@]}" "${EXTRA_OPTS[@]}" -movflags +faststart -c:a copy "$WIN_OUTPUT" 2>&1)
+	FFMPEG_OUTPUT=$(ffmpeg "${FFMPEG_CMD[@]}" 2>&1)
 	local FFMPEG_EXIT=$?
 	
 	if [ $FFMPEG_EXIT -eq 0 ] && [ -f "$OUTPUT_FILE" ]; then
@@ -2817,7 +2886,11 @@ process_media_items() {
 							fi
 						fi
 						# Update source if provided
-						if [ -n "$download_images_ret_source" ]; then
+						# For mobile shared URLs, use the original URL as source, not the resolved URL
+						if [ "$MOBILE_SHARED_RESOLVED" -eq 1 ] && [ -n "$ORIGINAL_MEDIA_ITEM" ]; then
+							cleaned_source=$(cleanup_source_url "$ORIGINAL_MEDIA_ITEM")
+							FILE_SOURCES+=("$cleaned_source")
+						elif [ -n "$download_images_ret_source" ]; then
 							cleaned_source=$(cleanup_source_url "$download_images_ret_source")
 							FILE_SOURCES+=("$cleaned_source")
 						fi
