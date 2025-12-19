@@ -884,12 +884,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
             # Format response (same as URL processing)
             if result['success']:
-                # Log stdout/stderr for debugging
+                # Log stdout/stderr for debugging (always log, even on success)
                 logger.info(f"Script execution successful. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
                 if result['stdout']:
-                    logger.debug(f"Full stdout: {result['stdout']}")
+                    logger.info(f"Script stdout:\n{result['stdout']}")
                 if result['stderr']:
-                    logger.debug(f"Full stderr: {result['stderr']}")
+                    logger.info(f"Script stderr:\n{result['stderr']}")
                 
                 # Try to extract event ID and convert to nevent
                 event_id = None
@@ -961,13 +961,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 # Telegram has a 4096 character limit per message, so limit to ~3500 to leave room for prefix
                 MAX_ERROR_LENGTH = 3500
                 if len(error_msg) > MAX_ERROR_LENGTH:
-                    # Truncate but keep the most important part (usually the end has the actual error)
-                    truncated_msg = error_msg[:MAX_ERROR_LENGTH]
-                    # Try to truncate at a newline if possible
-                    last_newline = truncated_msg.rfind('\n')
-                    if last_newline > MAX_ERROR_LENGTH * 0.8:  # If we can find a newline in the last 20%
-                        truncated_msg = truncated_msg[:last_newline]
-                    error_display = f"❌ Error processing media file(s)\n\n{truncated_msg}\n\n... (truncated, full error in logs)"
+                    # Truncate from the beginning, keep the end (most important part with actual error)
+                    truncated_msg = error_msg[-MAX_ERROR_LENGTH:]
+                    # Try to truncate at a newline if possible (find first newline in truncated message)
+                    first_newline = truncated_msg.find('\n')
+                    if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:  # If we can find a newline in the first 20%
+                        truncated_msg = truncated_msg[first_newline+1:]
+                    error_display = f"❌ Error processing media file(s)\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
                 else:
                     error_display = f"❌ Error processing media file(s)\n\n{error_msg}"
                 
@@ -1019,12 +1019,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         # Format response
         if result['success']:
-            # Log stdout/stderr for debugging
+            # Log stdout/stderr for debugging (always log, even on success)
             logger.info(f"Script execution successful. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
             if result['stdout']:
-                logger.debug(f"Full stdout: {result['stdout']}")
+                logger.info(f"Script stdout:\n{result['stdout']}")
             if result['stderr']:
-                logger.debug(f"Full stderr: {result['stderr']}")
+                logger.info(f"Script stderr:\n{result['stderr']}")
             
             # Try to extract event ID and convert to nevent
             # Check both stdout and stderr, as the script might output to either
@@ -1098,13 +1098,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # Telegram has a 4096 character limit per message, so limit to ~3500 to leave room for prefix
             MAX_ERROR_LENGTH = 3500
             if len(error_msg) > MAX_ERROR_LENGTH:
-                # Truncate but keep the most important part (usually the end has the actual error)
-                truncated_msg = error_msg[:MAX_ERROR_LENGTH]
-                # Try to truncate at a newline if possible
-                last_newline = truncated_msg.rfind('\n')
-                if last_newline > MAX_ERROR_LENGTH * 0.8:  # If we can find a newline in the last 20%
-                    truncated_msg = truncated_msg[:last_newline]
-                error_display = f"❌ Error processing URL(s)\n\n{truncated_msg}\n\n... (truncated, full error in logs)"
+                # Truncate from the beginning, keep the end (most important part with actual error)
+                truncated_msg = error_msg[-MAX_ERROR_LENGTH:]
+                # Try to truncate at a newline if possible (find first newline in truncated message)
+                first_newline = truncated_msg.find('\n')
+                if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:  # If we can find a newline in the first 20%
+                    truncated_msg = truncated_msg[first_newline+1:]
+                error_display = f"❌ Error processing URL(s)\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
             else:
                 error_display = f"❌ Error processing URL(s)\n\n{error_msg}"
             
