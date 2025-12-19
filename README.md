@@ -70,6 +70,41 @@ This repository contains three main scripts:
 
 ## Quick Start
 
+### Recommended: Docker (Simplest)
+
+1. **Configure your Nostr keys**:
+   ```bash
+   cp example_env ~/.nostr/nostr_media_uploader
+   # Edit ~/.nostr/nostr_media_uploader with your keys
+   ```
+
+2. **Extract cookies from Firefox** (optional, for authenticated downloads):
+   ```bash
+   python extract_firefox_cookies.py firefox_cookies.txt
+   ```
+
+3. **Start with Docker Compose**:
+   ```bash
+   docker-compose up -d
+   ```
+
+4. **View logs**:
+   ```bash
+   docker-compose logs -f
+   ```
+
+That's it! The Telegram bot is now running in Docker with all dependencies pre-installed.
+
+**For manual script usage in Docker:**
+```bash
+# Run the script inside the container
+docker-compose exec telegram-bot bash /app/nostr_media_uploader.sh https://web.facebook.com/reel/1234567890
+```
+
+### Alternative: Native Installation
+
+If you prefer to run natively without Docker:
+
 1. **Install dependencies** (see [INSTALLATION.md](INSTALLATION.md) for details):
    ```bash
    # Install gallery-dl (requires >= 1.30.6)
@@ -141,6 +176,7 @@ For detailed installation instructions, see [INSTALLATION.md](INSTALLATION.md).
 - `--comment` / `--nocomment`: Enable/disable original captions (default: enabled)
 - `--firefox`: Use Firefox cookies for authenticated downloads
 - `--cookies <file>`: Use cookies from specified file (Mozilla/Netscape format). Takes precedence over `--firefox`
+- `--encoders <list>`: Comma-separated list of video encoders to use (e.g., `libx264,hevc_qsv`). Overrides automatic detection. Encoders will be tried in the specified order.
 - `--source` / `--nosource`: Show/hide source URLs in posts
 - `--password <password>`: Provide password for encrypted keys
 - `--max-file-search <number>`: Maximum files to search when inferring Facebook image positions
@@ -156,6 +192,15 @@ For detailed installation instructions, see [INSTALLATION.md](INSTALLATION.md).
 #### Video Upload with Cookies File
 ```bash
 ./nostr_media_uploader.sh --cookies firefox_cookies.txt https://web.facebook.com/reel/1174103824690243
+```
+
+#### Specify Video Encoders
+```bash
+# Use specific hardware encoders
+./nostr_media_uploader.sh --encoders hevc_qsv,h264_qsv https://web.facebook.com/reel/1174103824690243
+
+# Use software encoders only
+./nostr_media_uploader.sh --encoders libx264,libx265 https://web.facebook.com/reel/1174103824690243
 ```
 
 #### Upload Without Relay Broadcast
@@ -227,27 +272,126 @@ See [example_env](example_env) for a complete configuration template.
 - **`POW_DIFF`**: Proof of work difficulty (default: 20)
 - **`USE_COOKIES_FF`**: Use Firefox cookies by default (0/1, default: 0)
 - **`COOKIES_FILE`**: Path to cookies file (Mozilla/Netscape format). If set, takes precedence over `USE_COOKIES_FF` and `--firefox` option
+- **`ENCODERS`**: Comma-separated list of preferred video encoders (e.g., `libx264,hevc_qsv`). Overrides automatic encoder detection. Encoders will be tried in the specified order.
 - **`APPEND_ORIGINAL_COMMENT`**: Append original captions (0/1, default: 1)
+
+## Docker Deployment
+
+Docker is the **recommended** way to run the Telegram bot, as it includes all dependencies and simplifies setup.
+
+### Prerequisites
+
+- Docker and Docker Compose installed
+- Your Nostr keys configured in `~/.nostr/nostr_media_uploader`
+- (Optional) Firefox cookies file for authenticated downloads
+
+### Quick Setup
+
+1. **Configure Nostr keys**:
+   ```bash
+   cp example_env ~/.nostr/nostr_media_uploader
+   # Edit ~/.nostr/nostr_media_uploader with your keys
+   ```
+
+2. **Extract cookies** (optional):
+   ```bash
+   python extract_firefox_cookies.py firefox_cookies.txt
+   ```
+
+3. **Configure Telegram bot**:
+   ```bash
+   cp telegram_bot.yaml.example telegram_bot.yaml
+   # Edit telegram_bot.yaml with your bot token and channel settings
+   ```
+
+4. **Start the container**:
+   ```bash
+   docker-compose up -d
+   ```
+
+5. **View logs**:
+   ```bash
+   docker-compose logs -f
+   ```
+
+### Docker Configuration
+
+The `docker-compose.yml` file mounts:
+- `~/.nostr` directory (read-only) - Contains your Nostr keys and configuration
+- `firefox_cookies.txt` (read-write) - Cookies file for authenticated downloads
+- `telegram_bot.yaml` (read-only) - Telegram bot configuration
+- Scripts (read-only) - `nostr_media_uploader.sh`, `image_uploader.sh`, `aiart.sh`
+
+### Hardware Acceleration (Optional)
+
+For Intel Quick Sync Video (QSV) hardware acceleration, uncomment the devices section in `docker-compose.yml`:
+
+```yaml
+devices:
+  - /dev/dri:/dev/dri  # Intel QSV on Linux
+  # - /dev/dxg:/dev/dxg  # WSL2 uses dxg, not dri
+```
+
+### Running Scripts in Docker
+
+To run the uploader script manually inside the container:
+
+```bash
+# Run with cookies file
+docker-compose exec telegram-bot bash /app/nostr_media_uploader.sh --cookies /app/firefox_cookies.txt https://example.com/media
+
+# Run with specific encoders
+docker-compose exec telegram-bot bash /app/nostr_media_uploader.sh --encoders libx264,hevc_qsv https://example.com/media
+```
+
+### Updating
+
+To update the Docker image with latest changes:
+
+```bash
+# Rebuild the image
+docker-compose build
+
+# Restart the container
+docker-compose up -d
+```
 
 ## Platform Support
 
+- ✅ **Docker** (recommended) - Works on Linux, macOS, Windows (WSL2)
 - ✅ Linux (native)
 - ✅ Cygwin (Windows)
 - ⚠️ macOS (may work but not tested)
 
 ## Video Codec Support
 
-The script automatically handles video codec conversion:
+The script automatically handles video codec conversion with intelligent encoder selection:
+
+### Encoder Priority
 
 1. **Hardware-accelerated encoding** (if available):
-   - H.265: Intel QSV (hevc_qsv), NVIDIA NVENC (hevc_nvenc), AMD AMF (hevc_amf)
-   - H.264: Intel QSV (h264_qsv), NVIDIA NVENC (h264_nvenc), AMD AMF (h264_amf)
+   - H.265: Intel QSV (hevc_qsv), NVIDIA NVENC (hevc_nvenc), AMD AMF (hevc_amf), VideoToolbox (hevc_videotoolbox), V4L2 M2M (hevc_v4l2m2m)
+   - H.264: Intel QSV (h264_qsv), NVIDIA NVENC (h264_nvenc), AMD AMF (h264_amf), VideoToolbox (h264_videotoolbox), V4L2 M2M (h264_v4l2m2m)
 
 2. **Software encoding** (fallback):
-   - H.265: libx265
-   - H.264: libx264 (universal fallback)
+   - H.264: libx264 (preferred - faster)
+   - H.265: libx265 (better compression, slower)
 
-The script automatically detects available hardware and selects the best encoder.
+The script automatically detects available hardware and selects the best encoder. Hardware encoders are tested with actual encoding to ensure they work (especially important in Docker/WSL2 environments).
+
+### Custom Encoder Selection
+
+You can override automatic detection by specifying encoders:
+
+```bash
+# Via command line
+./nostr_media_uploader.sh --encoders libx264,hevc_qsv video.mp4
+
+# Via environment variable (in config file)
+ENCODERS="hevc_qsv,h264_qsv,libx264,libx265"
+```
+
+Encoders are tried in the order specified. If an encoder fails, the next one in the list is attempted.
 
 ## Error Handling
 
@@ -397,31 +541,44 @@ The repository includes a Telegram bot (`telegram_bot.py`) that can automaticall
 
 ### Setup
 
-1. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+#### Recommended: Docker (Simplest)
 
-2. **Create a Telegram bot**:
+1. **Create a Telegram bot**:
    - Talk to [@BotFather](https://t.me/BotFather) on Telegram
    - Use `/newbot` command to create a new bot
    - Save the bot token you receive
 
-3. **Get your Telegram User ID**:
+2. **Get your Telegram User ID**:
    - Talk to [@userinfobot](https://t.me/userinfobot) to get your user ID
 
-4. **Get Chat ID** (for channels/groups):
+3. **Get Chat ID** (for channels/groups):
    - For channels: Use [@getidsbot](https://t.me/getidsbot) or add the bot to your channel and use [@RawDataBot](https://t.me/RawDataBot)
    - For groups: Add the bot to the group and check the chat ID
    - You can also use channel username format (e.g., `@channelname`)
 
-5. **Configure the bot**:
+4. **Configure the bot**:
    ```bash
    cp telegram_bot.yaml.example telegram_bot.yaml
    # Edit telegram_bot.yaml with your settings
    ```
 
-6. **Run the bot**:
+5. **Start with Docker Compose** (see [Docker Deployment](#docker-deployment) section above):
+   ```bash
+   docker-compose up -d
+   ```
+
+The Docker setup includes all dependencies and is the simplest way to run the bot.
+
+#### Alternative: Native Installation
+
+1. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Follow steps 1-4 above** to create bot and configure
+
+3. **Run the bot**:
    ```bash
    # Option 1: Use the convenience script (recommended)
    ./run_telegram_bot.sh
@@ -437,6 +594,9 @@ The repository includes a Telegram bot (`telegram_bot.py`) that can automaticall
    
    # Option 4: Use custom config file
    python3 telegram_bot.py --config /path/to/custom_config.yaml
+   
+   # Option 5: Use cookies file
+   python3 telegram_bot.py --cookies firefox_cookies.txt
    ```
 
 ### Usage
