@@ -6,6 +6,11 @@ services:
     container_name: nostr-telegram-bot
     restart: unless-stopped
     
+    # Mount Intel GPU devices for Quick Sync Video acceleration
+    #devices:
+      # - /dev/dri:/dev/dri
+      # - /dev/dxg:/dev/dxg  # WSL2 uses dxg, not dri
+    
     # Mount .nostr directory from host to container
     volumes:
       - ${HOME}/.nostr:/root/.nostr:ro

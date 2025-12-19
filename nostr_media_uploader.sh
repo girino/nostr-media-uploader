@@ -753,6 +753,97 @@ check_file_for_fbid() {
 	return 1
 }
 
+# Function to check if we're running in Docker
+# Returns: 0 if in Docker, 1 if not
+is_running_in_docker() {
+	# Check for .dockerenv file (most reliable Docker indicator)
+	if [ -f "/.dockerenv" ]; then
+		return 0
+	fi
+	
+	# Check cgroup (alternative method)
+	if [ -f "/proc/self/cgroup" ]; then
+		if grep -qE 'docker|lxc|kubepods' /proc/self/cgroup 2>/dev/null; then
+			return 0
+		fi
+	fi
+	
+	return 1
+}
+
+# Function to test if a hardware encoder actually works
+# This performs an actual encoding test with a synthetic video
+# Parameters:
+#   $1: ENCODER_NAME - encoder name (e.g., "hevc_qsv", "h264_qsv")
+# Returns: 0 if encoder works, 1 if it fails
+test_encoder_with_ffmpeg() {
+	local ENCODER_NAME="$1"
+	
+	# Software encoders are always available if compiled in
+	if [[ "$ENCODER_NAME" == libx264 ]] || [[ "$ENCODER_NAME" == libx265 ]]; then
+		return 0
+	fi
+	
+	# Build encoder-specific test command
+	local ENCODER_OPTS=()
+	local PIX_FMT=""
+	
+	case "$ENCODER_NAME" in
+		hevc_qsv)
+			PIX_FMT="nv12"
+			ENCODER_OPTS=(-c:v hevc_qsv -preset slow -pix_fmt "$PIX_FMT" -b:v 1000k)
+			;;
+		h264_qsv)
+			PIX_FMT="nv12"
+			ENCODER_OPTS=(-c:v h264_qsv -preset slow -pix_fmt "$PIX_FMT" -b:v 1000k)
+			;;
+		hevc_nvenc)
+			ENCODER_OPTS=(-c:v hevc_nvenc -preset slow -rc:v vbr -b:v 1000k)
+			;;
+		h264_nvenc)
+			ENCODER_OPTS=(-c:v h264_nvenc -preset slow -rc:v vbr -b:v 1000k)
+			;;
+		hevc_amf)
+			ENCODER_OPTS=(-c:v hevc_amf -quality speed -b:v 1000k)
+			;;
+		h264_amf)
+			ENCODER_OPTS=(-c:v h264_amf -quality speed -b:v 1000k)
+			;;
+		h264_v4l2m2m)
+			# Raspberry Pi hardware encoder (V4L2 M2M)
+			ENCODER_OPTS=(-c:v h264_v4l2m2m -b:v 1000k)
+			;;
+		hevc_videotoolbox|h264_videotoolbox)
+			# VideoToolbox is macOS-only
+			return 1
+			;;
+		*)
+			# Unknown encoder
+			return 1
+			;;
+	esac
+	
+	# Test encoding: generate a 1-second test pattern and try to encode it
+	# Use a small resolution (320x240) and low frame rate (1fps) for speed
+	# Output to /dev/null since we only care if encoding succeeds
+	local TEST_OUTPUT
+	TEST_OUTPUT=$(ffmpeg -f lavfi -i "testsrc=duration=1:size=320x240:rate=1" \
+		"${ENCODER_OPTS[@]}" \
+		-t 1 -f null - 2>&1)
+	local TEST_EXIT=$?
+	
+	if [ $TEST_EXIT -eq 0 ]; then
+		return 0
+	else
+		# Check for common error messages that indicate hardware not available
+		if echo "$TEST_OUTPUT" | grep -qiE "no.*device|cannot.*open|failed.*init|not.*available|permission.*denied"; then
+			return 1
+		fi
+		# Other errors might be transient, but for safety, return failure
+		return 1
+	fi
+}
+
 # Function to check if a hardware encoder is actually usable
 # This performs pre-flight checks before attempting encoding
 # Parameters:
@@ -766,108 +857,57 @@ check_hardware_encoder_available() {
 		return 0
 	fi
 	
-	# Check encoder-specific hardware requirements
+	# Test the encoder by actually trying to encode a test pattern
+	# This is more reliable than device detection, especially in Docker/WSL2
+	if test_encoder_with_ffmpeg "$ENCODER_NAME"; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+# Function to map encoder name to encoder spec format
+# Parameters:
+#   $1: ENCODER_NAME - encoder name (e.g., "libx264", "hevc_qsv")
+# Returns: encoder spec via stdout in format "encoder_name:type:hw" or empty string if unknown
+#   type is "h265" or "h264", hw is "1" (hardware) or "0" (software)
+map_encoder_to_spec() {
+	local ENCODER_NAME="$1"
+	
 	case "$ENCODER_NAME" in
-		hevc_qsv|h264_qsv)
-			# Intel Quick Sync Video - check for Intel GPU and DRI devices
-			if [ "$OS_TYPE" = "linux" ]; then
-				# Check for DRI render nodes (Intel GPU)
-				if ls /dev/dri/renderD* >/dev/null 2>&1; then
-					# Verify it's Intel GPU by checking vendor IDs
-					if [ -d /sys/class/drm ]; then
-						# Check if any DRM device is Intel
-						for card in /sys/class/drm/card*/device/vendor; do
-							if [ -f "$card" ]; then
-								local VENDOR_ID
-								VENDOR_ID=$(cat "$card" 2>/dev/null | tr -d '\r\n' | tr '[:upper:]' '[:lower:]')
-								# Intel vendor ID is 0x8086 (hex) or 32902 (decimal)
-								# Normalize to lowercase hex for comparison
-								if [[ "$VENDOR_ID" == *"8086"* ]] || [ "$VENDOR_ID" = "32902" ]; then
-									return 0
-								fi
-							fi
-						done
-					fi
-				fi
-			elif [ "$OS_TYPE" = "cygwin" ]; then
-				# On Cygwin/Windows, QSV is available if Intel GPU is present
-				# Check for Intel GPU via wmic (Windows) or assume available if encoder exists
-				# Since we already checked the encoder exists, assume it might work
-				return 0
-			fi
-			# QSV not available
-			return 1
+		# h265 hardware encoders
+		hevc_qsv|hevc_nvenc|hevc_videotoolbox|hevc_amf)
+			echo "${ENCODER_NAME}:h265:1"
 			;;
-		hevc_nvenc|h264_nvenc)
-			# NVIDIA NVENC - check for NVIDIA GPU
-			# Try nvidia-smi first (most reliable)
-			if command -v nvidia-smi >/dev/null 2>&1; then
-				if nvidia-smi -L >/dev/null 2>&1; then
-					return 0
-				fi
-			fi
-			# Fallback: check for NVIDIA device
-			if [ "$OS_TYPE" = "linux" ]; then
-				# Check lspci for NVIDIA GPU
-				if command -v lspci >/dev/null 2>&1; then
-					if lspci | grep -qi "nvidia"; then
-						# Found NVIDIA GPU, assume NVENC might be available
-						return 0
-					fi
-				fi
-			fi
-			# NVENC not available
-			return 1
+		# h264 hardware encoders
+		h264_qsv|h264_nvenc|h264_videotoolbox|h264_amf|h264_v4l2m2m)
+			echo "${ENCODER_NAME}:h264:1"
 			;;
-		hevc_videotoolbox|h264_videotoolbox)
-			# VideoToolbox is macOS-only
-			# We don't currently support macOS, but if we add it, check for macOS
-			# For now, skip it
-			return 1
+		# h265 software encoder
+		libx265)
+			echo "libx265:h265:0"
 			;;
-		hevc_amf|h264_amf)
-			# AMD AMF - check for AMD GPU
-			if [ "$OS_TYPE" = "linux" ]; then
-				# Check for AMD GPU via lspci
-				if command -v lspci >/dev/null 2>&1; then
-					if lspci | grep -qiE "amd|radeon"; then
-						# Check for DRI render nodes (AMD GPU)
-						if ls /dev/dri/renderD* >/dev/null 2>&1; then
-							# Verify it's AMD GPU by checking vendor IDs
-							if [ -d /sys/class/drm ]; then
-								for card in /sys/class/drm/card*/device/vendor; do
-									if [ -f "$card" ]; then
-										local VENDOR_ID
-										VENDOR_ID=$(cat "$card" 2>/dev/null | tr -d '\r\n' | tr '[:upper:]' '[:lower:]')
-										# AMD vendor ID is 0x1002 (hex) or 4098 (decimal)
-										if [[ "$VENDOR_ID" == *"1002"* ]] || [ "$VENDOR_ID" = "4098" ]; then
-											return 0
-										fi
-									fi
-								done
-							fi
-						fi
-					fi
-				fi
-			elif [ "$OS_TYPE" = "cygwin" ]; then
-				# On Cygwin/Windows, AMF is available if AMD GPU is present
-				# Since we already checked the encoder exists, assume it might work
-				return 0
-			fi
-			# AMF not available
-			return 1
+		# h264 software encoder
+		libx264)
+			echo "libx264:h264:0"
 			;;
 		*)
-			# Unknown encoder, assume not available
-			return 1
+			# Unknown encoder
+			echo ""
 			;;
 	esac
 }
 
 # Function to get all available encoders in priority order
+# Parameters:
+#   $1: USER_ENCODERS - optional comma-separated list of encoder names (e.g., "libx264,libx265")
+#       If provided, only these encoders will be used (if available in ffmpeg)
+#       If empty, uses automatic detection
 # Returns: serialized array of encoder specs via stdout
 # Format: "encoder_name:type:hw" where type is "h265" or "h264", hw is "1" or "0"
 get_available_encoders_priority() {
+	local USER_ENCODERS="$1"
+	
 	# Check available encoders - extract encoder names from ffmpeg output
 	# Format: "V..... libx264            H.264 / AVC / ..."
 	local AVAILABLE_ENCODERS
@@ -875,7 +915,44 @@ get_available_encoders_priority() {
 	
 	local ENCODER_LIST=()
 	
-	# Priority order: h265 hardware > h264 hardware > h265 software > h264 software
+	# If user specified encoders, use only those
+	if [ -n "$USER_ENCODERS" ]; then
+		# Split comma-separated list
+		IFS=',' read -ra USER_ENCODER_ARRAY <<< "$USER_ENCODERS"
+		for ENCODER_NAME in "${USER_ENCODER_ARRAY[@]}"; do
+			# Trim whitespace
+			ENCODER_NAME=$(echo "$ENCODER_NAME" | xargs)
+			
+			# Check if encoder exists in ffmpeg
+			if echo "$AVAILABLE_ENCODERS" | grep -q "\\b${ENCODER_NAME}\\b"; then
+				# Map encoder name to spec format
+				local ENCODER_SPEC
+				ENCODER_SPEC=$(map_encoder_to_spec "$ENCODER_NAME")
+				
+				if [ -n "$ENCODER_SPEC" ]; then
+					ENCODER_LIST+=("$ENCODER_SPEC")
+				else
+					echo "Warning: Unknown encoder '$ENCODER_NAME', skipping..." >&2
+				fi
+			else
+				echo "Warning: Encoder '$ENCODER_NAME' not available in ffmpeg, skipping..." >&2
+			fi
+		done
+		
+		# If no valid encoders found, return error
+		if [ ${#ENCODER_LIST[@]} -eq 0 ]; then
+			return 1
+		fi
+		
+		# Serialize and return user-specified encoders
+		serialize_array "${ENCODER_LIST[@]}"
+		return 0
+	fi
+	
+	# Automatic detection: Priority order: h265 hardware > h264 hardware > h264 software > h265 software
+	
+	# Priority order: h265 hardware > h264 hardware > h264 software > h265 software
+	# (For software encoders, libx264 is faster than libx265, so it's preferred)
 	# Check each encoder and add to list if available AND hardware is present
 	
 	# h265 hardware encoders
@@ -921,15 +998,20 @@ get_available_encoders_priority() {
 			ENCODER_LIST+=("h264_amf:h264:1")
 		fi
 	fi
-	
-	# h265 software encoder
-	if echo "$AVAILABLE_ENCODERS" | grep -q '\blibx265\b'; then
-		ENCODER_LIST+=("libx265:h265:0")
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_v4l2m2m\b'; then
+		if check_hardware_encoder_available "h264_v4l2m2m"; then
+			ENCODER_LIST+=("h264_v4l2m2m:h264:1")
+		fi
 	fi
 	
-	# h264 software encoder (fallback)
+	# h264 software encoder (faster than h265, so prefer it)
 	if echo "$AVAILABLE_ENCODERS" | grep -q '\blibx264\b'; then
 		ENCODER_LIST+=("libx264:h264:0")
+	fi
+	
+	# h265 software encoder (slower but better compression)
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\blibx265\b'; then
+		ENCODER_LIST+=("libx265:h265:0")
 	fi
 	
 	# Serialize array and return
@@ -1048,6 +1130,10 @@ convert_video_with_encoder() {
 	elif [ "$ENCODER" = "h264_amf" ]; then
 		PRESET="speed"
 		ENCODER_OPTS=(-c:v h264_amf -b:v "${TARGET_BITRATE}" -quality "$PRESET")
+	elif [ "$ENCODER" = "h264_v4l2m2m" ]; then
+		# Raspberry Pi hardware encoder (V4L2 M2M)
+		# Note: v4l2m2m doesn't support preset, just bitrate
+		ENCODER_OPTS=(-c:v h264_v4l2m2m -b:v "${TARGET_BITRATE}")
 	elif [ "$ENCODER" = "libx264" ]; then
 		PRESET="medium"
 		ENCODER_OPTS=(-c:v libx264 -b:v "${TARGET_BITRATE}" -preset "$PRESET")
@@ -1275,8 +1361,9 @@ download_video() {
 					echo "Trying video encoders in priority order..."
 					
 					# Get list of available encoders in priority order
+					# Use ENCODERS from environment/command line if set, otherwise auto-detect
 					local ENCODERS_STR
-					ENCODERS_STR=$(get_available_encoders_priority)
+					ENCODERS_STR=$(get_available_encoders_priority "${ENCODERS:-}")
 					local ENCODER_LIST_RESULT=$?
 					
 					if [ $ENCODER_LIST_RESULT -ne 0 ]; then
@@ -1672,9 +1759,10 @@ resolve_mobile_shared_url() {
 	resolve_mobile_shared_url_ret_success=1
 	resolve_mobile_shared_url_ret_error=""
 	
-	# Check if URL matches mobile shared format (multiple chars after /share/, not single letter paths like /r/, /v/, /p/)
-	if [[ ! "$MOBILE_SHARED_URL" =~ ^https?://(www\.)?facebook\.com/share/[A-Za-z0-9]{2,} ]]; then
-		resolve_mobile_shared_url_ret_error="URL does not match mobile shared format (facebook.com/share/... with multiple chars)"
+	# Check if URL matches mobile shared format (multiple chars after /share/, not single letter paths like /r/, /v/)
+	# Also accept /share/p/... format
+	if [[ ! "$MOBILE_SHARED_URL" =~ ^https?://(www\.)?facebook\.com/share/(p/)?[A-Za-z0-9]{2,} ]]; then
+		resolve_mobile_shared_url_ret_error="URL does not match mobile shared format (facebook.com/share/... or share/p/... with multiple chars)"
 		return 1
 	fi
 	
@@ -1750,8 +1838,21 @@ resolve_mobile_shared_url() {
 	fi
 	
 	if [ -z "$PHOTO_URL" ]; then
-		resolve_mobile_shared_url_ret_error="Could not find photo URL in gallery-dl debug output"
-		return 1
+		# Fallback: Try to parse the redirect URL to extract permalink ID
+		echo "Could not find photo URL in gallery-dl debug output, trying to parse redirect URL..."
+		
+		# Check if redirect URL matches /groups/XXXX/permalink/YYYYY pattern
+		if [[ "$REDIRECT_URL" =~ /groups/[0-9]+/permalink/([0-9]+) ]]; then
+			local PERMALINK_ID="${BASH_REMATCH[1]}"
+			echo "Found permalink ID in redirect URL: $PERMALINK_ID"
+			
+			# Construct media set URL: https://www.facebook.com/media/set/?set=pcb.PERMALINK_ID
+			PHOTO_URL="https://www.facebook.com/media/set/?set=pcb.$PERMALINK_ID"
+			echo "Constructed media set URL from permalink: $PHOTO_URL"
+		else
+			resolve_mobile_shared_url_ret_error="Could not find photo URL in gallery-dl debug output and redirect URL does not match /groups/XXXX/permalink/YYYYY pattern"
+			return 1
+		fi
 	fi
 	
 	resolve_mobile_shared_url_ret_photo_url="$PHOTO_URL"
@@ -2223,6 +2324,11 @@ usage() {
 	echo "  -cookies, --cookies FILE  Use cookies from specified file (Mozilla/Netscape format)"
 	echo "                    Takes precedence over --firefox option"
 	echo "  --firefox         Use cookies from Firefox browser"
+	echo "  --encoders LIST   Comma-separated list of video encoders to use (e.g., libx264,libx265)"
+	echo "                    If not specified, automatically detects and uses available encoders"
+	echo "                    Supported encoders: libx264, libx265, hevc_qsv, h264_qsv,"
+	echo "                    hevc_nvenc, h264_nvenc, hevc_amf, h264_amf, hevc_videotoolbox, h264_videotoolbox"
+	echo "                    Can also be set via ENCODERS environment variable in config file"
 	echo
 	echo "Arguments:"
 	echo "  file|url          One or more paths to image or video files, or URLs to download videos"
@@ -2389,6 +2495,7 @@ prepare_gallery_dl_params() {
 #   parse_command_line_ret_description_candidate - description text
 #   parse_command_line_ret_source_candidate - source text
 #   parse_command_line_ret_profile_name - profile name if -p option was used
+#   parse_command_line_ret_encoders - comma-separated list of encoder names if --encoders option was used
 # Side effects: Also exports PROFILE_NAME as a global variable for early use
 parse_command_line() {
 	# Initialize default values (hardcoded defaults, NOT from environment)
@@ -2404,6 +2511,7 @@ parse_command_line() {
 	local DISPLAY_SOURCE=0
 	local PASSWORD=""
 	local PROFILE_NAME=""
+	local USER_ENCODERS=""
 	
 	local ALL_MEDIA_FILES=()
 	local DESCRIPTION_CANDIDATE=""
@@ -2493,6 +2601,13 @@ while (( "$#" )); do
 			exit 1
 		fi
 		shift  # shift to remove the value from the params
+	elif [[ "$PARAM" == "--encoders" || "$PARAM" == "-encoders" ]]; then
+		USER_ENCODERS="$2"
+		if [ -z "$USER_ENCODERS" ]; then
+			echo "Encoder list is required after --encoders option (comma-separated, e.g., libx264,libx265)"
+			exit 1
+		fi
+		shift  # shift to remove the encoder list from the params
 	elif [[ "$PARAM" =~ ^- ]]; then
 		# Unrecognized option starting with - or --
 		local SCRIPT_NAME_ERR=$(basename "$0")
@@ -2546,6 +2661,7 @@ fi
 	parse_command_line_ret_description_candidate="$DESCRIPTION_CANDIDATE"
 	parse_command_line_ret_source_candidate="$SOURCE_CANDIDATE"
 	parse_command_line_ret_profile_name="$PROFILE_NAME"
+	parse_command_line_ret_encoders="$USER_ENCODERS"
 	
 	# Export PROFILE_NAME as a side effect for early use (before ENV loading)
 	export PROFILE_NAME
@@ -2708,10 +2824,11 @@ process_media_items() {
 			
 			# Check for mobile shared URLs (bypass yt-dlp as it downloads ads with cookies)
 			# Format: https://www.facebook.com/share/********* (multiple chars after /share/)
-			# But NOT: https://www.facebook.com/share/r/... or /v/... or /p/... (single letter paths)
-			# Pattern: /share/ followed by 2+ alphanumeric chars (not a single letter + slash)
-			if [[ "$MEDIA_ITEM" =~ ^https?://(www\.)?facebook\.com/share/[A-Za-z0-9]{2,} ]]; then
-				echo "URL is a mobile shared link (multiple chars after /share/), skipping video download to avoid ads"
+			# Also: https://www.facebook.com/share/p/********* (multiple chars after /share/p/)
+			# But NOT: https://www.facebook.com/share/r/... or /v/... (single letter paths)
+			# Pattern: /share/ or /share/p/ followed by 2+ alphanumeric chars (not a single letter + slash)
+			if [[ "$MEDIA_ITEM" =~ ^https?://(www\.)?facebook\.com/share/(p/)?[A-Za-z0-9]{2,} ]]; then
+				echo "URL is a mobile shared link (multiple chars after /share/ or /share/p/), skipping video download to avoid ads"
 				SKIP_VIDEO_DOWNLOAD=1
 			fi
 			
@@ -2754,8 +2871,8 @@ process_media_items() {
 					# No files were successfully processed - check if it's a mobile shared URL first
 					local MOBILE_SHARED_RESOLVED=0
 					local ORIGINAL_MEDIA_ITEM="$MEDIA_ITEM"  # Save original URL
-					# Check for mobile shared URLs (multiple chars after /share/, not single letter paths like /r/, /v/, /p/)
-					if [[ "$MEDIA_ITEM" =~ ^https?://(www\.)?facebook\.com/share/[A-Za-z0-9]{2,} ]]; then
+					# Check for mobile shared URLs (multiple chars after /share/ or /share/p/, not single letter paths like /r/, /v/)
+					if [[ "$MEDIA_ITEM" =~ ^https?://(www\.)?facebook\.com/share/(p/)?[A-Za-z0-9]{2,} ]]; then
 						echo "Video download failed, detected mobile shared URL, attempting to resolve..."
 						
 						# Initialize return variables
@@ -3384,6 +3501,7 @@ PARSED_DISPLAY_SOURCE="$parse_command_line_ret_display_source"
 PARSED_PASSWORD="$parse_command_line_ret_password"
 PARSED_DESCRIPTION_CANDIDATE="$parse_command_line_ret_description_candidate"
 PARSED_SOURCE_CANDIDATE="$parse_command_line_ret_source_candidate"
+PARSED_ENCODERS="$parse_command_line_ret_encoders"
 
 # Use extracted PROFILE_NAME to load config
 if [ -n "$PARSED_PROFILE_NAME" ]; then
@@ -3412,6 +3530,17 @@ fi
 # Support DISABLE_RELAY environment variable as an alternative to SEND_TO_RELAY=0
 if [[ "${DISABLE_RELAY:-0}" == "1" ]] || [[ "${DISABLE_RELAY:-0}" == "true" ]] || [[ "${DISABLE_RELAY:-0}" == "yes" ]]; then
 	SEND_TO_RELAY=0
+fi
+
+# Merge ENCODERS: Command-line takes precedence over environment variable
+if [ -n "$PARSED_ENCODERS" ]; then
+	ENCODERS="$PARSED_ENCODERS"
+elif [ -n "${ENCODERS:-}" ]; then
+	# Use environment variable if set
+	ENCODERS="$ENCODERS"
+else
+	# No encoders specified, will use automatic detection
+	ENCODERS=""
 fi
 
 # Merge: Use parsed command-line value if it was explicitly set (differs from default),

@@ -70,6 +70,17 @@ NSEC_KEY="nsec1..."
 # Takes precedence over --firefox command line option and USE_COOKIES_FF
 # COOKIES_FILE="./firefox_cookies.txt"
 
+# Comma-separated list of video encoders to use (optional)
+# If not set, automatically detects and uses available encoders in priority order
+# Command-line --encoders option takes precedence over this setting
+# Supported encoders: libx264, libx265, hevc_qsv, h264_qsv, hevc_nvenc, h264_nvenc,
+#                     hevc_amf, h264_amf, hevc_videotoolbox, h264_videotoolbox
+# Examples:
+#   ENCODERS="libx264,libx265"  # Use only software encoders
+#   ENCODERS="hevc_qsv"         # Use only Intel Quick Sync Video
+#   ENCODERS="libx264"           # Use only libx264 (h264 software encoder)
+# ENCODERS=""
+
 # Disable sending events to relays (useful for testing)
 # Default: 1 (send to relays)
 # Set SEND_TO_RELAY=0, NO_RELAY=1, or DISABLE_RELAY=1 to disable
