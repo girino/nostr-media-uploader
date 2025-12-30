@@ -9,3 +9,7 @@ telegram_bot.yaml
 __pycache__/
 apa.html
 firefox_cookies.txt
+
+venv/
+venv_windows/
+venv_linux/

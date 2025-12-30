@@ -1,7 +1,7 @@
 #!/bin/bash
 
 usage () {
-    echo "Usage: $0 [--profile=PROFILE|-profile=PROFILE|-p=PROFILE] [file1] [file2] ... [comment]"
+    echo "Usage: $0 [--profile=PROFILE|-profile=PROFILE|-p=PROFILE] [--blossom=SERVER] [--file-drop=URL] [--tag=TAG] [file1] [file2] ... [comment]"
     echo "Uploads files to Blossom servers and creates a kind 1 event with the URLs."
     echo "Files can be specified as individual files or directories containing files."
     echo "The last argument is treated as a comment for the event."
@@ -10,6 +10,13 @@ usage () {
     echo "  --profile=PROFILE    Use the specified profile from ~/.nostr/ (default: girino)"
     echo "  -profile=PROFILE     Short form of --profile"
     echo "  -p=PROFILE           Shortcut for -profile=PROFILE"
+    echo "  --blossom=SERVER     Use an alternative Blossom server (can be used multiple times)"
+    echo "  -blossom=SERVER      Short form of --blossom"
+    echo "  --file-drop=URL      Use file-drop server for uploads (e.g., http://192.168.31.103:3232/upload)"
+    echo "                       If file-drop fails, falls back to blossom servers"
+    echo "                       Can also be set via FILE_DROP_URL environment variable"
+    echo "  --tag=TAG            Add an additional hashtag to the event (can be used multiple times)"
+    echo "  -t TAG, --tag TAG    Alternative form for --tag"
 }
 
 # Default profile
@@ -116,6 +123,8 @@ if [[ -n "${EXTRA_BLOSSOMS[*]}" ]]; then
     BLOSSOM_SERVERS=("${EXTRA_BLOSSOMS[@]}" "${BLOSSOM_SERVERS[@]}")
 fi
 
+# Note: CMD_LINE_BLOSSOMS will be processed after parsing command line arguments
+
 
 if [[ -z "$NSEC_KEY" && -z "$KEY" ]]; then
     echo "Error: Neither NSEC_KEY nor KEY is set."
@@ -153,6 +162,47 @@ is_image_or_video() {
     else
         echo 0
     fi
+}
+
+# Function to upload a file to a file-drop server
+# Parameters:
+#   $1: FILE - path to file to upload
+#   $2: FILE_DROP_URL - file-drop server upload URL (e.g., http://192.168.31.103:3232/upload)
+# Returns: uploaded file URL via stdout
+# Exit code: 0 on success, 1 on failure
+upload_file_to_filedrop() {
+    local FILE="$1"
+    local FILE_DROP_URL="$2"
+    
+    if [[ ! -f "$FILE" ]]; then
+        echo "File does not exist: $FILE" >&2
+        return 1
+    fi
+    
+    echo "Uploading $FILE to file-drop server: $FILE_DROP_URL" >&2
+    local upload_output=$(curl -s -X POST -F "file=@$FILE" "$FILE_DROP_URL" 2>&1)
+    local RESULT=$?
+    
+    if [[ $RESULT -ne 0 ]]; then
+        echo "Failed to upload file $FILE to file-drop server: $upload_output" >&2
+        return 1
+    fi
+    
+    # Check if output is valid JSON
+    if ! echo "$upload_output" | jq . >/dev/null 2>&1; then
+        echo "Invalid JSON response from file-drop server: $upload_output" >&2
+        return 1
+    fi
+    
+    local file_url=$(echo "$upload_output" | jq -r '.url')
+    if [[ -z "$file_url" || "$file_url" == "null" ]]; then
+        echo "Failed to extract URL from file-drop response: $upload_output" >&2
+        return 1
+    fi
+    
+    echo "Uploaded to: $file_url" >&2
+    echo "$file_url"
+    return 0
 }
 
 # if exists NPUB_KEY, use "nak decode | jq -r .private_key" to get it. 
@@ -204,10 +254,62 @@ fi
 
 # Parse positional parameters
 EXTRA_TAGS=()
+CMD_LINE_BLOSSOMS=()
+FILE_DROP_URL="${FILE_DROP_URL:-}"  # Initialize from environment if set
 # Parse positional and non-positional parameters using shift
 while [[ $# -gt 0 ]]; do
     ARG="$1"
     case "$ARG" in
+        --blossom=*)
+            BLOSSOM_SERVER="${ARG#--blossom=}"
+            if [[ -z "$BLOSSOM_SERVER" ]]; then
+                echo "Missing value for $ARG"
+                usage
+                exit 1
+            fi
+            CMD_LINE_BLOSSOMS+=("$BLOSSOM_SERVER")
+            shift
+            ;;
+        --blossom|-blossom)
+            shift
+            BLOSSOM_SERVER="$1"
+            if [[ -z "$BLOSSOM_SERVER" ]]; then
+                echo "Missing value for $ARG"
+                usage
+                exit 1
+            fi
+            CMD_LINE_BLOSSOMS+=("$BLOSSOM_SERVER")
+            shift
+            ;;
+        -blossom=*)
+            BLOSSOM_SERVER="${ARG#-blossom=}"
+            if [[ -z "$BLOSSOM_SERVER" ]]; then
+                echo "Missing value for $ARG"
+                usage
+                exit 1
+            fi
+            CMD_LINE_BLOSSOMS+=("$BLOSSOM_SERVER")
+            shift
+            ;;
+        --file-drop=*)
+            FILE_DROP_URL="${ARG#--file-drop=}"
+            if [[ -z "$FILE_DROP_URL" ]]; then
+                echo "Missing value for $ARG"
+                usage
+                exit 1
+            fi
+            shift
+            ;;
+        --file-drop)
+            shift
+            FILE_DROP_URL="$1"
+            if [[ -z "$FILE_DROP_URL" ]]; then
+                echo "Missing value for --file-drop"
+                usage
+                exit 1
+            fi
+            shift
+            ;;
         --tag=*)
             TAG="${ARG#--tag=}"
             if [[ -z "$TAG" ]]; then
@@ -267,6 +369,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Apply command-line blossom servers (prepend them to the front)
+if [[ ${#CMD_LINE_BLOSSOMS[@]} -gt 0 ]]; then
+    echo "Adding command-line blossom servers to BLOSSOM_SERVERS: ${CMD_LINE_BLOSSOMS[@]}"
+    BLOSSOM_SERVERS=("${CMD_LINE_BLOSSOMS[@]}" "${BLOSSOM_SERVERS[@]}")
+fi
+
 # If there are more arguments after the comment, ignore them
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
@@ -282,33 +390,55 @@ for FILE in "${FILES[@]}"; do
     fi
 done
 
-# Upload files to Blossom servers using nak, collect URLs
+# Upload files to file-drop or Blossom servers, collect URLs
 BAD_SERVERS=()
 for FILE in "${FILES[@]}"; do
     UPLOADED=0
-    for SERVER in "${BLOSSOM_SERVERS[@]}"; do
-        echo "Uploading $FILE to $SERVER"
-        # Skip bad servers
-        if [[ " ${BAD_SERVERS[@]} " =~ " $SERVER " ]]; then
-            continue
-        fi
-        JSON_RET=$(nak blossom upload --server "$SERVER" "$FILE" 2>/dev/null)
-        if [[ $? -ne 0 ]]; then
-            echo "Error: Failed to upload $FILE to $SERVER"
-            BAD_SERVERS+=("$SERVER")
-            continue
-        fi
-        # Extract URL from JSON response
-        URL=$(echo "$JSON_RET" | jq -r '.url // empty')
-        if [[ -n "$URL" ]]; then
+    
+    # Try file-drop first if configured
+    if [[ -n "$FILE_DROP_URL" ]]; then
+        echo "Trying file-drop server for $FILE: $FILE_DROP_URL"
+        URL=$(upload_file_to_filedrop "$FILE" "$FILE_DROP_URL")
+        if [[ $? -eq 0 && -n "$URL" ]]; then
             URLS+=("$URL")
-            echo "Uploaded $FILE to $SERVER: $URL"
+            echo "Successfully uploaded $FILE to file-drop server: $URL"
             UPLOADED=1
-            break
+        else
+            echo "File-drop upload failed for $FILE, falling back to blossom servers" >&2
         fi
-    done
+    fi
+    
+    # If file-drop not configured or failed, try blossom servers
     if [[ $UPLOADED -eq 0 ]]; then
-        echo "Failed to upload $FILE to any Blossom server."
+        for SERVER in "${BLOSSOM_SERVERS[@]}"; do
+            echo "Uploading $FILE to $SERVER"
+            # Skip bad servers
+            if [[ " ${BAD_SERVERS[@]} " =~ " $SERVER " ]]; then
+                continue
+            fi
+            JSON_RET=$(nak blossom upload --server "$SERVER" "$FILE" 2>/dev/null)
+            if [[ $? -ne 0 ]]; then
+                echo "Error: Failed to upload $FILE to $SERVER"
+                BAD_SERVERS+=("$SERVER")
+                continue
+            fi
+            # Extract URL from JSON response
+            URL=$(echo "$JSON_RET" | jq -r '.url // empty')
+            if [[ -n "$URL" ]]; then
+                URLS+=("$URL")
+                echo "Uploaded $FILE to $SERVER: $URL"
+                UPLOADED=1
+                break
+            fi
+        done
+    fi
+    
+    if [[ $UPLOADED -eq 0 ]]; then
+        if [[ -n "$FILE_DROP_URL" ]]; then
+            echo "Failed to upload $FILE to file-drop server or any Blossom server."
+        else
+            echo "Failed to upload $FILE to any Blossom server."
+        fi
         exit 1
     fi
 done

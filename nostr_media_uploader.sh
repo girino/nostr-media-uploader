@@ -2095,6 +2095,47 @@ download_facebook_og_image() {
 	echo "Successfully downloaded Facebook image: $FINAL_IMAGE_FILE"
 }
 
+# Function to upload a file to a file-drop server
+# Parameters:
+#   $1: FILE - path to file to upload
+#   $2: FILE_DROP_URL - file-drop server upload URL (e.g., http://192.168.31.103:3232/upload)
+# Returns: uploaded file URL via stdout
+# Exit code: 0 on success, 1 on failure
+upload_file_to_filedrop() {
+	local FILE="$1"
+	local FILE_DROP_URL="$2"
+	
+	if [ ! -f "$FILE" ]; then
+		echo "File does not exist: $FILE" >&2
+		return 1
+	fi
+	
+	echo "Uploading $FILE to file-drop server: $FILE_DROP_URL" >&2
+	local upload_output=$(curl -s -X POST -F "file=@$FILE" "$FILE_DROP_URL" 2>&1)
+	local RESULT=$?
+	
+	if [ $RESULT -ne 0 ]; then
+		echo "Failed to upload file $FILE to file-drop server: $upload_output" >&2
+		return 1
+	fi
+	
+	# Check if output is valid JSON
+	if ! echo "$upload_output" | jq . >/dev/null 2>&1; then
+		echo "Invalid JSON response from file-drop server: $upload_output" >&2
+		return 1
+	fi
+	
+	local file_url=$(echo "$upload_output" | jq -r '.url')
+	if [ -z "$file_url" ] || [ "$file_url" == "null" ]; then
+		echo "Failed to extract URL from file-drop response: $upload_output" >&2
+		return 1
+	fi
+	
+	echo "Uploaded to: $file_url" >&2
+	echo "$file_url"
+	return 0
+}
+
 # Function to upload a file to a blossom server
 # Parameters:
 #   $1: FILE - path to file to upload
@@ -2329,6 +2370,9 @@ usage() {
 	echo "                    Supported encoders: libx264, libx265, hevc_qsv, h264_qsv,"
 	echo "                    hevc_nvenc, h264_nvenc, hevc_amf, h264_amf, hevc_videotoolbox, h264_videotoolbox"
 	echo "                    Can also be set via ENCODERS environment variable in config file"
+	echo "  --file-drop URL  Use file-drop server for uploads (e.g., http://192.168.31.103:3232/upload)"
+	echo "                    If file-drop fails, falls back to blossom servers"
+	echo "                    Can also be set via FILE_DROP_URL environment variable in config file"
 	echo
 	echo "Arguments:"
 	echo "  file|url          One or more paths to image or video files, or URLs to download videos"
@@ -2496,6 +2540,7 @@ prepare_gallery_dl_params() {
 #   parse_command_line_ret_source_candidate - source text
 #   parse_command_line_ret_profile_name - profile name if -p option was used
 #   parse_command_line_ret_encoders - comma-separated list of encoder names if --encoders option was used
+#   parse_command_line_ret_file_drop_url - file-drop server URL if --file-drop option was used
 # Side effects: Also exports PROFILE_NAME as a global variable for early use
 parse_command_line() {
 	# Initialize default values (hardcoded defaults, NOT from environment)
@@ -2512,6 +2557,7 @@ parse_command_line() {
 	local PASSWORD=""
 	local PROFILE_NAME=""
 	local USER_ENCODERS=""
+	local FILE_DROP_URL=""
 	
 	local ALL_MEDIA_FILES=()
 	local DESCRIPTION_CANDIDATE=""
@@ -2608,6 +2654,13 @@ while (( "$#" )); do
 			exit 1
 		fi
 		shift  # shift to remove the encoder list from the params
+	elif [[ "$PARAM" == "--file-drop" || "$PARAM" == "-file-drop" ]]; then
+		FILE_DROP_URL="$2"
+		if [ -z "$FILE_DROP_URL" ]; then
+			echo "File-drop URL is required after --file-drop option (e.g., http://192.168.31.103:3232/upload)"
+			exit 1
+		fi
+		shift  # shift to remove the URL from the params
 	elif [[ "$PARAM" =~ ^- ]]; then
 		# Unrecognized option starting with - or --
 		local SCRIPT_NAME_ERR=$(basename "$0")
@@ -2662,6 +2715,7 @@ fi
 	parse_command_line_ret_source_candidate="$SOURCE_CANDIDATE"
 	parse_command_line_ret_profile_name="$PROFILE_NAME"
 	parse_command_line_ret_encoders="$USER_ENCODERS"
+	parse_command_line_ret_file_drop_url="$FILE_DROP_URL"
 	
 	# Export PROFILE_NAME as a side effect for early use (before ENV loading)
 	export PROFILE_NAME
@@ -3130,6 +3184,7 @@ process_media_items() {
 #   $9: DISPLAY_SOURCE - 1 to display, 0 otherwise
 #   $10: SEND_TO_RELAY - 1 to send, 0 otherwise
 #   $11: DESCRIPTION - global description to append at the end
+#   $12: FILE_DROP_URL - file-drop server URL (empty if not set, will fall back to blossom)
 # Returns: Exit code (0=success, dies on failure)
 upload_and_publish_event() {
 	local PROCESSED_FILES_STR="$1"
@@ -3143,6 +3198,7 @@ upload_and_publish_event() {
 	local DISPLAY_SOURCE="$9"
 	local SEND_TO_RELAY="${10}"
 	local DESCRIPTION="${11}"
+	local FILE_DROP_URL="${12}"
 	
 	# Deserialize arrays
 	local PROCESSED_FILES=()
@@ -3171,11 +3227,6 @@ if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
 	die "No files to upload"
 fi
 
-	# Check if we have any valid blossom servers
-	if [ ${#BLOSSOMS_LIST[@]} -eq 0 ]; then
-		die "No valid blossom servers configured. Please check your BLOSSOMS configuration."
-	fi
-
 	local UPLOAD_URLS=()
 	local RESULT=0
 	local upload_success=0
@@ -3187,30 +3238,76 @@ fi
 	local NAK_CMD
 	local RELAY
 	
-	for TRIES in "${!BLOSSOMS_LIST[@]}"; do
-		BLOSSOM="${BLOSSOMS_LIST[$TRIES]}"
-		# Skip empty blossom URLs
-		if [ -z "$BLOSSOM" ]; then
-			echo "Skipping empty blossom server entry" >&2
-			continue
-		fi
-		echo "Using blossom: $BLOSSOM, try: $((TRIES+1))"
-	
+	# Try file-drop first if configured
+	if [ -n "$FILE_DROP_URL" ]; then
+		echo "Trying file-drop server: $FILE_DROP_URL"
 		UPLOAD_URLS=()
 		upload_success=1
 		
 		for FILE in "${PROCESSED_FILES[@]}"; do
-			upload_url=$(upload_file_to_blossom "$FILE" "$BLOSSOM" "$KEY_DECRYPTED")
+			upload_url=$(upload_file_to_filedrop "$FILE" "$FILE_DROP_URL")
 			if [ $? -ne 0 ]; then
-			upload_success=0
-			break
-		fi
+				echo "File-drop upload failed for $FILE, will fall back to blossom servers" >&2
+				upload_success=0
+				break
+			fi
 			UPLOAD_URLS+=("$upload_url")
-	done
+		done
+		
+		# If file-drop succeeded for all files, proceed with publishing
+		if [ $upload_success -eq 1 ]; then
+			echo "Successfully uploaded all files to file-drop server"
+		else
+			echo "File-drop upload failed, falling back to blossom servers" >&2
+			UPLOAD_URLS=()
+		fi
+	fi
+	
+	# If file-drop not configured or failed, use blossom servers
+	if [ ${#UPLOAD_URLS[@]} -eq 0 ]; then
+		# Check if we have any valid blossom servers
+		if [ ${#BLOSSOMS_LIST[@]} -eq 0 ]; then
+			if [ -n "$FILE_DROP_URL" ]; then
+				die "File-drop upload failed and no valid blossom servers configured. Please check your BLOSSOMS configuration."
+			else
+				die "No valid blossom servers configured. Please check your BLOSSOMS configuration."
+			fi
+		fi
+		
+		for TRIES in "${!BLOSSOMS_LIST[@]}"; do
+			BLOSSOM="${BLOSSOMS_LIST[$TRIES]}"
+			# Skip empty blossom URLs
+			if [ -z "$BLOSSOM" ]; then
+				echo "Skipping empty blossom server entry" >&2
+				continue
+			fi
+			echo "Using blossom: $BLOSSOM, try: $((TRIES+1))"
+		
+			UPLOAD_URLS=()
+			upload_success=1
+			
+			for FILE in "${PROCESSED_FILES[@]}"; do
+				upload_url=$(upload_file_to_blossom "$FILE" "$BLOSSOM" "$KEY_DECRYPTED")
+				if [ $? -ne 0 ]; then
+					upload_success=0
+					break
+				fi
+				UPLOAD_URLS+=("$upload_url")
+			done
 
-	if [ $upload_success -eq 0 ]; then
-		RESULT=1
-		continue
+			if [ $upload_success -eq 0 ]; then
+				RESULT=1
+				continue
+			fi
+			
+			# Successfully uploaded to this blossom server, break out of loop
+			break
+		done
+	fi
+	
+	# Check if we successfully uploaded all files
+	if [ ${#UPLOAD_URLS[@]} -ne ${#PROCESSED_FILES[@]} ]; then
+		die "Failed to upload all files (uploaded ${#UPLOAD_URLS[@]} of ${#PROCESSED_FILES[@]})"
 	fi
 
 	# Build content for kind 1 event: interleaved URL -> caption -> URL -> caption, then sources at bottom
@@ -3254,14 +3351,11 @@ fi
 	
 	if [ $RESULT -eq 0 ]; then
 		echo "Successfully published kind 1 event"
-			return 0
+		return 0
 	else
-		echo "Failed to publish kind 1 event, trying next blossom server"
-		RESULT=1
+		echo "Failed to publish kind 1 event" >&2
+		die "Failed to publish kind 1 event"
 	fi
-done
-
-	die "Failed to upload files and publish event"
 }
 
 # Function to update history file after successful publish
@@ -3448,9 +3542,10 @@ main() {
 	# ========================================================================
 	# UPLOAD AND PUBLISH EVENT
 	# ========================================================================
+	local FILE_DROP_URL="${FILE_DROP_URL:-}"
 	upload_and_publish_event "$PROCESSED_FILES_STR" "$FILE_CAPTIONS_STR" "$FILE_SOURCES_STR" \
 		"$FILE_GALLERIES_STR" "$BLOSSOMS_LIST_STR" "$RELAYS_LIST" "$KEY_DECRYPTED" \
-		"$POW_DIFF" "$DISPLAY_SOURCE" "$SEND_TO_RELAY" "$DESCRIPTION_CANDIDATE"
+		"$POW_DIFF" "$DISPLAY_SOURCE" "$SEND_TO_RELAY" "$DESCRIPTION_CANDIDATE" "$FILE_DROP_URL"
 	
 	# ========================================================================
 	# UPDATE HISTORY FILE
@@ -3502,6 +3597,7 @@ PARSED_PASSWORD="$parse_command_line_ret_password"
 PARSED_DESCRIPTION_CANDIDATE="$parse_command_line_ret_description_candidate"
 PARSED_SOURCE_CANDIDATE="$parse_command_line_ret_source_candidate"
 PARSED_ENCODERS="$parse_command_line_ret_encoders"
+PARSED_FILE_DROP_URL="$parse_command_line_ret_file_drop_url"
 
 # Use extracted PROFILE_NAME to load config
 if [ -n "$PARSED_PROFILE_NAME" ]; then
@@ -3541,6 +3637,17 @@ elif [ -n "${ENCODERS:-}" ]; then
 else
 	# No encoders specified, will use automatic detection
 	ENCODERS=""
+fi
+
+# Merge FILE_DROP_URL: Command-line takes precedence over environment variable
+if [ -n "$PARSED_FILE_DROP_URL" ]; then
+	FILE_DROP_URL="$PARSED_FILE_DROP_URL"
+elif [ -n "${FILE_DROP_URL:-}" ]; then
+	# Use environment variable if set
+	FILE_DROP_URL="$FILE_DROP_URL"
+else
+	# No file-drop URL specified
+	FILE_DROP_URL=""
 fi
 
 # Merge: Use parsed command-line value if it was explicitly set (differs from default),
@@ -3633,6 +3740,7 @@ export KEY
 export EXTRA_RELAYS
 export EXTRA_BLOSSOMS
 export PROFILE_NAME
+export FILE_DROP_URL
 
 # Export parsed command-line results for main() to use
 export PARSED_MEDIA_FILES
