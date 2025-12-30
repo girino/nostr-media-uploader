@@ -15,6 +15,9 @@ usage () {
     echo "  --file-drop=URL      Use file-drop server for uploads (e.g., http://192.168.31.103:3232/upload)"
     echo "                       If file-drop fails, falls back to blossom servers"
     echo "                       Can also be set via FILE_DROP_URL environment variable"
+    echo "  --file-drop-url-prefix=PREFIX  Replace https://dweb.link/ prefix in file-drop URLs"
+    echo "                                 with custom prefix (e.g., https://gateway.example.com)"
+    echo "                                 Can also be set via FILE_DROP_URL_PREFIX environment variable"
     echo "  --tag=TAG            Add an additional hashtag to the event (can be used multiple times)"
     echo "  -t TAG, --tag TAG    Alternative form for --tag"
 }
@@ -168,11 +171,13 @@ is_image_or_video() {
 # Parameters:
 #   $1: FILE - path to file to upload
 #   $2: FILE_DROP_URL - file-drop server upload URL (e.g., http://192.168.31.103:3232/upload)
-# Returns: uploaded file URL via stdout
+#   $3: URL_PREFIX - optional URL prefix to replace https://dweb.link/ (empty if not set)
+# Returns: uploaded file URL via stdout (with prefix replaced if URL_PREFIX is set)
 # Exit code: 0 on success, 1 on failure
 upload_file_to_filedrop() {
     local FILE="$1"
     local FILE_DROP_URL="$2"
+    local URL_PREFIX="${3:-}"
     
     if [[ ! -f "$FILE" ]]; then
         echo "File does not exist: $FILE" >&2
@@ -198,6 +203,15 @@ upload_file_to_filedrop() {
     if [[ -z "$file_url" || "$file_url" == "null" ]]; then
         echo "Failed to extract URL from file-drop response: $upload_output" >&2
         return 1
+    fi
+    
+    # Replace URL prefix if URL_PREFIX is set
+    if [[ -n "$URL_PREFIX" ]]; then
+        # Remove trailing slash from prefix if present
+        URL_PREFIX=$(echo "$URL_PREFIX" | sed 's:/*$::')
+        # Replace https://dweb.link/ with the custom prefix
+        file_url=$(echo "$file_url" | sed "s|^https://dweb\.link/|${URL_PREFIX}/|")
+        echo "Replaced URL prefix with: $URL_PREFIX" >&2
     fi
     
     echo "Uploaded to: $file_url" >&2
@@ -256,6 +270,7 @@ fi
 EXTRA_TAGS=()
 CMD_LINE_BLOSSOMS=()
 FILE_DROP_URL="${FILE_DROP_URL:-}"  # Initialize from environment if set
+FILE_DROP_URL_PREFIX="${FILE_DROP_URL_PREFIX:-}"  # Initialize from environment if set
 # Parse positional and non-positional parameters using shift
 while [[ $# -gt 0 ]]; do
     ARG="$1"
@@ -305,6 +320,25 @@ while [[ $# -gt 0 ]]; do
             FILE_DROP_URL="$1"
             if [[ -z "$FILE_DROP_URL" ]]; then
                 echo "Missing value for --file-drop"
+                usage
+                exit 1
+            fi
+            shift
+            ;;
+        --file-drop-url-prefix=*)
+            FILE_DROP_URL_PREFIX="${ARG#--file-drop-url-prefix=}"
+            if [[ -z "$FILE_DROP_URL_PREFIX" ]]; then
+                echo "Missing value for $ARG"
+                usage
+                exit 1
+            fi
+            shift
+            ;;
+        --file-drop-url-prefix)
+            shift
+            FILE_DROP_URL_PREFIX="$1"
+            if [[ -z "$FILE_DROP_URL_PREFIX" ]]; then
+                echo "Missing value for --file-drop-url-prefix"
                 usage
                 exit 1
             fi
@@ -398,7 +432,7 @@ for FILE in "${FILES[@]}"; do
     # Try file-drop first if configured
     if [[ -n "$FILE_DROP_URL" ]]; then
         echo "Trying file-drop server for $FILE: $FILE_DROP_URL"
-        URL=$(upload_file_to_filedrop "$FILE" "$FILE_DROP_URL")
+        URL=$(upload_file_to_filedrop "$FILE" "$FILE_DROP_URL" "$FILE_DROP_URL_PREFIX")
         if [[ $? -eq 0 && -n "$URL" ]]; then
             URLS+=("$URL")
             echo "Successfully uploaded $FILE to file-drop server: $URL"

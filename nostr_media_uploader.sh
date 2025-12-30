@@ -2099,11 +2099,13 @@ download_facebook_og_image() {
 # Parameters:
 #   $1: FILE - path to file to upload
 #   $2: FILE_DROP_URL - file-drop server upload URL (e.g., http://192.168.31.103:3232/upload)
-# Returns: uploaded file URL via stdout
+#   $3: URL_PREFIX - optional URL prefix to replace https://dweb.link/ (empty if not set)
+# Returns: uploaded file URL via stdout (with prefix replaced if URL_PREFIX is set)
 # Exit code: 0 on success, 1 on failure
 upload_file_to_filedrop() {
 	local FILE="$1"
 	local FILE_DROP_URL="$2"
+	local URL_PREFIX="${3:-}"
 	
 	if [ ! -f "$FILE" ]; then
 		echo "File does not exist: $FILE" >&2
@@ -2129,6 +2131,15 @@ upload_file_to_filedrop() {
 	if [ -z "$file_url" ] || [ "$file_url" == "null" ]; then
 		echo "Failed to extract URL from file-drop response: $upload_output" >&2
 		return 1
+	fi
+	
+	# Replace URL prefix if URL_PREFIX is set
+	if [ -n "$URL_PREFIX" ]; then
+		# Remove trailing slash from prefix if present
+		URL_PREFIX=$(echo "$URL_PREFIX" | sed 's:/*$::')
+		# Replace https://dweb.link/ with the custom prefix
+		file_url=$(echo "$file_url" | sed "s|^https://dweb\.link/|${URL_PREFIX}/|")
+		echo "Replaced URL prefix with: $URL_PREFIX" >&2
 	fi
 	
 	echo "Uploaded to: $file_url" >&2
@@ -2373,6 +2384,9 @@ usage() {
 	echo "  --file-drop URL  Use file-drop server for uploads (e.g., http://192.168.31.103:3232/upload)"
 	echo "                    If file-drop fails, falls back to blossom servers"
 	echo "                    Can also be set via FILE_DROP_URL environment variable in config file"
+	echo "  --file-drop-url-prefix PREFIX  Replace https://dweb.link/ prefix in file-drop URLs"
+	echo "                                 with custom prefix (e.g., https://gateway.example.com)"
+	echo "                                 Can also be set via FILE_DROP_URL_PREFIX environment variable"
 	echo
 	echo "Arguments:"
 	echo "  file|url          One or more paths to image or video files, or URLs to download videos"
@@ -2541,6 +2555,7 @@ prepare_gallery_dl_params() {
 #   parse_command_line_ret_profile_name - profile name if -p option was used
 #   parse_command_line_ret_encoders - comma-separated list of encoder names if --encoders option was used
 #   parse_command_line_ret_file_drop_url - file-drop server URL if --file-drop option was used
+#   parse_command_line_ret_file_drop_url_prefix - URL prefix if --file-drop-url-prefix option was used
 # Side effects: Also exports PROFILE_NAME as a global variable for early use
 parse_command_line() {
 	# Initialize default values (hardcoded defaults, NOT from environment)
@@ -2558,6 +2573,7 @@ parse_command_line() {
 	local PROFILE_NAME=""
 	local USER_ENCODERS=""
 	local FILE_DROP_URL=""
+	local FILE_DROP_URL_PREFIX=""
 	
 	local ALL_MEDIA_FILES=()
 	local DESCRIPTION_CANDIDATE=""
@@ -2661,6 +2677,13 @@ while (( "$#" )); do
 			exit 1
 		fi
 		shift  # shift to remove the URL from the params
+	elif [[ "$PARAM" == "--file-drop-url-prefix" || "$PARAM" == "-file-drop-url-prefix" ]]; then
+		FILE_DROP_URL_PREFIX="$2"
+		if [ -z "$FILE_DROP_URL_PREFIX" ]; then
+			echo "URL prefix is required after --file-drop-url-prefix option (e.g., https://gateway.example.com)"
+			exit 1
+		fi
+		shift  # shift to remove the prefix from the params
 	elif [[ "$PARAM" =~ ^- ]]; then
 		# Unrecognized option starting with - or --
 		local SCRIPT_NAME_ERR=$(basename "$0")
@@ -2716,6 +2739,7 @@ fi
 	parse_command_line_ret_profile_name="$PROFILE_NAME"
 	parse_command_line_ret_encoders="$USER_ENCODERS"
 	parse_command_line_ret_file_drop_url="$FILE_DROP_URL"
+	parse_command_line_ret_file_drop_url_prefix="$FILE_DROP_URL_PREFIX"
 	
 	# Export PROFILE_NAME as a side effect for early use (before ENV loading)
 	export PROFILE_NAME
@@ -3185,6 +3209,7 @@ process_media_items() {
 #   $10: SEND_TO_RELAY - 1 to send, 0 otherwise
 #   $11: DESCRIPTION - global description to append at the end
 #   $12: FILE_DROP_URL - file-drop server URL (empty if not set, will fall back to blossom)
+#   $13: FILE_DROP_URL_PREFIX - URL prefix to replace https://dweb.link/ (empty if not set)
 # Returns: Exit code (0=success, dies on failure)
 upload_and_publish_event() {
 	local PROCESSED_FILES_STR="$1"
@@ -3199,6 +3224,7 @@ upload_and_publish_event() {
 	local SEND_TO_RELAY="${10}"
 	local DESCRIPTION="${11}"
 	local FILE_DROP_URL="${12}"
+	local FILE_DROP_URL_PREFIX="${13}"
 	
 	# Deserialize arrays
 	local PROCESSED_FILES=()
@@ -3245,7 +3271,7 @@ fi
 		upload_success=1
 		
 		for FILE in "${PROCESSED_FILES[@]}"; do
-			upload_url=$(upload_file_to_filedrop "$FILE" "$FILE_DROP_URL")
+			upload_url=$(upload_file_to_filedrop "$FILE" "$FILE_DROP_URL" "$FILE_DROP_URL_PREFIX")
 			if [ $? -ne 0 ]; then
 				echo "File-drop upload failed for $FILE, will fall back to blossom servers" >&2
 				upload_success=0
@@ -3543,9 +3569,10 @@ main() {
 	# UPLOAD AND PUBLISH EVENT
 	# ========================================================================
 	local FILE_DROP_URL="${FILE_DROP_URL:-}"
+	local FILE_DROP_URL_PREFIX="${FILE_DROP_URL_PREFIX:-}"
 	upload_and_publish_event "$PROCESSED_FILES_STR" "$FILE_CAPTIONS_STR" "$FILE_SOURCES_STR" \
 		"$FILE_GALLERIES_STR" "$BLOSSOMS_LIST_STR" "$RELAYS_LIST" "$KEY_DECRYPTED" \
-		"$POW_DIFF" "$DISPLAY_SOURCE" "$SEND_TO_RELAY" "$DESCRIPTION_CANDIDATE" "$FILE_DROP_URL"
+		"$POW_DIFF" "$DISPLAY_SOURCE" "$SEND_TO_RELAY" "$DESCRIPTION_CANDIDATE" "$FILE_DROP_URL" "$FILE_DROP_URL_PREFIX"
 	
 	# ========================================================================
 	# UPDATE HISTORY FILE
@@ -3598,6 +3625,7 @@ PARSED_DESCRIPTION_CANDIDATE="$parse_command_line_ret_description_candidate"
 PARSED_SOURCE_CANDIDATE="$parse_command_line_ret_source_candidate"
 PARSED_ENCODERS="$parse_command_line_ret_encoders"
 PARSED_FILE_DROP_URL="$parse_command_line_ret_file_drop_url"
+PARSED_FILE_DROP_URL_PREFIX="$parse_command_line_ret_file_drop_url_prefix"
 
 # Use extracted PROFILE_NAME to load config
 if [ -n "$PARSED_PROFILE_NAME" ]; then
@@ -3648,6 +3676,17 @@ elif [ -n "${FILE_DROP_URL:-}" ]; then
 else
 	# No file-drop URL specified
 	FILE_DROP_URL=""
+fi
+
+# Merge FILE_DROP_URL_PREFIX: Command-line takes precedence over environment variable
+if [ -n "$PARSED_FILE_DROP_URL_PREFIX" ]; then
+	FILE_DROP_URL_PREFIX="$PARSED_FILE_DROP_URL_PREFIX"
+elif [ -n "${FILE_DROP_URL_PREFIX:-}" ]; then
+	# Use environment variable if set
+	FILE_DROP_URL_PREFIX="$FILE_DROP_URL_PREFIX"
+else
+	# No file-drop URL prefix specified
+	FILE_DROP_URL_PREFIX=""
 fi
 
 # Merge: Use parsed command-line value if it was explicitly set (differs from default),
@@ -3741,6 +3780,7 @@ export EXTRA_RELAYS
 export EXTRA_BLOSSOMS
 export PROFILE_NAME
 export FILE_DROP_URL
+export FILE_DROP_URL_PREFIX
 
 # Export parsed command-line results for main() to use
 export PARSED_MEDIA_FILES
