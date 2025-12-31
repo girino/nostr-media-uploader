@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.error import TimedOut, NetworkError
 
 
 # Configure logging
@@ -692,6 +693,47 @@ async def execute_script(cmd, cwd=None):
         }
 
 
+async def send_message_with_retry(message, text, max_retries=3, retry_delay=1.0, edit_text=False, **kwargs):
+    """Send a message with retry logic for timeout and network errors.
+    
+    Args:
+        message: The message object to reply to or edit
+        text: The text to send
+        max_retries: Maximum number of retry attempts (default: 3)
+        retry_delay: Initial delay between retries in seconds (default: 1.0)
+        edit_text: If True, edit the existing message; if False, send a new message
+        **kwargs: Additional arguments to pass to reply_text/edit_text
+    
+    Returns:
+        The sent message object, or None if all retries failed
+    """
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            if edit_text:
+                # Editing existing message
+                return await message.edit_text(text, **kwargs)
+            else:
+                # Sending new message
+                return await message.reply_text(text, **kwargs)
+        except (TimedOut, NetworkError) as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                logger.warning(f"Message send attempt {attempt + 1} failed with {type(e).__name__}, retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Failed to send message after {max_retries} attempts: {e}")
+        except Exception as e:
+            # For non-network errors, don't retry
+            logger.error(f"Non-retryable error sending message: {e}")
+            raise
+    
+    # If we get here, all retries failed
+    logger.error(f"Could not send message after {max_retries} attempts. Last error: {last_exception}")
+    return None
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming messages and process links from the owner."""
     # Handle both regular messages and channel posts
@@ -853,11 +895,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     # If we have media files, process them
     if media_files:
+        # Try to send acknowledgment, but don't fail if it times out
+        status_msg = None
         try:
-            # Send acknowledgment
-            status_msg = await message.reply_text(
+            status_msg = await send_message_with_retry(
+                message,
                 f"Processing {len(media_files)} media file(s)..."
             )
+            if status_msg is None:
+                logger.warning("Could not send status message for media files, continuing without it")
+        except Exception as e:
+            logger.warning(f"Failed to send status message for media files: {e}, continuing without it")
+        
+        try:
             
             # Build command with local files
             cmd = build_command(
@@ -935,11 +985,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         
                         # Create clickable link using Markdown format
                         response_msg = f"✅ [View on Nostr]({client_url})\n\n`{nevent}`"
-                        await status_msg.edit_text(response_msg, parse_mode='Markdown')
+                        if status_msg:
+                            await send_message_with_retry(status_msg, response_msg, edit_text=True, parse_mode='Markdown')
+                        else:
+                            await send_message_with_retry(message, response_msg, parse_mode='Markdown')
                         logger.info(f"Successfully processed media files, nevent: {nevent}, client_url: {client_url}")
                     else:
                         # Return only the nevent formatted ID if no client URL configured
-                        await status_msg.edit_text(nevent)
+                        if status_msg:
+                            await send_message_with_retry(status_msg, nevent, edit_text=True)
+                        else:
+                            await send_message_with_retry(message, nevent)
                         logger.info(f"Successfully processed media files, nevent: {nevent}")
                 else:
                     # Fallback if we couldn't extract/encode event ID
@@ -947,7 +1003,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     success_msg = f"✅ Successfully processed {len(media_files)} media file(s)"
                     if event_id:
                         success_msg += f"\nEvent ID: {event_id} (could not encode to nevent)"
-                    await status_msg.edit_text(success_msg)
+                    if status_msg:
+                        await send_message_with_retry(status_msg, success_msg, edit_text=True)
+                    else:
+                        await send_message_with_retry(message, success_msg)
             else:
                 # Combine stderr and stdout for error messages (bash scripts often use both)
                 error_parts = []
@@ -971,13 +1030,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 else:
                     error_display = f"❌ Error processing media file(s)\n\n{error_msg}"
                 
-                await status_msg.edit_text(error_display)
+                if status_msg:
+                    await send_message_with_retry(status_msg, error_display, edit_text=True)
+                else:
+                    await send_message_with_retry(message, error_display)
                 logger.error(f"Error processing media files")
                 logger.error(f"stderr: {result['stderr']}")
                 logger.error(f"stdout: {result['stdout']}")
         except Exception as e:
             logger.exception(f"Exception while processing media files: {e}")
-            await message.reply_text(f"❌ Exception occurred: {str(e)}")
+            # Try to send error message, but don't fail if it times out
+            try:
+                await send_message_with_retry(message, f"❌ Exception occurred: {str(e)}")
+            except Exception as send_error:
+                logger.error(f"Failed to send error message: {send_error}")
             # Clean up temporary files on error
             for temp_file in media_files:
                 try:
@@ -997,11 +1063,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Extract extra text after URLs
     extra_text = extract_extra_text(text, urls)
     
+    # Try to send acknowledgment, but don't fail if it times out
+    status_msg = None
     try:
-        # Send acknowledgment
-        status_msg = await message.reply_text(
+        status_msg = await send_message_with_retry(
+            message,
             f"Processing {len(urls)} URL(s): {urls[0][:50]}{'...' if len(urls[0]) > 50 else ''}..."
         )
+        if status_msg is None:
+            logger.warning("Could not send status message, continuing without it")
+    except Exception as e:
+        logger.warning(f"Failed to send status message: {e}, continuing without it")
+    
+    try:
         
         # Build command
         cmd = build_command(
@@ -1072,11 +1146,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     
                     # Create clickable link using Markdown format
                     response_msg = f"✅ [View on Nostr]({client_url})\n\n`{nevent}`"
-                    await status_msg.edit_text(response_msg, parse_mode='Markdown')
+                    if status_msg:
+                        await send_message_with_retry(status_msg, response_msg, edit_text=True, parse_mode='Markdown')
+                    else:
+                        await send_message_with_retry(message, response_msg, parse_mode='Markdown')
                     logger.info(f"Successfully processed URLs: {urls}, nevent: {nevent}, client_url: {client_url}")
                 else:
                     # Return only the nevent formatted ID if no client URL configured
-                    await status_msg.edit_text(nevent)
+                    if status_msg:
+                        await send_message_with_retry(status_msg, nevent, edit_text=True)
+                    else:
+                        await send_message_with_retry(message, nevent)
                     logger.info(f"Successfully processed URLs: {urls}, nevent: {nevent}")
             else:
                 # Fallback if we couldn't extract/encode event ID
@@ -1084,7 +1164,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 success_msg = f"✅ Successfully processed {len(urls)} URL(s)"
                 if event_id:
                     success_msg += f"\nEvent ID: {event_id} (could not encode to nevent)"
-                await status_msg.edit_text(success_msg)
+                if status_msg:
+                    await send_message_with_retry(status_msg, success_msg, edit_text=True)
+                else:
+                    await send_message_with_retry(message, success_msg)
         else:
             # Combine stderr and stdout for error messages (bash scripts often use both)
             error_parts = []
@@ -1108,13 +1191,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 error_display = f"❌ Error processing URL(s)\n\n{error_msg}"
             
-            await status_msg.edit_text(error_display)
+            if status_msg:
+                await send_message_with_retry(status_msg, error_display, edit_text=True)
+            else:
+                await send_message_with_retry(message, error_display)
             logger.error(f"Error processing URLs {urls}")
             logger.error(f"stderr: {result['stderr']}")
             logger.error(f"stdout: {result['stdout']}")
     except Exception as e:
         logger.exception(f"Exception while processing message: {e}")
-        await message.reply_text(f"❌ Exception occurred: {str(e)}")
+        # Try to send error message, but don't fail if it times out
+        try:
+            await send_message_with_retry(message, f"❌ Exception occurred: {str(e)}")
+        except Exception as send_error:
+            logger.error(f"Failed to send error message: {send_error}")
 
 
 def main() -> None:
