@@ -903,10 +903,12 @@ map_encoder_to_spec() {
 #   $1: USER_ENCODERS - optional comma-separated list of encoder names (e.g., "libx264,libx265")
 #       If provided, only these encoders will be used (if available in ffmpeg)
 #       If empty, uses automatic detection
+#   $2: ENABLE_H265 - 1 to enable H265/HEVC encoders, 0 to disable (default: 0, only H264)
 # Returns: serialized array of encoder specs via stdout
 # Format: "encoder_name:type:hw" where type is "h265" or "h264", hw is "1" or "0"
 get_available_encoders_priority() {
 	local USER_ENCODERS="$1"
+	local ENABLE_H265="${2:-0}"
 	
 	# Check available encoders - extract encoder names from ffmpeg output
 	# Format: "V..... libx264            H.264 / AVC / ..."
@@ -950,30 +952,33 @@ get_available_encoders_priority() {
 	fi
 	
 	# Automatic detection: Priority order: h265 hardware > h264 hardware > h264 software > h265 software
+	# (Only if H265 is enabled, otherwise: h264 hardware > h264 software)
 	
 	# Priority order: h265 hardware > h264 hardware > h264 software > h265 software
 	# (For software encoders, libx264 is faster than libx265, so it's preferred)
 	# Check each encoder and add to list if available AND hardware is present
 	
-	# h265 hardware encoders
-	if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_qsv\b'; then
-		if check_hardware_encoder_available "hevc_qsv"; then
-			ENCODER_LIST+=("hevc_qsv:h265:1")
+	# h265 hardware encoders (only if H265 is enabled)
+	if [ "$ENABLE_H265" -eq 1 ]; then
+		if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_qsv\b'; then
+			if check_hardware_encoder_available "hevc_qsv"; then
+				ENCODER_LIST+=("hevc_qsv:h265:1")
+			fi
 		fi
-	fi
-	if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_nvenc\b'; then
-		if check_hardware_encoder_available "hevc_nvenc"; then
-			ENCODER_LIST+=("hevc_nvenc:h265:1")
+		if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_nvenc\b'; then
+			if check_hardware_encoder_available "hevc_nvenc"; then
+				ENCODER_LIST+=("hevc_nvenc:h265:1")
+			fi
 		fi
-	fi
-	if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_videotoolbox\b'; then
-		if check_hardware_encoder_available "hevc_videotoolbox"; then
-			ENCODER_LIST+=("hevc_videotoolbox:h265:1")
+		if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_videotoolbox\b'; then
+			if check_hardware_encoder_available "hevc_videotoolbox"; then
+				ENCODER_LIST+=("hevc_videotoolbox:h265:1")
+			fi
 		fi
-	fi
-	if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_amf\b'; then
-		if check_hardware_encoder_available "hevc_amf"; then
-			ENCODER_LIST+=("hevc_amf:h265:1")
+		if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_amf\b'; then
+			if check_hardware_encoder_available "hevc_amf"; then
+				ENCODER_LIST+=("hevc_amf:h265:1")
+			fi
 		fi
 	fi
 	
@@ -1009,9 +1014,11 @@ get_available_encoders_priority() {
 		ENCODER_LIST+=("libx264:h264:0")
 	fi
 	
-	# h265 software encoder (slower but better compression)
-	if echo "$AVAILABLE_ENCODERS" | grep -q '\blibx265\b'; then
-		ENCODER_LIST+=("libx265:h265:0")
+	# h265 software encoder (slower but better compression, only if H265 is enabled)
+	if [ "$ENABLE_H265" -eq 1 ]; then
+		if echo "$AVAILABLE_ENCODERS" | grep -q '\blibx265\b'; then
+			ENCODER_LIST+=("libx265:h265:0")
+		fi
 	fi
 	
 	# Serialize array and return
@@ -1357,13 +1364,16 @@ download_video() {
 				if [[ "$BITRATE" =~ ^[0-9]+$ ]]; then
 					echo "Source bitrate: ${BITRATE} bps"
 					
-					# Try conversion with fallback chain: h265 hardware > h264 hardware > h265 software > h264 software
+					# Try conversion with fallback chain (if H265 enabled): h265 hardware > h264 hardware > h265 software > h264 software
+					# If H265 disabled (default): h264 hardware > h264 software
 					echo "Trying video encoders in priority order..."
 					
 					# Get list of available encoders in priority order
 					# Use ENCODERS from environment/command line if set, otherwise auto-detect
+					# ENABLE_H265 defaults to 0 (disabled, only H264)
+					local ENABLE_H265="${ENABLE_H265:-0}"
 					local ENCODERS_STR
-					ENCODERS_STR=$(get_available_encoders_priority "${ENCODERS:-}")
+					ENCODERS_STR=$(get_available_encoders_priority "${ENCODERS:-}" "$ENABLE_H265")
 					local ENCODER_LIST_RESULT=$?
 					
 					if [ $ENCODER_LIST_RESULT -ne 0 ]; then
@@ -2381,6 +2391,8 @@ usage() {
 	echo "                    Supported encoders: libx264, libx265, hevc_qsv, h264_qsv,"
 	echo "                    hevc_nvenc, h264_nvenc, hevc_amf, h264_amf, hevc_videotoolbox, h264_videotoolbox"
 	echo "                    Can also be set via ENCODERS environment variable in config file"
+	echo "  --enable-h265     Enable HEVC/H265 codecs (disabled by default, only H264 is used)"
+	echo "                    Can also be set via ENABLE_H265=1 environment variable in config file"
 	echo "  --file-drop URL  Use file-drop server for uploads (e.g., http://192.168.31.103:3232/upload)"
 	echo "                    If file-drop fails, falls back to blossom servers"
 	echo "                    Can also be set via FILE_DROP_URL environment variable in config file"
@@ -2556,6 +2568,7 @@ prepare_gallery_dl_params() {
 #   parse_command_line_ret_encoders - comma-separated list of encoder names if --encoders option was used
 #   parse_command_line_ret_file_drop_url - file-drop server URL if --file-drop option was used
 #   parse_command_line_ret_file_drop_url_prefix - URL prefix if --file-drop-url-prefix option was used
+#   parse_command_line_ret_enable_h265 - 1 if --enable-h265 was used, 0 otherwise
 # Side effects: Also exports PROFILE_NAME as a global variable for early use
 parse_command_line() {
 	# Initialize default values (hardcoded defaults, NOT from environment)
@@ -2574,6 +2587,7 @@ parse_command_line() {
 	local USER_ENCODERS=""
 	local FILE_DROP_URL=""
 	local FILE_DROP_URL_PREFIX=""
+	local ENABLE_H265=0
 	
 	local ALL_MEDIA_FILES=()
 	local DESCRIPTION_CANDIDATE=""
@@ -2684,6 +2698,8 @@ while (( "$#" )); do
 			exit 1
 		fi
 		shift  # shift to remove the prefix from the params
+	elif [[ "$PARAM" == "--enable-h265" || "$PARAM" == "-enable-h265" || "$PARAM" == "--enable-hevc" || "$PARAM" == "-enable-hevc" ]]; then
+		ENABLE_H265=1
 	elif [[ "$PARAM" =~ ^- ]]; then
 		# Unrecognized option starting with - or --
 		local SCRIPT_NAME_ERR=$(basename "$0")
@@ -2740,6 +2756,7 @@ fi
 	parse_command_line_ret_encoders="$USER_ENCODERS"
 	parse_command_line_ret_file_drop_url="$FILE_DROP_URL"
 	parse_command_line_ret_file_drop_url_prefix="$FILE_DROP_URL_PREFIX"
+	parse_command_line_ret_enable_h265="$ENABLE_H265"
 	
 	# Export PROFILE_NAME as a side effect for early use (before ENV loading)
 	export PROFILE_NAME
@@ -3626,6 +3643,7 @@ PARSED_SOURCE_CANDIDATE="$parse_command_line_ret_source_candidate"
 PARSED_ENCODERS="$parse_command_line_ret_encoders"
 PARSED_FILE_DROP_URL="$parse_command_line_ret_file_drop_url"
 PARSED_FILE_DROP_URL_PREFIX="$parse_command_line_ret_file_drop_url_prefix"
+PARSED_ENABLE_H265="$parse_command_line_ret_enable_h265"
 
 # Use extracted PROFILE_NAME to load config
 if [ -n "$PARSED_PROFILE_NAME" ]; then
@@ -3687,6 +3705,22 @@ elif [ -n "${FILE_DROP_URL_PREFIX:-}" ]; then
 else
 	# No file-drop URL prefix specified
 	FILE_DROP_URL_PREFIX=""
+fi
+
+# Merge ENABLE_H265: Command-line takes precedence over environment variable
+# Default is 0 (disabled, only H264)
+if [ "$PARSED_ENABLE_H265" -eq 1 ]; then
+	ENABLE_H265=1
+elif [ -n "${ENABLE_H265:-}" ]; then
+	# Use environment variable if set (convert to 0/1)
+	if [[ "${ENABLE_H265}" == "1" ]] || [[ "${ENABLE_H265}" == "true" ]] || [[ "${ENABLE_H265}" == "yes" ]]; then
+		ENABLE_H265=1
+	else
+		ENABLE_H265=0
+	fi
+else
+	# Default: disabled (only H264)
+	ENABLE_H265=0
 fi
 
 # Merge: Use parsed command-line value if it was explicitly set (differs from default),
@@ -3781,6 +3815,7 @@ export EXTRA_BLOSSOMS
 export PROFILE_NAME
 export FILE_DROP_URL
 export FILE_DROP_URL_PREFIX
+export ENABLE_H265
 
 # Export parsed command-line results for main() to use
 export PARSED_MEDIA_FILES

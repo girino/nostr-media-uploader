@@ -506,21 +506,44 @@ def convert_path_for_cygwin(path, config=None):
     return path
 
 
-async def download_media_file(bot, file, file_extension=None):
+async def download_media_file(bot, file, file_extension=None, max_retries=3, retry_delay=1.0):
     """Download a media file from Telegram and save it to a temporary file.
     
     Args:
         bot: The bot instance to use for downloading
         file: The file object from Telegram (PhotoSize, Video, etc.)
         file_extension: Optional file extension (e.g., 'jpg', 'mp4'). If not provided, will try to detect.
+        max_retries: Maximum number of retry attempts (default: 3)
+        retry_delay: Initial delay between retries in seconds (default: 1.0)
     
     Returns:
         Path to the temporary file, or None if download failed
     """
     try:
-        # Get the file object
+        # Get the file object with retry logic
+        file_obj = None
         if hasattr(file, 'file_id'):
-            file_obj = await bot.get_file(file.file_id)
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    file_obj = await bot.get_file(file.file_id)
+                    break
+                except (TimedOut, NetworkError) as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                        logger.warning(f"get_file attempt {attempt + 1} failed with {type(e).__name__}, retrying in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        logger.error(f"Failed to get_file after {max_retries} attempts: {e}")
+                except Exception as e:
+                    # For non-network errors, don't retry
+                    logger.error(f"Non-retryable error getting file: {e}")
+                    raise
+            
+            if file_obj is None:
+                logger.error(f"Could not get file object after {max_retries} attempts. Last error: {last_exception}")
+                return None
         else:
             # If it's already a File object
             file_obj = file
@@ -551,11 +574,47 @@ async def download_media_file(bot, file, file_extension=None):
         temp_path = temp_file.name
         temp_file.close()
         
-        # Download the file
-        await file_obj.download_to_drive(temp_path)
+        # Download the file with retry logic
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                await file_obj.download_to_drive(temp_path)
+                logger.info(f"Downloaded media file to: {temp_path}")
+                return temp_path
+            except (TimedOut, NetworkError) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"download_to_drive attempt {attempt + 1} failed with {type(e).__name__}, retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    # Clean up partial download if it exists
+                    try:
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+                    except Exception:
+                        pass
+                else:
+                    logger.error(f"Failed to download file after {max_retries} attempts: {e}")
+            except Exception as e:
+                # For non-network errors, don't retry
+                logger.error(f"Non-retryable error downloading file: {e}")
+                # Clean up temporary file on error
+                try:
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                except Exception:
+                    pass
+                raise
         
-        logger.info(f"Downloaded media file to: {temp_path}")
-        return temp_path
+        # If we get here, all retries failed
+        logger.error(f"Could not download file after {max_retries} attempts. Last error: {last_exception}")
+        # Clean up temporary file
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except Exception:
+            pass
+        return None
     except Exception as e:
         logger.exception(f"Error downloading media file: {e}")
         return None
