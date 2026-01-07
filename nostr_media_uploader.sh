@@ -2399,6 +2399,9 @@ usage() {
 	echo "  --file-drop-url-prefix PREFIX  Replace https://dweb.link/ prefix in file-drop URLs"
 	echo "                                 with custom prefix (e.g., https://gateway.example.com)"
 	echo "                                 Can also be set via FILE_DROP_URL_PREFIX environment variable"
+	echo "  --nsfw              Mark the post as NSFW by adding content-warning tag"
+	echo "                    Can also be set via NSFW=1 environment variable in config file"
+	echo "                    Automatically enabled if #NSFW or #nsfw hashtag is found in content"
 	echo
 	echo "Arguments:"
 	echo "  file|url          One or more paths to image or video files, or URLs to download videos"
@@ -2569,6 +2572,7 @@ prepare_gallery_dl_params() {
 #   parse_command_line_ret_file_drop_url - file-drop server URL if --file-drop option was used
 #   parse_command_line_ret_file_drop_url_prefix - URL prefix if --file-drop-url-prefix option was used
 #   parse_command_line_ret_enable_h265 - 1 if --enable-h265 was used, 0 otherwise
+#   parse_command_line_ret_nsfw - 1 if --nsfw was used, 0 otherwise
 # Side effects: Also exports PROFILE_NAME as a global variable for early use
 parse_command_line() {
 	# Initialize default values (hardcoded defaults, NOT from environment)
@@ -2588,6 +2592,7 @@ parse_command_line() {
 	local FILE_DROP_URL=""
 	local FILE_DROP_URL_PREFIX=""
 	local ENABLE_H265=0
+	local NSFW=0
 	
 	local ALL_MEDIA_FILES=()
 	local DESCRIPTION_CANDIDATE=""
@@ -2700,6 +2705,8 @@ while (( "$#" )); do
 		shift  # shift to remove the prefix from the params
 	elif [[ "$PARAM" == "--enable-h265" || "$PARAM" == "-enable-h265" || "$PARAM" == "--enable-hevc" || "$PARAM" == "-enable-hevc" ]]; then
 		ENABLE_H265=1
+	elif [[ "$PARAM" == "--nsfw" || "$PARAM" == "-nsfw" ]]; then
+		NSFW=1
 	elif [[ "$PARAM" =~ ^- ]]; then
 		# Unrecognized option starting with - or --
 		local SCRIPT_NAME_ERR=$(basename "$0")
@@ -2757,6 +2764,7 @@ fi
 	parse_command_line_ret_file_drop_url="$FILE_DROP_URL"
 	parse_command_line_ret_file_drop_url_prefix="$FILE_DROP_URL_PREFIX"
 	parse_command_line_ret_enable_h265="$ENABLE_H265"
+	parse_command_line_ret_nsfw="$NSFW"
 	
 	# Export PROFILE_NAME as a side effect for early use (before ENV loading)
 	export PROFILE_NAME
@@ -3371,6 +3379,22 @@ fi
 	echo "$CONTENT"
 	echo "=== End Event Content ==="
 
+	# Check if NSFW tag should be added
+	# Check if NSFW is enabled via command line or environment variable
+	local ADD_NSFW_TAG=0
+	if [ "${NSFW:-0}" -eq 1 ]; then
+		ADD_NSFW_TAG=1
+		echo "NSFW flag is enabled"
+	fi
+	
+	# Check if content contains #NSFW or #nsfw hashtag
+	if [ $ADD_NSFW_TAG -eq 0 ] && [ -n "$CONTENT" ]; then
+		if echo "$CONTENT" | grep -qiE '#nsfw\b'; then
+			ADD_NSFW_TAG=1
+			echo "NSFW hashtag detected in content"
+		fi
+	fi
+
 	# Create kind 1 event with nak
 	echo "Creating kind 1 event with content length: ${#CONTENT}"
 	
@@ -3386,6 +3410,50 @@ fi
 		NAK_CMD+=("--content" "$(echo -e "$CONTENT")")
 	else
 		NAK_CMD+=("--content" "")
+	fi
+	
+	# Add content-warning tag if NSFW is enabled or detected
+	if [ $ADD_NSFW_TAG -eq 1 ]; then
+		NAK_CMD+=("-t" "content-warning=nsfw")
+		echo "Adding content-warning tag for NSFW content"
+	fi
+	
+	# Extract hashtags from content and add them as tags
+	# Pattern: # followed by alphanumeric characters and underscores
+	if [ -n "$CONTENT" ]; then
+		local HASHTAGS=()
+		local SEEN_TAGS=()  # Track lowercase versions for case-insensitive deduplication
+		
+		# Extract all hashtags from content
+		while IFS= read -r hashtag; do
+			# Remove the leading # 
+			local tag_value="${hashtag#\#}"
+			# Only process non-empty tags
+			if [ -n "$tag_value" ]; then
+				# Check if we already have this tag (case-insensitive)
+				local tag_lower="${tag_value,,}"
+				local found=0
+				for seen_tag in "${SEEN_TAGS[@]}"; do
+					if [ "$seen_tag" = "$tag_lower" ]; then
+						found=1
+						break
+					fi
+				done
+				if [ $found -eq 0 ]; then
+					HASHTAGS+=("$tag_value")
+					SEEN_TAGS+=("$tag_lower")
+				fi
+			fi
+		done < <(echo "$CONTENT" | grep -oE '#[A-Za-z0-9_]+')
+		
+		# Add hashtags as tags to nak command
+		if [ ${#HASHTAGS[@]} -gt 0 ]; then
+			echo "Found ${#HASHTAGS[@]} unique hashtag(s) in content"
+			for hashtag in "${HASHTAGS[@]}"; do
+				NAK_CMD+=("-t" "t=$hashtag")
+				echo "Adding hashtag tag: t=$hashtag"
+			done
+		fi
 	fi
 	
 	echo "${NAK_CMD[@]}"
@@ -3644,6 +3712,7 @@ PARSED_ENCODERS="$parse_command_line_ret_encoders"
 PARSED_FILE_DROP_URL="$parse_command_line_ret_file_drop_url"
 PARSED_FILE_DROP_URL_PREFIX="$parse_command_line_ret_file_drop_url_prefix"
 PARSED_ENABLE_H265="$parse_command_line_ret_enable_h265"
+PARSED_NSFW="$parse_command_line_ret_nsfw"
 
 # Use extracted PROFILE_NAME to load config
 if [ -n "$PARSED_PROFILE_NAME" ]; then
@@ -3795,6 +3864,22 @@ PASSWORD="${PARSED_PASSWORD:-${PASSWORD:-}}"
 # MAX_FILE_SEARCH: use parsed if set, otherwise use env
 MAX_FILE_SEARCH="${PARSED_MAX_FILE_SEARCH:-${MAX_FILE_SEARCH:-10}}"
 
+# Merge NSFW: Command-line takes precedence over environment variable
+# Default is 0 (not NSFW)
+if [ "$PARSED_NSFW" -eq 1 ]; then
+	NSFW=1
+elif [ -n "${NSFW:-}" ]; then
+	# Use environment variable if set (convert to 0/1)
+	if [[ "${NSFW}" == "1" ]] || [[ "${NSFW}" == "true" ]] || [[ "${NSFW}" == "yes" ]]; then
+		NSFW=1
+	else
+		NSFW=0
+	fi
+else
+	# Default: not NSFW
+	NSFW=0
+fi
+
 # ========================================================================
 # EXPORT MERGED VARIABLES FOR main() TO READ
 # ========================================================================
@@ -3816,6 +3901,7 @@ export PROFILE_NAME
 export FILE_DROP_URL
 export FILE_DROP_URL_PREFIX
 export ENABLE_H265
+export NSFW
 
 # Export parsed command-line results for main() to use
 export PARSED_MEDIA_FILES

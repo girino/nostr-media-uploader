@@ -1,7 +1,7 @@
 #!/bin/bash
 
 usage () {
-    echo "Usage: $0 [--profile=PROFILE|-profile=PROFILE|-p=PROFILE] [--blossom=SERVER] [--file-drop=URL] [--tag=TAG] [file1] [file2] ... [comment]"
+    echo "Usage: $0 [--profile=PROFILE|-profile=PROFILE|-p=PROFILE] [--blossom=SERVER] [--file-drop=URL] [--tag=TAG] [--nsfw] [file1] [file2] ... [comment]"
     echo "Uploads files to Blossom servers and creates a kind 1 event with the URLs."
     echo "Files can be specified as individual files or directories containing files."
     echo "The last argument is treated as a comment for the event."
@@ -20,6 +20,9 @@ usage () {
     echo "                                 Can also be set via FILE_DROP_URL_PREFIX environment variable"
     echo "  --tag=TAG            Add an additional hashtag to the event (can be used multiple times)"
     echo "  -t TAG, --tag TAG    Alternative form for --tag"
+    echo "  --nsfw               Mark the post as NSFW by adding content-warning tag"
+    echo "                       Can also be set via NSFW=1 environment variable in config file"
+    echo "                       Automatically enabled if #NSFW or #nsfw hashtag is found in content"
 }
 
 # Default profile
@@ -154,6 +157,7 @@ COMMENT=""
 URLS=()
 FOUND_COMMENT=0
 EXTRA_TAGS=()
+NSFW=0
 
 # Function to check if a file is image/* or video/*
 is_image_or_video() {
@@ -271,6 +275,17 @@ EXTRA_TAGS=()
 CMD_LINE_BLOSSOMS=()
 FILE_DROP_URL="${FILE_DROP_URL:-}"  # Initialize from environment if set
 FILE_DROP_URL_PREFIX="${FILE_DROP_URL_PREFIX:-}"  # Initialize from environment if set
+# Initialize NSFW from environment if set, normalize to 0/1
+if [[ -n "${NSFW:-}" ]]; then
+    # Normalize NSFW value (accept 1, true, yes)
+    if [[ "${NSFW}" == "1" ]] || [[ "${NSFW}" == "true" ]] || [[ "${NSFW}" == "yes" ]]; then
+        NSFW=1
+    else
+        NSFW=0
+    fi
+else
+    NSFW=0
+fi
 # Parse positional and non-positional parameters using shift
 while [[ $# -gt 0 ]]; do
     ARG="$1"
@@ -363,6 +378,10 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             EXTRA_TAGS+=("$TAG")
+            shift
+            ;;
+        --nsfw|-nsfw)
+            NSFW=1
             shift
             ;;
         --)
@@ -500,28 +519,73 @@ if [[ -n "$EXTRA_TAGS" ]]; then
     done
 fi
 
-# Extract hashtags from comment
+# Check if NSFW tag should be added
+# Check if NSFW is enabled via command line or environment variable
+ADD_NSFW_TAG=0
+if [[ "$NSFW" -eq 1 ]]; then
+    ADD_NSFW_TAG=1
+    echo "NSFW flag is enabled"
+fi
+
+# Check if content contains #NSFW or #nsfw hashtag
+if [[ $ADD_NSFW_TAG -eq 0 && -n "$CONTENT" ]]; then
+    if echo "$CONTENT" | grep -qiE '#nsfw\b'; then
+        ADD_NSFW_TAG=1
+        echo "NSFW hashtag detected in content"
+    fi
+fi
+
+# Extract hashtags from content and add them as tags
+# Pattern: # followed by alphanumeric characters and underscores
 HASHTAGS=()
+SEEN_TAGS=()  # Track lowercase versions for case-insensitive deduplication
+
 if [[ -n "$CONTENT" ]]; then
-    while read -r tag; do
-        HASHTAGS+=("$tag")
-    done < <(grep -oE '#[A-Za-z0-9_]+' <<< "$CONTENT" | sort -u)
+    # Extract all hashtags from content
+    while IFS= read -r hashtag; do
+        # Remove the leading # 
+        tag_value="${hashtag#\#}"
+        # Only process non-empty tags
+        if [[ -n "$tag_value" ]]; then
+            # Check if we already have this tag (case-insensitive)
+            tag_lower="${tag_value,,}"
+            found=0
+            for seen_tag in "${SEEN_TAGS[@]}"; do
+                if [[ "$seen_tag" == "$tag_lower" ]]; then
+                    found=1
+                    break
+                fi
+            done
+            if [[ $found -eq 0 ]]; then
+                HASHTAGS+=("$tag_value")
+                SEEN_TAGS+=("$tag_lower")
+            fi
+        fi
+    done < <(grep -oE '#[A-Za-z0-9_]+' <<< "$CONTENT")
 fi
 
 # Prepare hashtag arguments for nak
 HASHTAG_ARGS=()
-for TAG in "${HASHTAGS[@]}"; do
-    # Remove leading '#' from tag
-    TAG=${TAG:1}
-    HASHTAG_ARGS+=("-t" "t=$TAG")
-    echo "Adding hashtag tag: $TAG"
-done
+if [[ ${#HASHTAGS[@]} -gt 0 ]]; then
+    echo "Found ${#HASHTAGS[@]} unique hashtag(s) in content"
+    for TAG in "${HASHTAGS[@]}"; do
+        HASHTAG_ARGS+=("-t" "t=$TAG")
+        echo "Adding hashtag tag: t=$TAG"
+    done
+fi
 
 # Create kind 1 event with nak
 CMD=("nak" "event" "--auth" "--kind" "1" "--content" "$(echo -e "$CONTENT")")
 if [[ ${#HASHTAG_ARGS[@]} -gt 0 ]]; then
     CMD+=("${HASHTAG_ARGS[@]}")
 fi
+
+# Add content-warning tag if NSFW is enabled or detected
+if [[ $ADD_NSFW_TAG -eq 1 ]]; then
+    CMD+=("-t" "content-warning=nsfw")
+    echo "Adding content-warning tag for NSFW content"
+fi
+
 CMD+=("-sec" "$KEY")
 # Add POW if needed
 if [[ $POW_DIFF -gt 0 ]]; then

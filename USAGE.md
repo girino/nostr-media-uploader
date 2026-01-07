@@ -44,6 +44,17 @@ The main script for downloading media from URLs and uploading to Nostr.
 - `--source`: Show source URLs in posts
 - `--nosource`: Don't show source URLs (default)
 
+#### NSFW Content
+- `--nsfw`: Mark the post as NSFW by adding content-warning tag
+  - Can also be set via `NSFW=1` environment variable in config file
+  - Automatically enabled if `#NSFW` or `#nsfw` hashtag is found in content
+
+#### Hashtags
+- Hashtags in content are automatically extracted and added as tags
+  - All hashtags matching pattern `#[A-Za-z0-9_]+` are extracted from content
+  - Each hashtag is added as a `t` tag (e.g., `#art` → `t=art`)
+  - Duplicate hashtags are automatically removed (case-insensitive)
+
 #### Advanced Options
 - `--max-file-search <number>`: Maximum files to search when inferring Facebook image positions (default: 10)
 - `-h`, `--help`: Show help message
@@ -73,6 +84,28 @@ The main script for downloading media from URLs and uploading to Nostr.
 #### Upload with Source Attribution
 ```bash
 ./nostr_media_uploader.sh --source video.mp4 "Caption" "https://source.example.com"
+```
+
+#### Mark Content as NSFW
+```bash
+# Using command-line flag
+./nostr_media_uploader.sh --nsfw image.jpg "NSFW content"
+
+# Automatic detection from hashtag
+./nostr_media_uploader.sh image.jpg "This is #NSFW content"
+
+# Via environment variable in config file
+# Add NSFW=1 to ~/.nostr/nostr_media_uploader
+./nostr_media_uploader.sh image.jpg
+```
+
+#### Hashtag Extraction
+```bash
+# Hashtags in content are automatically extracted and added as tags
+./nostr_media_uploader.sh image.jpg "Beautiful sunset #photography #nature #sunset"
+
+# This will create tags: t=photography, t=nature, t=sunset
+# Note: #NSFW or #nsfw will also trigger NSFW content-warning tag
 ```
 
 ## image_uploader.sh
@@ -123,6 +156,9 @@ Profile-based uploader for AI-generated art with hashtag support.
 
 - `--profile=<name>` / `-p=<name>`: Use specified profile from ~/.nostr/
 - `--tag <tag>` / `-t <tag>`: Add hashtag (can be used multiple times)
+- `--nsfw`: Mark the post as NSFW by adding content-warning tag
+  - Can also be set via `NSFW=1` environment variable in config file
+  - Automatically enabled if `#NSFW` or `#nsfw` hashtag is found in content
 
 ### Profiles
 
@@ -220,6 +256,9 @@ See [example_env](example_env) for configuration options.
 for img in images/*.jpg; do
     ./aiart.sh --tag ai --tag art "$img"
 done
+
+# Upload with NSFW flag
+./aiart.sh --nsfw image.jpg "NSFW artwork"
 ```
 
 ## Troubleshooting

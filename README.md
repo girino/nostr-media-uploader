@@ -179,6 +179,8 @@ For detailed installation instructions, see [INSTALLATION.md](INSTALLATION.md).
 - `--encoders <list>`: Comma-separated list of video encoders to use (e.g., `libx264,hevc_qsv`). Overrides automatic detection. Encoders will be tried in the specified order.
 - `--source` / `--nosource`: Show/hide source URLs in posts
 - `--password <password>`: Provide password for encrypted keys
+- `--nsfw`: Mark the post as NSFW by adding content-warning tag (can also be set via `NSFW=1` environment variable, or automatically detected from `#NSFW`/`#nsfw` hashtag in content)
+- **Hashtag extraction**: All hashtags in content are automatically extracted and added as `t` tags (e.g., `#art` in content becomes `t=art` tag). Duplicate hashtags are automatically removed (case-insensitive).
 - `--max-file-search <number>`: Maximum files to search when inferring Facebook image positions
 - `-h`, `--help`: Show help message
 
@@ -216,6 +218,28 @@ For detailed installation instructions, see [INSTALLATION.md](INSTALLATION.md).
 #### Disable Video Conversion
 ```bash
 ./nostr_media_uploader.sh --noconvert video.mp4
+```
+
+#### Mark Content as NSFW
+```bash
+# Using command-line flag
+./nostr_media_uploader.sh --nsfw image.jpg "NSFW content"
+
+# Automatic detection from hashtag
+./nostr_media_uploader.sh image.jpg "This is #NSFW content"
+
+# Via environment variable in config file
+# Add NSFW=1 to ~/.nostr/nostr_media_uploader
+./nostr_media_uploader.sh image.jpg
+```
+
+#### Hashtag Extraction
+```bash
+# Hashtags in content are automatically extracted and added as tags
+./nostr_media_uploader.sh image.jpg "Beautiful sunset #photography #nature #sunset"
+
+# This will create tags: t=photography, t=nature, t=sunset
+# Note: #NSFW or #nsfw will also trigger NSFW content-warning tag
 ```
 
 ## Configuration
@@ -274,6 +298,7 @@ See [example_env](example_env) for a complete configuration template.
 - **`COOKIES_FILE`**: Path to cookies file (Mozilla/Netscape format). If set, takes precedence over `USE_COOKIES_FF` and `--firefox` option
 - **`ENCODERS`**: Comma-separated list of preferred video encoders (e.g., `libx264,hevc_qsv`). Overrides automatic encoder detection. Encoders will be tried in the specified order.
 - **`APPEND_ORIGINAL_COMMENT`**: Append original captions (0/1, default: 1)
+- **`NSFW`**: Mark posts as NSFW by adding content-warning tag (0/1, default: 0). Can also be set via `--nsfw` command-line flag, or automatically detected from `#NSFW`/`#nsfw` hashtag in content
 
 ## Docker Deployment
 

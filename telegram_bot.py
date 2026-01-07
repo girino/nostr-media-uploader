@@ -13,6 +13,8 @@ import yaml
 import argparse
 import tempfile
 from pathlib import Path
+from collections import defaultdict
+from typing import Dict, List, Optional
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from telegram.error import TimedOut, NetworkError
@@ -27,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 CONFIG_FILE = os.getenv('TELEGRAM_BOT_CONFIG', 'telegram_bot.yaml')
+
+# Media group handling: store pending media groups
+# Format: {media_group_id: {'messages': [messages], 'task': asyncio.Task, 'processed': bool}}
+pending_media_groups: Dict[str, Dict] = {}
+
+# Timeout for waiting for more messages in a media group (in seconds)
+MEDIA_GROUP_TIMEOUT = 2.0
 
 # URL regex pattern to match http/https links
 URL_PATTERN = re.compile(
@@ -752,6 +761,250 @@ async def execute_script(cmd, cwd=None):
         }
 
 
+async def process_media_group(media_group_id: str, messages: List, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process all messages in a media group together.
+    
+    Args:
+        media_group_id: The media group ID
+        messages: List of messages in the group
+        context: Bot context
+    """
+    if not messages:
+        return
+    
+    # Get config from context
+    config = context.bot_data.get('config')
+    if not config:
+        logger.error("Configuration not found in bot_data")
+        return
+    
+    # Use the first message for channel/profile detection
+    first_message = messages[0]
+    
+    # Check if message is from the owner (same logic as handle_message)
+    is_owner = False
+    channel_config = None
+    
+    if first_message.from_user:
+        is_owner = (first_message.from_user.id == config['owner_id'])
+        if not is_owner:
+            logger.info(f"Media group from non-owner user {first_message.from_user.id}, ignoring")
+            return
+        
+        chat_id = first_message.chat.id if first_message.chat.id else None
+        chat_username = first_message.chat.username if first_message.chat.username else None
+        channel_config = find_channel_config(config, chat_id=chat_id, chat_username=chat_username)
+    elif first_message.sender_chat:
+        sender_chat_id = first_message.sender_chat.id
+        sender_chat_username = first_message.sender_chat.username if first_message.sender_chat.username else None
+        chat_id = first_message.chat.id if first_message.chat.id else None
+        chat_username = first_message.chat.username if first_message.chat.username else None
+        
+        channel_config = find_channel_config(config, chat_id=sender_chat_id, chat_username=sender_chat_username)
+        if not channel_config:
+            channel_config = find_channel_config(config, chat_id=chat_id, chat_username=chat_username)
+        
+        if channel_config:
+            is_owner = True
+        else:
+            logger.info(f"Media group from channel with no matching config, ignoring")
+            return
+    else:
+        logger.info("Media group has no from_user or sender_chat, ignoring")
+        return
+    
+    # Require channel configuration
+    if not channel_config:
+        logger.info("No channel configuration found for media group, ignoring")
+        return
+    
+    profile_name = channel_config.get('profile_name')
+    if not profile_name:
+        logger.error(f"Channel config found but profile_name is missing, ignoring")
+        return
+    
+    # Collect all media files from all messages in the group
+    media_files = []
+    # Collect caption from the first message (Telegram usually puts caption on first message)
+    text = first_message.caption or first_message.text or ""
+    
+    logger.info(f"Processing media group {media_group_id} with {len(messages)} message(s)")
+    
+    for msg in messages:
+        # Download media from each message
+        if msg.photo:
+            largest_photo = max(msg.photo, key=lambda p: p.file_size if p.file_size else 0)
+            logger.info(f"Downloading photo from media group message...")
+            temp_file = await download_media_file(context.bot, largest_photo, 'jpg')
+            if temp_file:
+                media_files.append(temp_file)
+        elif msg.video:
+            logger.info(f"Downloading video from media group message...")
+            temp_file = await download_media_file(context.bot, msg.video, 'mp4')
+            if temp_file:
+                media_files.append(temp_file)
+        elif msg.document:
+            if msg.document.mime_type:
+                if msg.document.mime_type.startswith('image/'):
+                    ext = None
+                    if msg.document.file_name:
+                        ext = Path(msg.document.file_name).suffix.lstrip('.')
+                    if not ext:
+                        ext = msg.document.mime_type.split('/')[-1]
+                    logger.info(f"Downloading image document from media group message...")
+                    temp_file = await download_media_file(context.bot, msg.document, ext)
+                    if temp_file:
+                        media_files.append(temp_file)
+                elif msg.document.mime_type.startswith('video/'):
+                    ext = None
+                    if msg.document.file_name:
+                        ext = Path(msg.document.file_name).suffix.lstrip('.')
+                    if not ext:
+                        ext = msg.document.mime_type.split('/')[-1]
+                    logger.info(f"Downloading video document from media group message...")
+                    temp_file = await download_media_file(context.bot, msg.document, ext)
+                    if temp_file:
+                        media_files.append(temp_file)
+    
+    if not media_files:
+        logger.warning(f"No media files collected from media group {media_group_id}")
+        return
+    
+    # Try to send acknowledgment
+    status_msg = None
+    try:
+        status_msg = await send_message_with_retry(
+            first_message,
+            f"Processing media group with {len(media_files)} file(s)..."
+        )
+        if status_msg is None:
+            logger.warning("Could not send status message for media group, continuing without it")
+    except Exception as e:
+        logger.warning(f"Failed to send status message for media group: {e}, continuing without it")
+    
+    try:
+        # Build command with all media files
+        cmd = build_command(
+            profile_name,
+            config['script_path'],
+            media_files,  # Pass all file paths
+            text,  # Use caption/text as description
+            config.get('use_firefox', True),
+            config.get('cookies_file'),
+            config
+        )
+        
+        # Execute script
+        result = await execute_script(cmd)
+        
+        # Clean up temporary files
+        for temp_file in media_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+                    logger.debug(f"Cleaned up temporary file: {temp_file}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary file {temp_file}: {e}")
+        
+        # Format response (same as single media processing)
+        if result['success']:
+            logger.info(f"Script execution successful. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
+            if result['stdout']:
+                logger.info(f"Script stdout:\n{result['stdout']}")
+            if result['stderr']:
+                logger.info(f"Script stderr:\n{result['stderr']}")
+            
+            event_id = None
+            nevent = None
+            
+            if result['stdout']:
+                event_id = extract_event_id(result['stdout'])
+                if event_id:
+                    logger.info(f"Extracted event ID from stdout: {event_id}")
+            
+            if not event_id and result['stderr']:
+                event_id = extract_event_id(result['stderr'])
+                if event_id:
+                    logger.info(f"Extracted event ID from stderr: {event_id}")
+            
+            if event_id:
+                nevent = await encode_to_nevent(event_id)
+                logger.info(f"Encoded to nevent: {nevent}")
+            else:
+                logger.warning(f"Could not extract event ID from output for media group")
+            
+            if nevent:
+                if config.get('nostr_client_url'):
+                    client_url_template = config['nostr_client_url']
+                    if '{nevent}' in client_url_template:
+                        client_url = client_url_template.format(nevent=nevent)
+                    else:
+                        if client_url_template.endswith('/'):
+                            client_url = f"{client_url_template}e/{nevent}"
+                        else:
+                            client_url = f"{client_url_template}/e/{nevent}"
+                    
+                    response_msg = f"✅ [View on Nostr]({client_url})\n\n`{nevent}`"
+                    if status_msg:
+                        await send_message_with_retry(status_msg, response_msg, edit_text=True, parse_mode='Markdown')
+                    else:
+                        await send_message_with_retry(first_message, response_msg, parse_mode='Markdown')
+                    logger.info(f"Successfully processed media group, nevent: {nevent}, client_url: {client_url}")
+                else:
+                    if status_msg:
+                        await send_message_with_retry(status_msg, nevent, edit_text=True)
+                    else:
+                        await send_message_with_retry(first_message, nevent)
+                    logger.info(f"Successfully processed media group, nevent: {nevent}")
+            else:
+                logger.warning(f"Could not extract event ID from output for media group")
+                success_msg = f"✅ Successfully processed media group with {len(media_files)} file(s)"
+                if event_id:
+                    success_msg += f"\nEvent ID: {event_id} (could not encode to nevent)"
+                if status_msg:
+                    await send_message_with_retry(status_msg, success_msg, edit_text=True)
+                else:
+                    await send_message_with_retry(first_message, success_msg)
+        else:
+            error_parts = []
+            if result['stderr']:
+                error_parts.append(f"Error:\n{result['stderr']}")
+            if result['stdout']:
+                error_parts.append(f"Output:\n{result['stdout']}")
+            
+            error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
+            
+            MAX_ERROR_LENGTH = 3500
+            if len(error_msg) > MAX_ERROR_LENGTH:
+                truncated_msg = error_msg[-MAX_ERROR_LENGTH:]
+                first_newline = truncated_msg.find('\n')
+                if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:
+                    truncated_msg = truncated_msg[first_newline+1:]
+                error_display = f"❌ Error processing media group\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
+            else:
+                error_display = f"❌ Error processing media group\n\n{error_msg}"
+            
+            if status_msg:
+                await send_message_with_retry(status_msg, error_display, edit_text=True)
+            else:
+                await send_message_with_retry(first_message, error_display)
+            logger.error(f"Error processing media group")
+            logger.error(f"stderr: {result['stderr']}")
+            logger.error(f"stdout: {result['stdout']}")
+    except Exception as e:
+        logger.exception(f"Exception while processing media group: {e}")
+        try:
+            await send_message_with_retry(first_message, f"❌ Exception occurred: {str(e)}")
+        except Exception as send_error:
+            logger.error(f"Failed to send error message: {send_error}")
+        for temp_file in media_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except Exception:
+                pass
+
+
 async def send_message_with_retry(message, text, max_retries=3, retry_delay=1.0, edit_text=False, **kwargs):
     """Send a message with retry logic for timeout and network errors.
     
@@ -912,6 +1165,85 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Extract text from message
     text = message.text or message.caption or ""
     
+    # Check if this message is part of a media group
+    if message.media_group_id:
+        media_group_id = message.media_group_id
+        
+        # Check if this media group is already being processed
+        if media_group_id in pending_media_groups:
+            group_data = pending_media_groups[media_group_id]
+            if group_data.get('processed', False):
+                # Already processed, ignore this message
+                logger.info(f"Media group {media_group_id} already processed, ignoring duplicate message")
+                return
+            
+            # Add this message to the group
+            group_data['messages'].append(message)
+            logger.info(f"Added message to media group {media_group_id} (total: {len(group_data['messages'])})")
+            
+            # Cancel the previous timeout task and create a new one (reset timeout)
+            if 'task' in group_data and not group_data['task'].done():
+                try:
+                    group_data['task'].cancel()
+                except Exception as e:
+                    logger.warning(f"Error cancelling timeout task: {e}")
+            
+            # Create new timeout task
+            async def process_group_after_timeout():
+                try:
+                    await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
+                    if media_group_id in pending_media_groups:
+                        group_data = pending_media_groups[media_group_id]
+                        if not group_data.get('processed', False):
+                            group_data['processed'] = True
+                            await process_media_group(media_group_id, group_data['messages'], context)
+                            # Clean up
+                            del pending_media_groups[media_group_id]
+                except asyncio.CancelledError:
+                    # Task was cancelled (new message arrived), this is expected
+                    pass
+                except Exception as e:
+                    logger.exception(f"Error in media group timeout task: {e}")
+                    # Clean up on error
+                    if media_group_id in pending_media_groups:
+                        del pending_media_groups[media_group_id]
+            
+            group_data['task'] = asyncio.create_task(process_group_after_timeout())
+        else:
+            # First message in a new media group
+            logger.info(f"Starting new media group {media_group_id}")
+            
+            # Create timeout task
+            async def process_group_after_timeout():
+                try:
+                    await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
+                    if media_group_id in pending_media_groups:
+                        group_data = pending_media_groups[media_group_id]
+                        if not group_data.get('processed', False):
+                            group_data['processed'] = True
+                            await process_media_group(media_group_id, group_data['messages'], context)
+                            # Clean up
+                            del pending_media_groups[media_group_id]
+                except asyncio.CancelledError:
+                    # Task was cancelled (new message arrived), this is expected
+                    pass
+                except Exception as e:
+                    logger.exception(f"Error in media group timeout task: {e}")
+                    # Clean up on error
+                    if media_group_id in pending_media_groups:
+                        del pending_media_groups[media_group_id]
+            
+            pending_media_groups[media_group_id] = {
+                'messages': [message],
+                'task': asyncio.create_task(process_group_after_timeout()),
+                'processed': False
+            }
+            logger.info(f"Created media group {media_group_id} with first message, waiting for more...")
+        
+        # Return early - processing will happen after timeout
+        return
+    
+    # Not part of a media group - process immediately (existing logic)
     # Check for direct media uploads (photos or videos)
     media_files = []
     if message.photo:
