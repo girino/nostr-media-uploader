@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from telegram.error import TimedOut, NetworkError
@@ -95,6 +96,7 @@ def load_config(config_path, use_firefox=True, cookies_file=None):
         'channels': config_data.get('channels', {}),
         'use_firefox': use_firefox,
         'cookies_file': cookies_file,
+        'disable_cookies_for_sites': config_data.get('disable_cookies_for_sites'),  # Optional: list of domains to disable cookies for
     }
 
 
@@ -137,6 +139,65 @@ def extract_urls(text):
     if not text:
         return []
     return URL_PATTERN.findall(text)
+
+
+def should_disable_cookies(urls, disable_cookies_for_sites):
+    """Check if cookies should be disabled for any of the given URLs.
+    
+    Args:
+        urls: List of URLs to check
+        disable_cookies_for_sites: List of domain patterns to match against (e.g., ['facebook.com', 'instagram.com'])
+    
+    Returns:
+        True if any URL matches a domain in the disable list, False otherwise
+    """
+    if not urls:
+        return False
+    
+    # If disable_cookies_for_sites is None or empty list, don't disable
+    if not disable_cookies_for_sites:
+        return False
+    
+    # Convert to list if it's not already
+    if not isinstance(disable_cookies_for_sites, list):
+        disable_cookies_for_sites = [disable_cookies_for_sites]
+    
+    # Filter out empty strings
+    disable_cookies_for_sites = [p for p in disable_cookies_for_sites if p and p.strip()]
+    
+    # If list is empty after filtering, don't disable
+    if not disable_cookies_for_sites:
+        return False
+    
+    for url in urls:
+        # Only check HTTP/HTTPS URLs
+        if not url.startswith(('http://', 'https://')):
+            continue
+        
+        # Extract domain from URL
+        try:
+            # Simple domain extraction - get the hostname part
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            # Remove port if present
+            if ':' in domain:
+                domain = domain.split(':')[0]
+        except Exception:
+            # If parsing fails, try simple string matching
+            domain = url.lower()
+        
+        # Check if domain matches any pattern in the disable list
+        for pattern in disable_cookies_for_sites:
+            pattern_lower = pattern.lower().strip()
+            # Remove leading/trailing dots and whitespace
+            pattern_lower = pattern_lower.strip('.')
+            
+            # Check if domain matches pattern (exact match or ends with pattern)
+            if domain == pattern_lower or domain.endswith('.' + pattern_lower):
+                logger.info(f"URL {url} matches disable cookies pattern '{pattern}', disabling cookies")
+                return True
+    
+    return False
 
 
 def extract_extra_text(text, urls):
@@ -629,8 +690,20 @@ async def download_media_file(bot, file, file_extension=None, max_retries=3, ret
         return None
 
 
-def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False):
-    """Build the command to execute nostr_media_uploader.sh."""
+def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None):
+    """Build the command to execute nostr_media_uploader.sh.
+    
+    Args:
+        profile_name: Profile name to use
+        script_path: Path to nostr_media_uploader.sh
+        urls: List of URLs or file paths
+        extra_text: Additional text/description
+        use_firefox: Whether to use Firefox cookies (default: True)
+        cookies_file: Path to cookies file (takes precedence over use_firefox)
+        config: Config dict (for path conversion)
+        nsfw: Whether to add --nsfw flag (default: False)
+        disable_cookies_for_sites: List of domain patterns to disable cookies for (default: None)
+    """
     # Convert script path to absolute path
     script_path = Path(script_path)
     if not script_path.is_absolute():
@@ -652,19 +725,26 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
     logger.info(f"Using bash: {bash_path}")
     logger.info(f"Script path: {script_path}")
     
+    # Check if cookies should be disabled for any URLs
+    disable_cookies = should_disable_cookies(urls, disable_cookies_for_sites)
+    if disable_cookies_for_sites:
+        logger.debug(f"Checking disable_cookies_for_sites: {disable_cookies_for_sites} against URLs: {urls}, result: {disable_cookies}")
+    
     # Build command: bash script_path -p profile_name [--cookies FILE|--firefox] [--nsfw] url1 url2 ... "extra_text"
     cmd = [bash_path, script_path, '-p', profile_name]
     
-    # Use cookies file if provided (takes precedence over --firefox)
-    if cookies_file:
+    # Use cookies file if provided and not disabled (takes precedence over --firefox)
+    if cookies_file and not disable_cookies:
         # Convert cookies file path to Cygwin path if needed
         cookies_path = convert_path_for_cygwin(cookies_file, config)
         cmd.extend(['--cookies', cookies_path])
         logger.info(f"Adding --cookies parameter with file: {cookies_path}")
-    elif use_firefox:
-        # Only add --firefox if cookies_file is not set
+    elif use_firefox and not disable_cookies:
+        # Only add --firefox if cookies_file is not set and cookies are not disabled
         cmd.append('--firefox')
         logger.info("Adding --firefox parameter")
+    elif disable_cookies:
+        logger.info("Cookies disabled for this request (URL matches disable_cookies_for_sites pattern)")
     
     # Add --nsfw if enabled
     if nsfw:
@@ -890,6 +970,13 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
         logger.warning(f"Failed to send status message for media group: {e}, continuing without it")
     
     try:
+        # Get disable_cookies_for_sites from channel config or global config
+        # Use 'in' check to handle empty lists correctly (empty list means "don't disable for this channel")
+        if 'disable_cookies_for_sites' in channel_config:
+            disable_cookies_sites = channel_config.get('disable_cookies_for_sites')
+        else:
+            disable_cookies_sites = config.get('disable_cookies_for_sites')
+        
         # Build command with all media files
         cmd = build_command(
             profile_name,
@@ -899,7 +986,8 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
             config.get('use_firefox', True),
             config.get('cookies_file'),
             config,
-            channel_config.get('nsfw', False)  # Get NSFW setting from channel config
+            channel_config.get('nsfw', False),  # Get NSFW setting from channel config
+            disable_cookies_sites  # Get disable cookies setting from channel or global config
         )
         
         # Execute script
@@ -1315,6 +1403,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.warning(f"Failed to send status message for media files: {e}, continuing without it")
         
         try:
+            # Get disable_cookies_for_sites from channel config or global config
+            # Use 'in' check to handle empty lists correctly (empty list means "don't disable for this channel")
+            if 'disable_cookies_for_sites' in channel_config:
+                disable_cookies_sites = channel_config.get('disable_cookies_for_sites')
+            else:
+                disable_cookies_sites = config.get('disable_cookies_for_sites')
             
             # Build command with local files
             cmd = build_command(
@@ -1325,7 +1419,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 config.get('use_firefox', True),
                 config.get('cookies_file'),
                 config,
-                channel_config.get('nsfw', False)  # Get NSFW setting from channel config
+                channel_config.get('nsfw', False),  # Get NSFW setting from channel config
+                disable_cookies_sites  # Get disable cookies setting from channel or global config
             )
             
             # Execute script
@@ -1484,6 +1579,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.warning(f"Failed to send status message: {e}, continuing without it")
     
     try:
+        # Get disable_cookies_for_sites from channel config or global config
+        # Use 'in' check to handle empty lists correctly (empty list means "don't disable for this channel")
+        if 'disable_cookies_for_sites' in channel_config:
+            disable_cookies_sites = channel_config.get('disable_cookies_for_sites')
+        else:
+            disable_cookies_sites = config.get('disable_cookies_for_sites')
         
         # Build command
         cmd = build_command(
@@ -1494,7 +1595,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             config.get('use_firefox', True),
             config.get('cookies_file'),
             config,
-            channel_config.get('nsfw', False)  # Get NSFW setting from channel config
+            channel_config.get('nsfw', False),  # Get NSFW setting from channel config
+            disable_cookies_sites  # Get disable cookies setting from channel or global config
         )
         
         # Execute script

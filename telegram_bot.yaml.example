@@ -15,6 +15,14 @@ script_path: ./nostr_media_uploader.sh
 # Takes precedence over --firefox option
 # cookies_file: ./firefox_cookies.txt
 
+# Optional: List of domains to disable cookies for (global setting)
+# When a URL matches any domain in this list, --firefox and --cookies will not be added
+# Can be overridden per-channel
+# Examples:
+#   disable_cookies_for_sites: [facebook.com, instagram.com]
+#   disable_cookies_for_sites: [example.com]
+# disable_cookies_for_sites: []
+
 # Optional: Path to Cygwin installation (e.g., C:\cygwin64 or F:\cygwin64)
 # If not specified, will try to auto-detect common locations
 # cygwin_root: F:\cygwin64
@@ -52,6 +60,12 @@ channels:
     chat_id: -1001111111111
     profile_name: nsfw_profile
     nsfw: true  # Mark all posts from this channel as NSFW
+  
+  # Example channel 5: with disable cookies for specific sites
+  channel5:
+    chat_id: -1002222222222
+    profile_name: public_profile
+    disable_cookies_for_sites: [facebook.com, instagram.com]  # Don't use cookies for these sites
 
 # Note: If no channels are configured, the bot will only process messages
 # from the owner (owner_id). Messages from channels will be ignored.
