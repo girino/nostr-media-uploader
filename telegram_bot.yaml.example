@@ -46,6 +46,12 @@ channels:
   channel3:
     chat_id: -1009876543210
     profile_name: another_profile
+  
+  # Example channel 4: with NSFW flag enabled
+  channel4:
+    chat_id: -1001111111111
+    profile_name: nsfw_profile
+    nsfw: true  # Mark all posts from this channel as NSFW
 
 # Note: If no channels are configured, the bot will only process messages
 # from the owner (owner_id). Messages from channels will be ignored.

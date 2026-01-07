@@ -629,7 +629,7 @@ async def download_media_file(bot, file, file_extension=None, max_retries=3, ret
         return None
 
 
-def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None):
+def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False):
     """Build the command to execute nostr_media_uploader.sh."""
     # Convert script path to absolute path
     script_path = Path(script_path)
@@ -652,7 +652,7 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
     logger.info(f"Using bash: {bash_path}")
     logger.info(f"Script path: {script_path}")
     
-    # Build command: bash script_path -p profile_name [--cookies FILE|--firefox] url1 url2 ... "extra_text"
+    # Build command: bash script_path -p profile_name [--cookies FILE|--firefox] [--nsfw] url1 url2 ... "extra_text"
     cmd = [bash_path, script_path, '-p', profile_name]
     
     # Use cookies file if provided (takes precedence over --firefox)
@@ -665,6 +665,11 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
         # Only add --firefox if cookies_file is not set
         cmd.append('--firefox')
         logger.info("Adding --firefox parameter")
+    
+    # Add --nsfw if enabled
+    if nsfw:
+        cmd.append('--nsfw')
+        logger.info("Adding --nsfw parameter")
     
     # Add --nocomment if there is extra text after URLs
     if extra_text and extra_text.strip():
@@ -761,13 +766,14 @@ async def execute_script(cmd, cwd=None):
         }
 
 
-async def process_media_group(media_group_id: str, messages: List, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def process_media_group(media_group_id: str, messages: List, context: ContextTypes.DEFAULT_TYPE, channel_config: dict = None) -> None:
     """Process all messages in a media group together.
     
     Args:
         media_group_id: The media group ID
         messages: List of messages in the group
         context: Bot context
+        channel_config: Optional channel configuration dict (if None, will be detected from messages)
     """
     if not messages:
         return
@@ -778,45 +784,46 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
         logger.error("Configuration not found in bot_data")
         return
     
-    # Use the first message for channel/profile detection
+    # Use the first message for channel/profile detection if channel_config not provided
     first_message = messages[0]
     
-    # Check if message is from the owner (same logic as handle_message)
-    is_owner = False
-    channel_config = None
-    
-    if first_message.from_user:
-        is_owner = (first_message.from_user.id == config['owner_id'])
-        if not is_owner:
-            logger.info(f"Media group from non-owner user {first_message.from_user.id}, ignoring")
-            return
+    # If channel_config not provided, detect it from the first message
+    if channel_config is None:
+        # Check if message is from the owner (same logic as handle_message)
+        is_owner = False
         
-        chat_id = first_message.chat.id if first_message.chat.id else None
-        chat_username = first_message.chat.username if first_message.chat.username else None
-        channel_config = find_channel_config(config, chat_id=chat_id, chat_username=chat_username)
-    elif first_message.sender_chat:
-        sender_chat_id = first_message.sender_chat.id
-        sender_chat_username = first_message.sender_chat.username if first_message.sender_chat.username else None
-        chat_id = first_message.chat.id if first_message.chat.id else None
-        chat_username = first_message.chat.username if first_message.chat.username else None
-        
-        channel_config = find_channel_config(config, chat_id=sender_chat_id, chat_username=sender_chat_username)
-        if not channel_config:
+        if first_message.from_user:
+            is_owner = (first_message.from_user.id == config['owner_id'])
+            if not is_owner:
+                logger.info(f"Media group from non-owner user {first_message.from_user.id}, ignoring")
+                return
+            
+            chat_id = first_message.chat.id if first_message.chat.id else None
+            chat_username = first_message.chat.username if first_message.chat.username else None
             channel_config = find_channel_config(config, chat_id=chat_id, chat_username=chat_username)
-        
-        if channel_config:
-            is_owner = True
+        elif first_message.sender_chat:
+            sender_chat_id = first_message.sender_chat.id
+            sender_chat_username = first_message.sender_chat.username if first_message.sender_chat.username else None
+            chat_id = first_message.chat.id if first_message.chat.id else None
+            chat_username = first_message.chat.username if first_message.chat.username else None
+            
+            channel_config = find_channel_config(config, chat_id=sender_chat_id, chat_username=sender_chat_username)
+            if not channel_config:
+                channel_config = find_channel_config(config, chat_id=chat_id, chat_username=chat_username)
+            
+            if channel_config:
+                is_owner = True
+            else:
+                logger.info(f"Media group from channel with no matching config, ignoring")
+                return
         else:
-            logger.info(f"Media group from channel with no matching config, ignoring")
+            logger.info("Media group has no from_user or sender_chat, ignoring")
             return
-    else:
-        logger.info("Media group has no from_user or sender_chat, ignoring")
-        return
-    
-    # Require channel configuration
-    if not channel_config:
-        logger.info("No channel configuration found for media group, ignoring")
-        return
+        
+        # Require channel configuration
+        if not channel_config:
+            logger.info("No channel configuration found for media group, ignoring")
+            return
     
     profile_name = channel_config.get('profile_name')
     if not profile_name:
@@ -891,7 +898,8 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
             text,  # Use caption/text as description
             config.get('use_firefox', True),
             config.get('cookies_file'),
-            config
+            config,
+            channel_config.get('nsfw', False)  # Get NSFW setting from channel config
         )
         
         # Execute script
@@ -1179,6 +1187,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
             # Add this message to the group
             group_data['messages'].append(message)
+            # Update channel_config if not already set (should already be set, but just in case)
+            if 'channel_config' not in group_data:
+                group_data['channel_config'] = channel_config
             logger.info(f"Added message to media group {media_group_id} (total: {len(group_data['messages'])})")
             
             # Cancel the previous timeout task and create a new one (reset timeout)
@@ -1196,7 +1207,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         group_data = pending_media_groups[media_group_id]
                         if not group_data.get('processed', False):
                             group_data['processed'] = True
-                            await process_media_group(media_group_id, group_data['messages'], context)
+                            # Get channel_config from stored group data
+                            channel_cfg = group_data.get('channel_config')
+                            await process_media_group(media_group_id, group_data['messages'], context, channel_cfg)
                             # Clean up
                             del pending_media_groups[media_group_id]
                 except asyncio.CancelledError:
@@ -1221,7 +1234,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         group_data = pending_media_groups[media_group_id]
                         if not group_data.get('processed', False):
                             group_data['processed'] = True
-                            await process_media_group(media_group_id, group_data['messages'], context)
+                            # Get channel_config from stored group data
+                            channel_cfg = group_data.get('channel_config')
+                            await process_media_group(media_group_id, group_data['messages'], context, channel_cfg)
                             # Clean up
                             del pending_media_groups[media_group_id]
                 except asyncio.CancelledError:
@@ -1236,7 +1251,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             pending_media_groups[media_group_id] = {
                 'messages': [message],
                 'task': asyncio.create_task(process_group_after_timeout()),
-                'processed': False
+                'processed': False,
+                'channel_config': channel_config  # Store channel_config for later use
             }
             logger.info(f"Created media group {media_group_id} with first message, waiting for more...")
         
@@ -1308,7 +1324,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 text,  # Use full text as extra text (description)
                 config.get('use_firefox', True),
                 config.get('cookies_file'),
-                config
+                config,
+                channel_config.get('nsfw', False)  # Get NSFW setting from channel config
             )
             
             # Execute script
@@ -1476,7 +1493,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             extra_text,
             config.get('use_firefox', True),
             config.get('cookies_file'),
-            config
+            config,
+            channel_config.get('nsfw', False)  # Get NSFW setting from channel config
         )
         
         # Execute script
