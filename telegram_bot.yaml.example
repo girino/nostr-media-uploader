@@ -23,6 +23,14 @@ script_path: ./nostr_media_uploader.sh
 #   disable_cookies_for_sites: [example.com]
 # disable_cookies_for_sites: []
 
+# Optional: Script execution timeout in seconds (default: 360 = 6 minutes)
+# Scripts that take longer than this will be forcefully killed
+# Useful for preventing long waits on rate-limited sites (e.g., X.com/Twitter)
+# Can be specified as:
+#   - Integer: 360 (seconds)
+#   - String with unit: "6m" (6 minutes) or "360s" (360 seconds)
+# script_timeout: 360
+
 # Optional: Path to Cygwin installation (e.g., C:\cygwin64 or F:\cygwin64)
 # If not specified, will try to auto-detect common locations
 # cygwin_root: F:\cygwin64

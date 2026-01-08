@@ -12,6 +12,13 @@ import logging
 import yaml
 import argparse
 import tempfile
+import signal
+import time
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Optional
@@ -31,12 +38,23 @@ logger = logging.getLogger(__name__)
 # Configuration
 CONFIG_FILE = os.getenv('TELEGRAM_BOT_CONFIG', 'telegram_bot.yaml')
 
+# Detect Cygwin environment
+IS_CYGWIN = sys.platform == 'cygwin'
+
 # Media group handling: store pending media groups
 # Format: {media_group_id: {'messages': [messages], 'task': asyncio.Task, 'processed': bool}}
 pending_media_groups: Dict[str, Dict] = {}
 
 # Timeout for waiting for more messages in a media group (in seconds)
 MEDIA_GROUP_TIMEOUT = 2.0
+
+# Track running processes for cleanup on shutdown
+# Format: {pid: {'process': subprocess.Process, 'cmd': list}}
+running_processes: Dict[int, Dict] = {}
+
+# Track running processes for cleanup on shutdown
+# Format: {pid: {'process': subprocess.Process, 'cmd': list, 'started': timestamp}}
+running_processes: Dict[int, Dict] = {}
 
 # URL regex pattern to match http/https links
 URL_PATTERN = re.compile(
@@ -87,6 +105,23 @@ def load_config(config_path, use_firefox=True, cookies_file=None):
         logger.warning(f"Cookies file specified but not found: {cookies_file}")
         # Don't raise error, just log warning - user might fix it later
     
+    # Get script timeout (default: 6 minutes = 360 seconds)
+    script_timeout = config_data.get('script_timeout', 360)
+    # Convert to int if it's a number
+    if isinstance(script_timeout, (int, float)):
+        script_timeout = int(script_timeout)
+    elif isinstance(script_timeout, str):
+        # Support format like "6m" or "360s"
+        script_timeout_str = script_timeout.lower().strip()
+        if script_timeout_str.endswith('m'):
+            script_timeout = int(float(script_timeout_str[:-1]) * 60)
+        elif script_timeout_str.endswith('s'):
+            script_timeout = int(float(script_timeout_str[:-1]))
+        else:
+            script_timeout = int(float(script_timeout_str))
+    else:
+        script_timeout = 360  # Default fallback
+    
     return {
         'bot_token': config_data.get('bot_token'),
         'owner_id': int(config_data.get('owner_id', 0)),
@@ -97,6 +132,7 @@ def load_config(config_path, use_firefox=True, cookies_file=None):
         'use_firefox': use_firefox,
         'cookies_file': cookies_file,
         'disable_cookies_for_sites': config_data.get('disable_cookies_for_sites'),  # Optional: list of domains to disable cookies for
+        'script_timeout': script_timeout,  # Timeout for script execution in seconds (default: 360 = 6 minutes)
     }
 
 
@@ -772,12 +808,586 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
     return cmd
 
 
-async def execute_script(cmd, cwd=None):
-    """Execute the script and capture output."""
+async def get_cygwin_pid(windows_pid):
+    """Map a Windows PID to a Cygwin PID using ps command.
+    
+    Args:
+        windows_pid: Windows process ID
+    
+    Returns:
+        Cygwin PID if found, None otherwise
+    """
+    if not IS_CYGWIN:
+        return windows_pid  # Not Cygwin, return as-is
+    
+    try:
+        # Use ps to find the Cygwin PID for this Windows PID
+        # Format: ps -W -p <windows_pid> -o pid=,ppid=,winpid=
+        # We want the pid column (Cygwin PID) where winpid matches
+        proc = await asyncio.create_subprocess_exec(
+            'ps', '-W', '-p', str(windows_pid), '-o', 'pid=,winpid=',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+        
+        if proc.returncode == 0 and stdout:
+            # Parse output: lines are like "12345 67890" (cygwin_pid winpid)
+            for line in stdout.decode('utf-8', errors='ignore').strip().split('\n'):
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    cygwin_pid = parts[0].strip()
+                    winpid = parts[1].strip()
+                    if winpid == str(windows_pid):
+                        logger.debug(f"Mapped Windows PID {windows_pid} to Cygwin PID {cygwin_pid}")
+                        return int(cygwin_pid)
+        
+        logger.debug(f"Could not map Windows PID {windows_pid} to Cygwin PID (process may not exist in Cygwin)")
+        return None
+    except (asyncio.TimeoutError, FileNotFoundError, ValueError, Exception) as e:
+        logger.debug(f"Error mapping Windows PID {windows_pid} to Cygwin PID: {e}")
+        return None
+
+
+async def kill_process_tree(pid, timeout=5.0):
+    """Kill a process and all its children recursively.
+    
+    Args:
+        pid: Process ID to kill
+        timeout: Time to wait for graceful termination before force kill (seconds)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        if not pid:
+            return False
+        
+        if not PSUTIL_AVAILABLE:
+            logger.warning("psutil not available, using basic process kill (children may remain). Install with: pip install psutil")
+            # Fallback: try to kill using signal on Unix or taskkill on Windows
+            try:
+                if os.name == 'nt':
+                    # Windows: use taskkill to kill process tree
+                    # Use async subprocess to avoid blocking on KeyboardInterrupt
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            'taskkill', '/F', '/T', '/PID', str(pid),
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL
+                        )
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+                    except (asyncio.TimeoutError, KeyboardInterrupt):
+                        # If interrupted or timeout, try to kill the taskkill process itself
+                        try:
+                            if proc and proc.returncode is None:
+                                proc.kill()
+                                await proc.wait()
+                        except Exception:
+                            pass
+                else:
+                    # Unix: send SIGINT to parent first to match Control-C behavior
+                    try:
+                        os.kill(pid, signal.SIGINT)
+                        logger.debug(f"Sent SIGINT to parent PID {pid} (matching Control-C), waiting for cleanup handlers...")
+                        await asyncio.sleep(2)  # Give parent time to run cleanup handlers
+                        
+                        # Check if process still exists
+                        try:
+                            os.kill(pid, 0)  # Check if process exists
+                            # Still running, send SIGTERM to process group (including children)
+                            os.killpg(os.getpgid(pid), signal.SIGTERM)
+                            await asyncio.sleep(1)
+                            # Force kill if still running
+                            os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass  # Process already dead
+                    except ProcessLookupError:
+                        pass  # Already dead
+            except (KeyboardInterrupt, Exception) as e:
+                if isinstance(e, KeyboardInterrupt):
+                    logger.warning("Process kill interrupted by KeyboardInterrupt, continuing cleanup...")
+                else:
+                    logger.debug(f"Basic kill failed: {e}")
+            return True
+        
+        # Get the process object
+        try:
+            parent = psutil.Process(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            logger.debug(f"Process {pid} not found or access denied")
+            return False
+        
+        # Get all child processes recursively BEFORE sending signal
+        # We'll check if they're still running after parent exits
+        children = parent.children(recursive=True)
+        child_pids = [p.pid for p in children]
+        
+        # Log detailed process tree information
+        logger.warning(f"[PROCESS TREE] ========== Starting kill operation ==========")
+        logger.warning(f"[PROCESS TREE] Parent process:")
+        try:
+            parent_cmd = ' '.join(parent.cmdline()) if hasattr(parent, 'cmdline') else 'N/A'
+            logger.warning(f"[PROCESS TREE]   PID: {pid} (Windows PID)")
+            logger.warning(f"[PROCESS TREE]   Name: {parent.name()}")
+            logger.warning(f"[PROCESS TREE]   Command: {parent_cmd}")
+            if IS_CYGWIN:
+                cygwin_pid = await get_cygwin_pid(pid)
+                if cygwin_pid:
+                    logger.warning(f"[PROCESS TREE]   Cygwin PID: {cygwin_pid}")
+                else:
+                    logger.warning(f"[PROCESS TREE]   Cygwin PID: <could not map>")
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+            logger.warning(f"[PROCESS TREE]   Error getting parent info: {e}")
+        
+        logger.warning(f"[PROCESS TREE] Child processes: {len(children)}")
+        if children:
+            for i, child in enumerate(children, 1):
+                try:
+                    child_cmd = ' '.join(child.cmdline()) if hasattr(child, 'cmdline') else 'N/A'
+                    logger.warning(f"[PROCESS TREE]   Child {i}:")
+                    logger.warning(f"[PROCESS TREE]     Windows PID: {child.pid}")
+                    logger.warning(f"[PROCESS TREE]     Name: {child.name()}")
+                    logger.warning(f"[PROCESS TREE]     Command: {child_cmd}")
+                    if IS_CYGWIN:
+                        child_cygwin_pid = await get_cygwin_pid(child.pid)
+                        if child_cygwin_pid:
+                            logger.warning(f"[PROCESS TREE]     Cygwin PID: {child_cygwin_pid}")
+                        else:
+                            logger.warning(f"[PROCESS TREE]     Cygwin PID: <could not map>")
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    logger.warning(f"[PROCESS TREE]   Child {i}: PID {child.pid} (Windows) | Error: {e}")
+        
+        logger.info(f"Killing process tree: parent PID {pid} and {len(children)} child process(es)")
+        
+        # Step 1: Send SIGINT to parent process first to allow it to run cleanup handlers
+        # SIGINT matches Control-C behavior exactly, triggering the same trap handlers
+        # This gives bash scripts time to execute their trap handlers (e.g., cleanup function)
+        try:
+            # On Windows, subprocesses launched via bash.exe are ALWAYS Cygwin processes
+            # So we should use Cygwin kill methods, not Windows methods
+            if os.name == 'nt' or IS_CYGWIN:
+                # Cygwin: map Windows PID to Cygwin PID, then use kill command
+                cygwin_pid = await get_cygwin_pid(pid)
+                if cygwin_pid:
+                    try:
+                        logger.warning(f"[KILL_PROCESS_TREE] Platform: Cygwin (Windows subprocess) | Method: 'kill -INT' command | Windows PID: {pid} -> Cygwin PID: {cygwin_pid}")
+                        kill_proc = await asyncio.create_subprocess_exec(
+                            'kill', '-INT', str(cygwin_pid),
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL
+                        )
+                        await asyncio.wait_for(kill_proc.wait(), timeout=2.0)
+                        logger.debug(f"Sent SIGINT to parent process (Windows PID {pid}, Cygwin PID {cygwin_pid}) via Cygwin kill command (matching Control-C), waiting for cleanup handlers...")
+                    except (asyncio.TimeoutError, FileNotFoundError, ProcessLookupError) as kill_err:
+                        # Fallback to psutil send_signal if kill command fails
+                        logger.warning(f"[KILL_PROCESS_TREE] Platform: Cygwin (Windows subprocess) | Method: psutil.send_signal() (fallback - kill command failed: {kill_err}) | Windows PID: {pid}")
+                        parent.send_signal(signal.SIGINT)
+                        logger.debug(f"Sent SIGINT to parent process {pid} via psutil (fallback), waiting for cleanup handlers...")
+                else:
+                    # Could not map PID, fallback to psutil
+                    logger.warning(f"[KILL_PROCESS_TREE] Platform: Cygwin (Windows subprocess) | Method: psutil.send_signal() (fallback - PID mapping failed) | Windows PID: {pid}")
+                    parent.send_signal(signal.SIGINT)
+                    logger.debug(f"Sent SIGINT to parent process {pid} via psutil (fallback), waiting for cleanup handlers...")
+            else:
+                # Linux: use psutil send_signal
+                logger.warning(f"[KILL_PROCESS_TREE] Platform: Linux | Method: psutil.send_signal() (SIGINT) | PID: {pid}")
+                parent.send_signal(signal.SIGINT)
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+            logger.debug(f"Could not signal parent process {pid}: {e}")
+        
+        # Wait for parent to handle signal and potentially exit gracefully
+        # Give it more time if there are many children (they need to be cleaned up)
+        wait_time = min(timeout, max(2.0, len(children) * 0.5))
+        try:
+            # Use polling with asyncio.sleep to allow KeyboardInterrupt to be handled
+            start_time = time.time()
+            while parent.is_running() and (time.time() - start_time) < wait_time:
+                try:
+                    await asyncio.sleep(0.1)
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    # If interrupted, break and proceed to force kill
+                    logger.warning("Process wait interrupted, proceeding to force kill...")
+                    break
+            
+            if not parent.is_running():
+                signal_name = "SIGINT" if os.name != 'nt' else "SIGTERM"
+                logger.info(f"Parent process {pid} exited gracefully after receiving {signal_name}")
+                
+                # Parent exited, wait longer for children to be cleaned up by parent's cleanup handlers
+                # Bash scripts with cleanup handlers need time to actually execute the cleanup
+                # Some children might be in the middle of cleanup operations
+                logger.debug("Waiting for parent's cleanup handlers to finish cleaning up children...")
+                await asyncio.sleep(3.0)  # Increased wait time for cleanup to complete
+                
+                # Check if any of the known child processes are still running
+                # The parent's cleanup handler should have killed them, but verify
+                still_running_children = []
+                for child_pid in child_pids:
+                    try:
+                        child_proc = psutil.Process(child_pid)
+                        if child_proc.is_running():
+                            still_running_children.append(child_proc)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass  # Child already dead, which is what we want
+                
+                if still_running_children:
+                    logger.info(f"Parent exited but {len(still_running_children)} child process(es) still running, waiting for cleanup to finish...")
+                    # Wait longer for them to exit on their own (they might be in cleanup)
+                    # Children might be cleaning up temp files, etc.
+                    try:
+                        logger.debug("Waiting up to 5s for children to finish cleanup...")
+                        gone, still_alive = psutil.wait_procs(still_running_children, timeout=5.0)
+                        if still_alive:
+                            logger.warning(f"Force killing {len(still_alive)} remaining child process(es) after cleanup timeout...")
+                            # Give them one last chance (they might be almost done)
+                            await asyncio.sleep(1.0)
+                            # Re-check - they might have finished
+                            still_alive = [p for p in still_alive if p.is_running()]
+                            for proc in still_alive:
+                                try:
+                                    if IS_CYGWIN:
+                                        # Cygwin: map Windows PID to Cygwin PID, then use kill -KILL command
+                                        cygwin_pid = await get_cygwin_pid(proc.pid)
+                                        if cygwin_pid:
+                                            try:
+                                                logger.warning(f"[FORCE KILL CHILD] Platform: Cygwin | Method: 'kill -KILL' command | Windows PID: {proc.pid} -> Cygwin PID: {cygwin_pid}")
+                                                kill_proc = await asyncio.create_subprocess_exec(
+                                                    'kill', '-KILL', str(cygwin_pid),
+                                                    stdout=asyncio.subprocess.DEVNULL,
+                                                    stderr=asyncio.subprocess.DEVNULL
+                                                )
+                                                await asyncio.wait_for(kill_proc.wait(), timeout=1.0)
+                                                logger.debug(f"Force killed child process (Windows PID {proc.pid}, Cygwin PID {cygwin_pid}) via Cygwin kill -KILL command")
+                                            except (asyncio.TimeoutError, FileNotFoundError, ProcessLookupError) as kill_err:
+                                                # Fallback to psutil kill
+                                                logger.warning(f"[FORCE KILL CHILD] Platform: Cygwin | Method: psutil.kill() (fallback - kill command failed: {kill_err}) | Windows PID: {proc.pid}")
+                                                proc.kill()
+                                        else:
+                                            # Could not map PID, fallback to psutil
+                                            logger.warning(f"[FORCE KILL CHILD] Platform: Cygwin | Method: psutil.kill() (fallback - PID mapping failed) | Windows PID: {proc.pid}")
+                                            proc.kill()
+                                    else:
+                                        proc.kill()
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    pass
+                    except Exception as e:
+                        logger.warning(f"Error waiting for children: {e}")
+                
+                return True
+            else:
+                # Parent still running after wait_time, will proceed to Step 2
+                elapsed = time.time() - start_time
+                logger.warning(f"Parent process {pid} did not exit within {elapsed:.1f}s, proceeding to force kill...")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # If interrupted during wait, proceed to force kill
+            logger.warning("Process wait interrupted, proceeding to force kill...")
+        except Exception as e:
+            logger.warning(f"Error waiting for parent process: {e}, proceeding to force kill...")
+        
+        # Step 2: If parent didn't exit, get fresh list of children and kill everything
+        try:
+            if parent.is_running():
+                # Get fresh list of children (in case they changed)
+                children = parent.children(recursive=True)
+                all_procs = [parent] + children
+                
+                logger.warning(f"[PROCESS TREE] Parent still running, force terminating {len(all_procs)} process(es) in tree:")
+                logger.warning(f"[PROCESS TREE]   Parent: PID {parent.pid} (Windows) | Name: {parent.name()}")
+                if children:
+                    logger.warning(f"[PROCESS TREE]   Children ({len(children)}):")
+                    for i, child in enumerate(children, 1):
+                        try:
+                            child_cmd = ' '.join(child.cmdline()) if hasattr(child, 'cmdline') else 'N/A'
+                            logger.warning(f"[PROCESS TREE]     Child {i}: PID {child.pid} (Windows) | Name: {child.name()} | Command: {child_cmd}")
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            logger.warning(f"[PROCESS TREE]     Child {i}: PID {child.pid} (Windows) | Name: <access denied>")
+                
+                logger.info(f"Force terminating {len(all_procs)} process(es) in tree...")
+                # Terminate all remaining processes (use SIGINT on Unix to match Control-C)
+                for proc in all_procs:
+                    try:
+                        proc_name = proc.name()
+                        proc_cmd = ' '.join(proc.cmdline()) if hasattr(proc, 'cmdline') else 'N/A'
+                        logger.warning(f"[PROCESS TREE]   Sending SIGINT to: PID {proc.pid} (Windows) | Name: {proc_name} | Command: {proc_cmd}")
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        proc_name = "<access denied>"
+                        proc_cmd = "N/A"
+                    try:
+                        # On Windows, subprocesses launched via bash.exe are ALWAYS Cygwin processes
+                        if os.name == 'nt' or IS_CYGWIN:
+                            # Cygwin: map Windows PID to Cygwin PID, then use kill command
+                            cygwin_pid = await get_cygwin_pid(proc.pid)
+                            if cygwin_pid:
+                                try:
+                                    logger.warning(f"[FORCE TERMINATE] Platform: Cygwin | Method: 'kill -INT' command | Windows PID: {proc.pid} -> Cygwin PID: {cygwin_pid}")
+                                    kill_proc = await asyncio.create_subprocess_exec(
+                                        'kill', '-INT', str(cygwin_pid),
+                                        stdout=asyncio.subprocess.DEVNULL,
+                                        stderr=asyncio.subprocess.DEVNULL
+                                    )
+                                    await asyncio.wait_for(kill_proc.wait(), timeout=1.0)
+                                    logger.debug(f"Sent SIGINT to process (Windows PID {proc.pid}, Cygwin PID {cygwin_pid}) via Cygwin kill command")
+                                except (asyncio.TimeoutError, FileNotFoundError, ProcessLookupError) as kill_err:
+                                    # Fallback to psutil if kill command fails
+                                    logger.warning(f"[FORCE TERMINATE] Platform: Cygwin | Method: psutil.send_signal() (fallback - kill command failed: {kill_err}) | Windows PID: {proc.pid}")
+                                    proc.send_signal(signal.SIGINT)
+                            else:
+                                # Could not map PID, fallback to psutil
+                                logger.warning(f"[FORCE TERMINATE] Platform: Cygwin | Method: psutil.send_signal() (fallback - PID mapping failed) | Windows PID: {proc.pid}")
+                                proc.send_signal(signal.SIGINT)
+                        else:
+                            proc.send_signal(signal.SIGINT)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                        logger.debug(f"Could not signal process {proc.pid}: {e}")
+                
+                # Wait for graceful termination
+                remaining_timeout = max(2.0, timeout - wait_time)
+                try:
+                    gone, still_alive = psutil.wait_procs(all_procs, timeout=remaining_timeout)
+                    if still_alive:
+                        logger.warning(f"Force killing {len(still_alive)} process(es) that didn't terminate...")
+                except Exception as e:
+                    logger.warning(f"Error waiting for processes: {e}")
+                    still_alive = all_procs
+                
+                # Step 3: Force kill any processes that didn't terminate
+                for proc in still_alive:
+                    try:
+                        if IS_CYGWIN:
+                            # Cygwin: map Windows PID to Cygwin PID, then use kill -KILL command
+                            cygwin_pid = await get_cygwin_pid(proc.pid)
+                            if cygwin_pid:
+                                try:
+                                    logger.warning(f"[FORCE KILL] Platform: Cygwin | Method: 'kill -KILL' command | Windows PID: {proc.pid} -> Cygwin PID: {cygwin_pid}")
+                                    kill_proc = await asyncio.create_subprocess_exec(
+                                        'kill', '-KILL', str(cygwin_pid),
+                                        stdout=asyncio.subprocess.DEVNULL,
+                                        stderr=asyncio.subprocess.DEVNULL
+                                    )
+                                    await asyncio.wait_for(kill_proc.wait(), timeout=1.0)
+                                except (asyncio.TimeoutError, FileNotFoundError, ProcessLookupError) as kill_err:
+                                    # Fallback to psutil kill
+                                    logger.warning(f"[FORCE KILL] Platform: Cygwin | Method: psutil.kill() (fallback - kill command failed: {kill_err}) | Windows PID: {proc.pid}")
+                                    proc.kill()
+                            else:
+                                # Could not map PID, fallback to psutil
+                                logger.warning(f"[FORCE KILL] Platform: Cygwin | Method: psutil.kill() (fallback - PID mapping failed) | Windows PID: {proc.pid}")
+                                proc.kill()
+                        else:
+                            logger.warning(f"[FORCE KILL] Platform: Linux | Method: proc.kill() (SIGKILL) | PID: {proc.pid}")
+                            proc.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                        logger.debug(f"Could not kill process {proc.pid}: {e}")
+                
+                # Final wait
+                try:
+                    psutil.wait_procs(still_alive, timeout=2.0)
+                except Exception:
+                    pass
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logger.warning("Process tree kill interrupted, but processes may have been killed")
+            return True
+        except Exception as e:
+            logger.error(f"Error in Step 2 of process tree kill: {e}")
+        
+        logger.info(f"Successfully killed process tree for PID {pid}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error killing process tree for PID {pid}: {e}")
+        return False
+
+
+async def _wait_for_read_task_and_collect_output(read_task, chunks_stdout, chunks_stderr, signal_type="signal"):
+    """Wait for read_task to complete and collect output.
+    
+    This is used for both timeout and KeyboardInterrupt cases to ensure
+    identical behavior when waiting for process to exit and collecting output.
+    
+    Args:
+        read_task: The asyncio task that's reading from process streams
+        chunks_stdout: List of stdout chunks collected so far
+        chunks_stderr: List of stderr chunks collected so far
+        signal_type: Type of signal sent ("timeout" or "interrupt") for logging
+    
+    Returns:
+        Tuple of (stdout_bytes, stderr_bytes) collected from read_task
+    """
+    # Wait for read_task to complete (which will happen when process exits)
+    # Give it enough time to run cleanup handlers (up to 15 seconds)
+    if read_task and not read_task.done():
+        try:
+            await asyncio.wait_for(read_task, timeout=15.0)
+            logger.debug(f"Process exited after {signal_type} signal, cleanup handlers should have run")
+        except asyncio.TimeoutError:
+            logger.warning(f"Process did not exit after {signal_type} signal within 15s, will force kill")
+            # Cancel read_task since it's taking too long
+            # This will also cancel nested stream reading tasks
+            read_task.cancel()
+            try:
+                await read_task
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                pass
+            # Give a moment for nested tasks to finish cancelling
+            await asyncio.sleep(0.1)
+    
+    # Collect the data (read_task may have continued reading)
+    stdout_bytes = b''.join(chunks_stdout)
+    stderr_bytes = b''.join(chunks_stderr)
+    
+    return stdout_bytes, stderr_bytes
+
+
+async def _kill_process_and_read_remaining_output(process, stdout_bytes, stderr_bytes):
+    """Helper function to kill process tree and read remaining output.
+    
+    This is used for both timeout and KeyboardInterrupt cases to ensure
+    identical cleanup behavior.
+    
+    Args:
+        process: The subprocess to kill
+        stdout_bytes: Existing stdout bytes (will be updated with remaining output)
+        stderr_bytes: Existing stderr bytes (will be updated with remaining output)
+    
+    Returns:
+        Tuple of (stdout_bytes, stderr_bytes) with any remaining output appended
+    """
+    # Kill the process tree (parent and all children)
+    try:
+        if process and process.pid:
+            # Kill the entire process tree
+            killed = await kill_process_tree(process.pid, timeout=5.0)
+            if not killed:
+                # Fallback: try the old method if psutil approach failed
+                logger.warning("Process tree kill failed, trying standard kill...")
+                try:
+                    process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5.0)
+                    except (asyncio.TimeoutError, KeyboardInterrupt):
+                        process.kill()
+                        try:
+                            await process.wait()
+                        except (asyncio.CancelledError, KeyboardInterrupt):
+                            pass  # Already interrupted
+                except (KeyboardInterrupt, Exception) as kill_err:
+                    if isinstance(kill_err, KeyboardInterrupt):
+                        logger.warning("Process kill interrupted, continuing...")
+                    else:
+                        logger.error(f"Fallback kill also failed: {kill_err}")
+        else:
+            logger.warning("Process PID not available for killing")
+    except (KeyboardInterrupt, Exception) as kill_error:
+        if isinstance(kill_error, KeyboardInterrupt):
+            logger.warning("Process tree kill interrupted by KeyboardInterrupt, continuing cleanup...")
+        else:
+            logger.error(f"Error killing process tree: {kill_error}")
+    
+    # After killing, try to read any remaining output from streams
+    # Cleanup handlers might have written to stdout/stderr during cleanup
+    # We need to read this output to see cleanup messages
+    logger.debug("Reading any remaining output from streams after process kill (cleanup handlers may have written)...")
+    try:
+        # Wait longer for cleanup handlers to write output (they might be running)
+        # The cleanup process might take a moment to flush output
+        await asyncio.sleep(2.0)  # Give cleanup handlers time to write
+        
+        # Try to read remaining data from stdout
+        remaining_stdout = b''
+        if process.stdout:
+            try:
+                # Try reading with multiple attempts since data might arrive after cleanup
+                for attempt in range(3):  # Try up to 3 times
+                    try:
+                        # Check if stream is readable
+                        if hasattr(process.stdout, 'at_eof') and process.stdout.at_eof():
+                            break
+                        
+                        chunk = await asyncio.wait_for(process.stdout.read(8192), timeout=1.0)
+                        if not chunk:
+                            # No data yet, wait a bit more if not last attempt
+                            if attempt < 2:
+                                await asyncio.sleep(0.5)
+                                continue
+                            break
+                        remaining_stdout += chunk
+                        # Got some data, continue reading
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        # Timeout or cancelled, might be more data later
+                        if attempt < 2:
+                            await asyncio.sleep(0.5)
+                            continue
+                        break
+                    except Exception as e:
+                        logger.debug(f"Error reading stdout chunk: {e}")
+                        break
+            except Exception as e:
+                logger.debug(f"Error reading remaining stdout: {e}")
+            
+            if remaining_stdout:
+                stdout_bytes += remaining_stdout
+                logger.info(f"Read {len(remaining_stdout)} additional bytes from stdout after kill (likely cleanup handler output)")
+        
+        # Try to read remaining data from stderr
+        remaining_stderr = b''
+        if process.stderr:
+            try:
+                # Try reading with multiple attempts since data might arrive after cleanup
+                for attempt in range(3):  # Try up to 3 times
+                    try:
+                        # Check if stream is readable
+                        if hasattr(process.stderr, 'at_eof') and process.stderr.at_eof():
+                            break
+                        
+                        chunk = await asyncio.wait_for(process.stderr.read(8192), timeout=1.0)
+                        if not chunk:
+                            # No data yet, wait a bit more if not last attempt
+                            if attempt < 2:
+                                await asyncio.sleep(0.5)
+                                continue
+                            break
+                        remaining_stderr += chunk
+                        # Got some data, continue reading
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        # Timeout or cancelled, might be more data later
+                        if attempt < 2:
+                            await asyncio.sleep(0.5)
+                            continue
+                        break
+                    except Exception as e:
+                        logger.debug(f"Error reading stderr chunk: {e}")
+                        break
+            except Exception as e:
+                logger.debug(f"Error reading remaining stderr: {e}")
+            
+            if remaining_stderr:
+                stderr_bytes += remaining_stderr
+                logger.info(f"Read {len(remaining_stderr)} additional bytes from stderr after kill (likely cleanup handler output)")
+    except Exception as e:
+        logger.debug(f"Error reading remaining output: {e}")
+    
+    return stdout_bytes, stderr_bytes
+
+
+async def execute_script(cmd, cwd=None, timeout=None):
+    """Execute the script and capture output.
+    
+    Args:
+        cmd: Command to execute as a list
+        cwd: Working directory (optional)
+        timeout: Timeout in seconds (optional, default: None = no timeout)
+    
+    Returns:
+        Dictionary with returncode, stdout, stderr, and success flag
+    """
+    process = None
     try:
         # Log full command for debugging
         logger.info(f"Executing command: {cmd}")
         logger.info(f"Command string: {' '.join(str(arg) for arg in cmd)}")
+        if timeout:
+            logger.info(f"Timeout set to {timeout} seconds")
         
         # Validate first argument (executable) exists if it's an absolute path
         executable = cmd[0] if cmd else None
@@ -799,6 +1409,7 @@ async def execute_script(cmd, cwd=None):
             startupinfo.wShowWindow = subprocess.SW_HIDE
         
         # Execute subprocess (works on both Windows and Linux)
+        # On Unix, create process in its own process group so SIGINT works like Control-C
         if os.name == 'nt':
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -808,18 +1419,305 @@ async def execute_script(cmd, cwd=None):
                 startupinfo=startupinfo
             )
         else:
+            # On Unix, try to create process in its own process group (like a foreground process)
+            # This allows SIGINT to work exactly like Control-C
+            # Note: Cygwin has limited process group support, so we handle it gracefully
+            def preexec_fn():
+                # Create new process group (like a foreground process)
+                # On Cygwin, this might not work or work differently
+                try:
+                    os.setsid()
+                except OSError:
+                    # On Cygwin, setsid might not be available or work differently
+                    # Just continue without it - we'll send signals directly
+                    pass
+            
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=cwd or Path(__file__).parent
+                cwd=cwd or Path(__file__).parent,
+                preexec_fn=preexec_fn if not IS_CYGWIN else None  # Skip on Cygwin
             )
         
-        stdout_bytes, stderr_bytes = await process.communicate()
+        # Track the process for cleanup on shutdown
+        if process and process.pid:
+            running_processes[process.pid] = {'process': process, 'cmd': cmd}
+            logger.debug(f"Tracking process PID {process.pid}: {cmd[0]}")
+        
+        # Wait for process completion with optional timeout
+        stdout_bytes = b''
+        stderr_bytes = b''
+        timed_out = False
+        interrupt_reason = None  # Store reason for error message formatting
+        
+        if timeout:
+            # Use manual stream reading to capture partial output on timeout
+            chunks_stdout = []
+            chunks_stderr = []
+            
+            async def read_streams():
+                """Read from both streams concurrently while waiting for process."""
+                nonlocal chunks_stdout, chunks_stderr
+                
+                stream_tasks = []
+                
+                async def read_stdout():
+                    if process.stdout:
+                        try:
+                            while True:
+                                chunk = await process.stdout.read(8192)
+                                if not chunk:
+                                    break
+                                chunks_stdout.append(chunk)
+                        except (asyncio.CancelledError, Exception):
+                            pass  # Stream closed, cancelled, or error
+                
+                async def read_stderr():
+                    if process.stderr:
+                        try:
+                            while True:
+                                chunk = await process.stderr.read(8192)
+                                if not chunk:
+                                    break
+                                chunks_stderr.append(chunk)
+                        except (asyncio.CancelledError, Exception):
+                            pass  # Stream closed, cancelled, or error
+                
+                # Start reading streams and waiting for process concurrently
+                if process.stdout:
+                    stream_tasks.append(asyncio.create_task(read_stdout()))
+                if process.stderr:
+                    stream_tasks.append(asyncio.create_task(read_stderr()))
+                
+                try:
+                    # Wait for process to finish
+                    await process.wait()
+                    
+                    # Wait for streams to finish reading (they'll hit EOF)
+                    if stream_tasks:
+                        await asyncio.gather(*stream_tasks, return_exceptions=True)
+                except asyncio.CancelledError:
+                    # If read_streams is cancelled, cancel all stream tasks
+                    for task in stream_tasks:
+                        if not task.done():
+                            task.cancel()
+                    # Wait for stream tasks to finish cancelling
+                    if stream_tasks:
+                        await asyncio.gather(*stream_tasks, return_exceptions=True)
+                    raise
+            
+            # Use timeout-aware approach: send signal before cancelling, matching Control-C behavior
+            try:
+                # Create a timeout task that sends SIGINT (matching Control-C) when timeout is reached
+                async def send_timeout_signal():
+                    await asyncio.sleep(timeout)
+                    # Timeout reached - send SIGINT to process (matching Control-C exactly)
+                    if process and process.pid:
+                        try:
+                            # On Windows, subprocesses launched via bash.exe are ALWAYS Cygwin processes
+                            # So we should use Cygwin kill methods, not Windows methods
+                            if os.name == 'nt' or IS_CYGWIN:
+                                    # Cygwin: map Windows PID to Cygwin PID, then use kill command
+                                    # Send to parent first, then get all children and send to them too
+                                    # This ensures all processes in the tree receive the signal
+                                    try:
+                                        # Map parent Windows PID to Cygwin PID
+                                        cygwin_pid = await get_cygwin_pid(process.pid)
+                                        if cygwin_pid:
+                                            # Send SIGINT to parent process
+                                            logger.warning(f"[TIMEOUT SIGNAL] Platform: Cygwin | Method: 'kill -INT' command | Windows PID: {process.pid} -> Cygwin PID: {cygwin_pid}")
+                                            kill_proc = await asyncio.create_subprocess_exec(
+                                                'kill', '-INT', str(cygwin_pid),
+                                                stdout=asyncio.subprocess.DEVNULL,
+                                                stderr=asyncio.subprocess.DEVNULL
+                                            )
+                                            await asyncio.wait_for(kill_proc.wait(), timeout=2.0)
+                                            logger.debug(f"Timeout reached ({timeout}s), sent SIGINT to parent process (Windows PID {process.pid}, Cygwin PID {cygwin_pid}) via Cygwin kill command")
+                                            
+                                            # Also send SIGINT to all child processes (they might not inherit the signal)
+                                            if PSUTIL_AVAILABLE:
+                                                try:
+                                                    parent_proc = psutil.Process(process.pid)
+                                                    children = parent_proc.children(recursive=True)
+                                                    if children:
+                                                        logger.info(f"Sending SIGINT to {len(children)} child process(es) via Cygwin kill command...")
+                                                        for child in children:
+                                                            try:
+                                                                child_cygwin_pid = await get_cygwin_pid(child.pid)
+                                                                if child_cygwin_pid:
+                                                                    logger.warning(f"[TIMEOUT SIGNAL] Platform: Cygwin | Method: 'kill -INT' command | Child Windows PID: {child.pid} -> Cygwin PID: {child_cygwin_pid}")
+                                                                    child_kill_proc = await asyncio.create_subprocess_exec(
+                                                                        'kill', '-INT', str(child_cygwin_pid),
+                                                                        stdout=asyncio.subprocess.DEVNULL,
+                                                                        stderr=asyncio.subprocess.DEVNULL
+                                                                    )
+                                                                    await asyncio.wait_for(child_kill_proc.wait(), timeout=1.0)
+                                                                    logger.debug(f"Sent SIGINT to child process (Windows PID {child.pid}, Cygwin PID {child_cygwin_pid}) via Cygwin kill command")
+                                                                else:
+                                                                    logger.warning(f"Could not map child Windows PID {child.pid} to Cygwin PID, skipping")
+                                                            except (asyncio.TimeoutError, FileNotFoundError, ProcessLookupError) as child_err:
+                                                                # Child might have already exited
+                                                                logger.debug(f"Error sending SIGINT to child process {child.pid}: {child_err}")
+                                                                pass
+                                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                                    # Parent or children might have already exited
+                                                    pass
+                                            
+                                            logger.debug(f"Timeout reached ({timeout}s), sent SIGINT to process tree starting at Windows PID {process.pid} (Cygwin PID {cygwin_pid}) via Cygwin kill command (matching Control-C)")
+                                        else:
+                                            # Could not map PID, fallback to os.kill
+                                            logger.warning(f"[TIMEOUT SIGNAL] Platform: Cygwin | Method: os.kill() (fallback - PID mapping failed) | Windows PID: {process.pid}")
+                                            os.kill(process.pid, signal.SIGINT)
+                                    except (asyncio.TimeoutError, FileNotFoundError, ProcessLookupError) as kill_err:
+                                        # Fallback to os.kill if kill command fails
+                                        logger.warning(f"[TIMEOUT SIGNAL] Platform: Cygwin (Windows subprocess) | Method: os.kill() (fallback - kill command failed: {kill_err}) | Windows PID: {process.pid}")
+                                        os.kill(process.pid, signal.SIGINT)
+                            else:
+                                # Linux: try process group first, fallback to process
+                                try:
+                                    pgid = os.getpgid(process.pid)
+                                    logger.warning(f"[TIMEOUT SIGNAL] Platform: Linux | Method: os.killpg() (SIGINT to process group) | PID: {process.pid} | Process Group: {pgid}")
+                                    os.killpg(pgid, signal.SIGINT)
+                                except (ProcessLookupError, OSError) as pg_err:
+                                    # Fallback: send to process directly if process group fails
+                                    logger.warning(f"[TIMEOUT SIGNAL] Platform: Linux | Method: os.kill() (SIGINT to process, fallback - process group failed: {pg_err}) | PID: {process.pid}")
+                                    os.kill(process.pid, signal.SIGINT)
+                        except (ProcessLookupError, psutil.NoSuchProcess, psutil.AccessDenied) as sig_err:
+                            logger.debug(f"Process already gone or cannot send signal: {sig_err}")
+                        except Exception as sig_err:
+                            logger.warning(f"Error sending timeout signal: {sig_err}")
+                
+                # Start both tasks concurrently
+                timeout_task = asyncio.create_task(send_timeout_signal())
+                read_task = asyncio.create_task(read_streams())
+                
+                # Wait for either to complete first
+                done, pending = await asyncio.wait(
+                    [timeout_task, read_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # Determine what happened
+                if timeout_task in done:
+                    # Timeout occurred - signal already sent
+                    timed_out = True
+                    interrupt_reason = ("timeout", f"timed out after {timeout} seconds")
+                    logger.warning(f"Script execution {interrupt_reason[1]}, signal sent, waiting for cleanup handlers and process exit...")
+                    
+                    # Signal was sent (SIGINT matching Control-C), now wait for process to handle it and exit
+                    # read_task is still running and will complete when process exits
+                    # Use the same helper function for both timeout and interrupt
+                    stdout_bytes, stderr_bytes = await _wait_for_read_task_and_collect_output(
+                        read_task, chunks_stdout, chunks_stderr, signal_type="timeout"
+                    )
+                elif read_task in done:
+                    # Normal completion - process finished before timeout
+                    timed_out = False
+                    # Cancel timeout task since we don't need it anymore
+                    timeout_task.cancel()
+                    try:
+                        await timeout_task
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        pass
+                    
+                    # Collect the data (read_task already completed)
+                    stdout_bytes = b''.join(chunks_stdout)
+                    stderr_bytes = b''.join(chunks_stderr)
+                
+            except KeyboardInterrupt as e:
+                # KeyboardInterrupt occurred (user pressed Control-C)
+                # SIGINT was already sent by OS - now handle exactly like timeout
+                timed_out = True
+                interrupt_reason = ("interrupt", "interrupted by KeyboardInterrupt (Ctrl+C)")
+                logger.warning(f"Script execution {interrupt_reason[1]}, signal sent, waiting for cleanup handlers and process exit...")
+                
+                # Cancel timeout task if it's still running
+                if 'timeout_task' in locals():
+                    timeout_task.cancel()
+                    try:
+                        await timeout_task
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        pass
+                
+                # Wait for read_task to complete (same as timeout case - use exact same function)
+                # read_task should still be running and will complete when process exits
+                if 'read_task' in locals():
+                    stdout_bytes, stderr_bytes = await _wait_for_read_task_and_collect_output(
+                        read_task, chunks_stdout, chunks_stderr, signal_type="interrupt"
+                    )
+                else:
+                    # read_task wasn't created yet, just collect what we have
+                    stdout_bytes = b''.join(chunks_stdout)
+                    stderr_bytes = b''.join(chunks_stderr)
+            
+            # If timed out/interrupted and process is still running, force kill and read remaining output
+            # This is the same for both timeout and KeyboardInterrupt
+            if timed_out and process and process.returncode is None:
+                # Process didn't exit after signal, need to force kill and read remaining output
+                logger.debug("Process still running after signal and wait, force killing and reading remaining output...")
+                stdout_bytes, stderr_bytes = await _kill_process_and_read_remaining_output(
+                    process, stdout_bytes, stderr_bytes
+                )
+        else:
+            # No timeout - use standard communicate
+            stdout_bytes, stderr_bytes = await process.communicate()
         
         # Decode bytes to strings
         stdout = stdout_bytes.decode('utf-8', errors='replace') if stdout_bytes else ''
         stderr = stderr_bytes.decode('utf-8', errors='replace') if stderr_bytes else ''
+        
+        # Remove process from tracking when it finishes
+        if process and process.pid and process.pid in running_processes:
+            del running_processes[process.pid]
+            logger.debug(f"Removed process PID {process.pid} from tracking")
+        
+        # Close process streams to avoid unclosed transport warnings
+        # This is especially important on Windows with ProactorEventLoop
+        try:
+            if process and process.stdout:
+                process.stdout.close()
+            if process and process.stderr:
+                process.stderr.close()
+        except Exception as e:
+            logger.debug(f"Error closing process streams: {e}")
+        
+        if timed_out:
+            # Determine the appropriate error message based on the reason
+            # Use the stored interrupt reason from the exception handler
+            if interrupt_reason:
+                reason_type, reason_text = interrupt_reason
+                if reason_type == "timeout":
+                    error_msg = f"Script execution timed out after {timeout} seconds"
+                    output_label = "before timeout"
+                elif reason_type == "interrupt":
+                    error_msg = "Script execution was interrupted (Ctrl+C)"
+                    output_label = "before interruption"
+                else:
+                    error_msg = "Script execution was cancelled"
+                    output_label = "before cancellation"
+            else:
+                # Fallback if reason wasn't set (shouldn't happen, but just in case)
+                error_msg = f"Script execution timed out after {timeout} seconds"
+                output_label = "before timeout"
+            
+            # Prepend error message to stderr, but keep any captured output
+            if stderr:
+                # Check if error message is already in stderr (from cleanup handlers)
+                if error_msg.lower() not in stderr.lower():
+                    stderr = f"{error_msg}\n\n--- Partial output {output_label} ---\n{stderr}"
+            else:
+                stderr = error_msg
+            if stdout:
+                stderr += f"\n\n--- Partial stdout {output_label} ---\n{stdout}"
+            
+            return {
+                'returncode': -1,
+                'stdout': stdout,
+                'stderr': stderr,
+                'success': False,
+                'timeout': True
+            }
         
         # Log captured output for debugging
         logger.debug(f"Script returncode: {process.returncode}")
@@ -838,6 +1736,20 @@ async def execute_script(cmd, cwd=None):
         }
     except Exception as e:
         logger.exception(f"Exception while executing script: {e}")
+        # Make sure to kill the process tree if it's still running
+        if process and process.returncode is None:
+            try:
+                if process.pid:
+                    await kill_process_tree(process.pid, timeout=5.0)
+                    # Remove from tracking
+                    if process.pid in running_processes:
+                        del running_processes[process.pid]
+                else:
+                    # Fallback if PID not available
+                    process.kill()
+                    await process.wait()
+            except Exception as e:
+                logger.debug(f"Error cleaning up process: {e}")
         return {
             'returncode': -1,
             'stdout': '',
@@ -990,8 +1902,9 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
             disable_cookies_sites  # Get disable cookies setting from channel or global config
         )
         
-        # Execute script
-        result = await execute_script(cmd)
+        # Execute script with timeout
+        timeout = config.get('script_timeout', 360)
+        result = await execute_script(cmd, timeout=timeout)
         
         # Clean up temporary files
         for temp_file in media_files:
@@ -1062,23 +1975,47 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
                 else:
                     await send_message_with_retry(first_message, success_msg)
         else:
-            error_parts = []
-            if result['stderr']:
-                error_parts.append(f"Error:\n{result['stderr']}")
-            if result['stdout']:
-                error_parts.append(f"Output:\n{result['stdout']}")
-            
-            error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
-            
-            MAX_ERROR_LENGTH = 3500
-            if len(error_msg) > MAX_ERROR_LENGTH:
-                truncated_msg = error_msg[-MAX_ERROR_LENGTH:]
-                first_newline = truncated_msg.find('\n')
-                if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:
-                    truncated_msg = truncated_msg[first_newline+1:]
-                error_display = f"❌ Error processing media group\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
+            # Check for timeout first
+            if result.get('timeout'):
+                timeout_seconds = config.get('script_timeout', 360)
+                error_parts = [f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\nThe request took too long and was cancelled. This may happen with rate-limited sites."]
+                
+                # Include any captured output before timeout
+                if result.get('stderr'):
+                    error_parts.append(result['stderr'])
+                if result.get('stdout') and 'Partial stdout' not in (result.get('stderr') or ''):
+                    error_parts.append(f"\n--- Partial stdout before timeout ---\n{result['stdout']}")
+                
+                error_msg = "\n\n".join(error_parts)
+                
+                # Truncate if too long (Telegram limit)
+                MAX_ERROR_LENGTH = 3500
+                if len(error_msg) > MAX_ERROR_LENGTH:
+                    truncated_msg = error_msg[-MAX_ERROR_LENGTH:]
+                    first_newline = truncated_msg.find('\n')
+                    if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:
+                        truncated_msg = truncated_msg[first_newline+1:]
+                    error_display = f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
+                else:
+                    error_display = error_msg
             else:
-                error_display = f"❌ Error processing media group\n\n{error_msg}"
+                error_parts = []
+                if result['stderr']:
+                    error_parts.append(f"Error:\n{result['stderr']}")
+                if result['stdout']:
+                    error_parts.append(f"Output:\n{result['stdout']}")
+                
+                error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
+                
+                MAX_ERROR_LENGTH = 3500
+                if len(error_msg) > MAX_ERROR_LENGTH:
+                    truncated_msg = error_msg[-MAX_ERROR_LENGTH:]
+                    first_newline = truncated_msg.find('\n')
+                    if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:
+                        truncated_msg = truncated_msg[first_newline+1:]
+                    error_display = f"❌ Error processing media group\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
+                else:
+                    error_display = f"❌ Error processing media group\n\n{error_msg}"
             
             if status_msg:
                 await send_message_with_retry(status_msg, error_display, edit_text=True)
@@ -1423,8 +2360,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 disable_cookies_sites  # Get disable cookies setting from channel or global config
             )
             
-            # Execute script
-            result = await execute_script(cmd)
+            # Execute script with timeout
+            timeout = config.get('script_timeout', 360)
+            result = await execute_script(cmd, timeout=timeout)
             
             # Clean up temporary files
             for temp_file in media_files:
@@ -1511,14 +2449,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     else:
                         await send_message_with_retry(message, success_msg)
             else:
-                # Combine stderr and stdout for error messages (bash scripts often use both)
-                error_parts = []
-                if result['stderr']:
-                    error_parts.append(f"Error:\n{result['stderr']}")
-                if result['stdout']:
-                    error_parts.append(f"Output:\n{result['stdout']}")
-                
-                error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
+                # Check for timeout first
+                if result.get('timeout'):
+                    timeout_seconds = config.get('script_timeout', 360)
+                    error_parts = [f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\nThe request took too long and was cancelled. This may happen with rate-limited sites."]
+                    
+                    # Include any captured output before timeout
+                    if result.get('stderr'):
+                        error_parts.append(result['stderr'])
+                    if result.get('stdout') and 'Partial stdout' not in (result.get('stderr') or ''):
+                        error_parts.append(f"\n--- Partial stdout before timeout ---\n{result['stdout']}")
+                    
+                    error_msg = "\n\n".join(error_parts)
+                    
+                    # Truncate if too long (Telegram limit)
+                    MAX_ERROR_LENGTH = 3500
+                    if len(error_msg) > MAX_ERROR_LENGTH:
+                        truncated_msg = error_msg[-MAX_ERROR_LENGTH:]
+                        first_newline = truncated_msg.find('\n')
+                        if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:
+                            truncated_msg = truncated_msg[first_newline+1:]
+                        error_display = f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
+                    else:
+                        error_display = error_msg
+                else:
+                    # Combine stderr and stdout for error messages (bash scripts often use both)
+                    error_parts = []
+                    if result['stderr']:
+                        error_parts.append(f"Error:\n{result['stderr']}")
+                    if result['stdout']:
+                        error_parts.append(f"Output:\n{result['stdout']}")
+                    
+                    error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
                 
                 # Telegram has a 4096 character limit per message, so limit to ~3500 to leave room for prefix
                 MAX_ERROR_LENGTH = 3500
@@ -1599,8 +2561,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             disable_cookies_sites  # Get disable cookies setting from channel or global config
         )
         
-        # Execute script
-        result = await execute_script(cmd)
+        # Execute script with timeout
+        timeout = config.get('script_timeout', 360)
+        result = await execute_script(cmd, timeout=timeout)
         
         # Format response
         if result['success']:
@@ -1680,14 +2643,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 else:
                     await send_message_with_retry(message, success_msg)
         else:
-            # Combine stderr and stdout for error messages (bash scripts often use both)
-            error_parts = []
-            if result['stderr']:
-                error_parts.append(f"Error:\n{result['stderr']}")
-            if result['stdout']:
-                error_parts.append(f"Output:\n{result['stdout']}")
-            
-            error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
+            # Check for timeout first
+            if result.get('timeout'):
+                timeout_seconds = config.get('script_timeout', 360)
+                error_parts = [f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\nThe request took too long and was cancelled. This may happen with rate-limited sites."]
+                
+                # Include any captured output before timeout
+                if result.get('stderr'):
+                    error_parts.append(result['stderr'])
+                if result.get('stdout') and 'Partial stdout' not in (result.get('stderr') or ''):
+                    error_parts.append(f"\n--- Partial stdout before timeout ---\n{result['stdout']}")
+                
+                error_msg = "\n\n".join(error_parts)
+                
+                # Truncate if too long (Telegram limit)
+                MAX_ERROR_LENGTH = 3500
+                if len(error_msg) > MAX_ERROR_LENGTH:
+                    truncated_msg = error_msg[-MAX_ERROR_LENGTH:]
+                    first_newline = truncated_msg.find('\n')
+                    if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:
+                        truncated_msg = truncated_msg[first_newline+1:]
+                    error_display = f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
+                else:
+                    error_display = error_msg
+            else:
+                # Combine stderr and stdout for error messages (bash scripts often use both)
+                error_parts = []
+                if result['stderr']:
+                    error_parts.append(f"Error:\n{result['stderr']}")
+                if result['stdout']:
+                    error_parts.append(f"Output:\n{result['stdout']}")
+                
+                error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
             
             # Telegram has a 4096 character limit per message, so limit to ~3500 to leave room for prefix
             MAX_ERROR_LENGTH = 3500
@@ -1718,8 +2705,96 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.error(f"Failed to send error message: {send_error}")
 
 
+async def cleanup_all_processes():
+    """Kill all tracked processes and their children."""
+    if not running_processes:
+        logger.info("No running processes to clean up")
+        return
+    
+    logger.info(f"Cleaning up {len(running_processes)} tracked process(es)...")
+    pids_to_kill = list(running_processes.keys())
+    
+    for pid in pids_to_kill:
+        proc_info = running_processes.get(pid)
+        if proc_info:
+            cmd_str = ' '.join(str(arg) for arg in proc_info['cmd'][:3])  # Show first few args
+            logger.info(f"Killing process tree for PID {pid} (command: {cmd_str}...)")
+            try:
+                await kill_process_tree(pid, timeout=5.0)
+                if pid in running_processes:
+                    del running_processes[pid]
+            except Exception as e:
+                logger.error(f"Error killing process {pid}: {e}")
+    
+    logger.info("Process cleanup completed")
+
+
+def setup_signal_handlers():
+    """Set up signal handlers for graceful shutdown."""
+    def signal_handler(signum, frame):
+        """Handle SIGINT and SIGTERM signals."""
+        signal_name = signal.Signals(signum).name
+        logger.info(f"Received {signal_name}, cleaning up {len(running_processes)} tracked process(es)...")
+        
+        # Kill all processes synchronously (using subprocess calls)
+        if running_processes:
+            pids_to_kill = list(running_processes.keys())
+            for pid in pids_to_kill:
+                logger.info(f"Killing process tree for PID {pid}...")
+                try:
+                    # Use synchronous process killing
+                    if PSUTIL_AVAILABLE:
+                        try:
+                            parent = psutil.Process(pid)
+                            children = parent.children(recursive=True)
+                            all_procs = [parent] + children
+                            for proc in all_procs:
+                                try:
+                                    proc.terminate()
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    pass
+                            # Wait briefly
+                            psutil.wait_procs(all_procs, timeout=2.0)
+                            # Force kill remaining
+                            for proc in all_procs:
+                                try:
+                                    if proc.is_running():
+                                        proc.kill()
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    pass
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                    elif os.name == 'nt':
+                        # Windows: use taskkill
+                        subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)], 
+                                     timeout=5.0, capture_output=True)
+                    else:
+                        # Unix: use killpg
+                        try:
+                            os.killpg(os.getpgid(pid), signal.SIGTERM)
+                            time.sleep(1)
+                            os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        except (ProcessLookupError, OSError):
+                            pass
+                except Exception as e:
+                    logger.error(f"Error killing process {pid}: {e}")
+        
+        logger.info("Process cleanup completed, exiting...")
+        # Exit gracefully
+        sys.exit(0)
+    
+    # Register signal handlers (only on Unix-like systems)
+    if os.name != 'nt':
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+    # On Windows, KeyboardInterrupt will be handled in the try/except block
+
+
 def main() -> None:
     """Start the bot."""
+    # Set up signal handlers for graceful shutdown
+    setup_signal_handlers()
+    
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Telegram bot for nostr_media_uploader')
     parser.add_argument('--no-firefox', action='store_true',
@@ -1789,8 +2864,55 @@ def main() -> None:
         logger.info("No channels configured - will only process messages from owner")
     logger.info("Bot is ready and listening for messages...")
     
-    # Run the bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Run the bot with cleanup on shutdown
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except KeyboardInterrupt:
+        logger.info("Received KeyboardInterrupt (Ctrl+C), cleaning up processes...")
+        # Kill all processes synchronously (for Windows and Unix)
+        if running_processes:
+            logger.info(f"Cleaning up {len(running_processes)} tracked process(es)...")
+            pids_to_kill = list(running_processes.keys())
+            for pid in pids_to_kill:
+                logger.info(f"Killing process tree for PID {pid}...")
+                try:
+                    if PSUTIL_AVAILABLE:
+                        try:
+                            parent = psutil.Process(pid)
+                            children = parent.children(recursive=True)
+                            all_procs = [parent] + children
+                            for proc in all_procs:
+                                try:
+                                    proc.terminate()
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    pass
+                            # Wait briefly
+                            psutil.wait_procs(all_procs, timeout=2.0)
+                            # Force kill remaining
+                            for proc in all_procs:
+                                try:
+                                    if proc.is_running():
+                                        proc.kill()
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    pass
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                    elif os.name == 'nt':
+                        # Windows: use taskkill
+                        subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)], 
+                                     timeout=5.0, capture_output=True)
+                    else:
+                        # Unix: use killpg
+                        try:
+                            os.killpg(os.getpgid(pid), signal.SIGTERM)
+                            time.sleep(1)
+                            os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        except (ProcessLookupError, OSError):
+                            pass
+                except Exception as e:
+                    logger.error(f"Error killing process {pid}: {e}")
+        logger.info("Process cleanup completed, exiting...")
+        raise
 
 
 if __name__ == '__main__':
