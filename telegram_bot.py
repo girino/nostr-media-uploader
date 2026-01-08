@@ -1215,13 +1215,15 @@ async def _wait_for_read_task_and_collect_output(read_task, chunks_stdout, chunk
         Tuple of (stdout_bytes, stderr_bytes) collected from read_task
     """
     # Wait for read_task to complete (which will happen when process exits)
-    # Give it enough time to run cleanup handlers (up to 15 seconds)
+    # For interrupts (Control-C), use shorter timeout since user wants quick shutdown
+    # For timeouts, use longer timeout to allow cleanup handlers to run
+    timeout = 2.0 if signal_type == "interrupt" else 15.0
     if read_task and not read_task.done():
         try:
-            await asyncio.wait_for(read_task, timeout=15.0)
+            await asyncio.wait_for(read_task, timeout=timeout)
             logger.debug(f"Process exited after {signal_type} signal, cleanup handlers should have run")
         except asyncio.TimeoutError:
-            logger.warning(f"Process did not exit after {signal_type} signal within 15s, will force kill")
+            logger.warning(f"Process did not exit after {signal_type} signal within {timeout}s, will force kill")
             # Cancel read_task since it's taking too long
             # This will also cancel nested stream reading tasks
             read_task.cancel()
@@ -1229,8 +1231,12 @@ async def _wait_for_read_task_and_collect_output(read_task, chunks_stdout, chunk
                 await read_task
             except (asyncio.CancelledError, KeyboardInterrupt):
                 pass
-            # Give a moment for nested tasks to finish cancelling
-            await asyncio.sleep(0.1)
+            # Give a moment for nested tasks to finish cancelling (but shorter for interrupts)
+            try:
+                await asyncio.sleep(0.1 if signal_type == "interrupt" else 0.1)
+            except (asyncio.CancelledError, RuntimeError):
+                # Event loop might be closing - that's okay
+                pass
     
     # Collect the data (read_task may have continued reading)
     stdout_bytes = b''.join(chunks_stdout)
@@ -1627,10 +1633,12 @@ async def execute_script(cmd, cwd=None, timeout=None):
                 
             except KeyboardInterrupt as e:
                 # KeyboardInterrupt occurred (user pressed Control-C)
-                # SIGINT was already sent by OS - now handle exactly like timeout
+                # On Windows, subprocesses launched via bash.exe are ALWAYS Cygwin processes
+                # So we should use Cygwin kill methods, not Windows methods
+                # Send SIGINT to match Control-C behavior, but use shorter wait times since user wants quick shutdown
                 timed_out = True
                 interrupt_reason = ("interrupt", "interrupted by KeyboardInterrupt (Ctrl+C)")
-                logger.warning(f"Script execution {interrupt_reason[1]}, signal sent, waiting for cleanup handlers and process exit...")
+                logger.warning(f"Script execution {interrupt_reason[1]}, sending signal...")
                 
                 # Cancel timeout task if it's still running
                 if 'timeout_task' in locals():
@@ -1640,7 +1648,55 @@ async def execute_script(cmd, cwd=None, timeout=None):
                     except (asyncio.CancelledError, KeyboardInterrupt):
                         pass
                 
-                # Wait for read_task to complete (same as timeout case - use exact same function)
+                # Send SIGINT to process (matching Control-C) - same as timeout but with shorter wait
+                if process and process.pid:
+                    try:
+                        if os.name == 'nt' or IS_CYGWIN:
+                            # Cygwin: map Windows PID to Cygwin PID, then use kill command
+                            cygwin_pid = await get_cygwin_pid(process.pid)
+                            if cygwin_pid:
+                                try:
+                                    logger.warning(f"[INTERRUPT SIGNAL] Platform: Cygwin (Windows subprocess) | Method: 'kill -INT' command | Windows PID: {process.pid} -> Cygwin PID: {cygwin_pid}")
+                                    kill_proc = await asyncio.create_subprocess_exec(
+                                        'kill', '-INT', str(cygwin_pid),
+                                        stdout=asyncio.subprocess.DEVNULL,
+                                        stderr=asyncio.subprocess.DEVNULL
+                                    )
+                                    await asyncio.wait_for(kill_proc.wait(), timeout=1.0)
+                                    logger.debug(f"Sent SIGINT to process (Windows PID {process.pid}, Cygwin PID {cygwin_pid}) via Cygwin kill command")
+                                except (asyncio.TimeoutError, FileNotFoundError, ProcessLookupError) as kill_err:
+                                    # Fallback to os.kill if kill command fails
+                                    logger.warning(f"[INTERRUPT SIGNAL] Platform: Cygwin (Windows subprocess) | Method: os.kill() (fallback - kill command failed: {kill_err}) | Windows PID: {process.pid}")
+                                    try:
+                                        os.kill(process.pid, signal.SIGINT)
+                                    except (ProcessLookupError, OSError):
+                                        pass
+                            else:
+                                # Could not map PID, fallback to os.kill
+                                logger.warning(f"[INTERRUPT SIGNAL] Platform: Cygwin (Windows subprocess) | Method: os.kill() (fallback - PID mapping failed) | Windows PID: {process.pid}")
+                                try:
+                                    os.kill(process.pid, signal.SIGINT)
+                                except (ProcessLookupError, OSError):
+                                    pass
+                        else:
+                            # Linux: try process group first, fallback to process
+                            try:
+                                pgid = os.getpgid(process.pid)
+                                logger.warning(f"[INTERRUPT SIGNAL] Platform: Linux | Method: os.killpg() (SIGINT to process group) | PID: {process.pid} | Process Group: {pgid}")
+                                os.killpg(pgid, signal.SIGINT)
+                            except (ProcessLookupError, OSError) as pg_err:
+                                # Fallback: send to process directly if process group fails
+                                logger.warning(f"[INTERRUPT SIGNAL] Platform: Linux | Method: os.kill() (SIGINT to process, fallback - process group failed: {pg_err}) | PID: {process.pid}")
+                                try:
+                                    os.kill(process.pid, signal.SIGINT)
+                                except (ProcessLookupError, OSError):
+                                    pass
+                    except (ProcessLookupError, OSError) as sig_err:
+                        logger.debug(f"Process already gone or cannot send signal: {sig_err}")
+                
+                logger.warning(f"Script execution {interrupt_reason[1]}, signal sent, waiting for cleanup handlers and process exit (short timeout for quick shutdown)...")
+                
+                # Wait for read_task to complete (use shorter timeout for interrupts)
                 # read_task should still be running and will complete when process exits
                 if 'read_task' in locals():
                     stdout_bytes, stderr_bytes = await _wait_for_read_task_and_collect_output(
@@ -1674,11 +1730,20 @@ async def execute_script(cmd, cwd=None, timeout=None):
         
         # Close process streams to avoid unclosed transport warnings
         # This is especially important on Windows with ProactorEventLoop
+        # We MUST close streams before the event loop closes to avoid "Event loop is closed" errors
+        # Note: Stream closing will also be handled in finally block to ensure it always happens
         try:
-            if process and process.stdout:
-                process.stdout.close()
-            if process and process.stderr:
-                process.stderr.close()
+            if process:
+                if process.stdout:
+                    try:
+                        process.stdout.close()
+                    except (RuntimeError, OSError, ValueError) as close_err:
+                        logger.debug(f"Error closing stdout stream: {close_err}")
+                if process.stderr:
+                    try:
+                        process.stderr.close()
+                    except (RuntimeError, OSError, ValueError) as close_err:
+                        logger.debug(f"Error closing stderr stream: {close_err}")
         except Exception as e:
             logger.debug(f"Error closing process streams: {e}")
         
@@ -1750,12 +1815,65 @@ async def execute_script(cmd, cwd=None, timeout=None):
                     await process.wait()
             except Exception as e:
                 logger.debug(f"Error cleaning up process: {e}")
+        # Ensure streams are closed even on exception
+        try:
+            if process:
+                if process.stdout:
+                    try:
+                        process.stdout.close()
+                    except (RuntimeError, OSError, ValueError):
+                        pass
+                if process.stderr:
+                    try:
+                        process.stderr.close()
+                    except (RuntimeError, OSError, ValueError):
+                        pass
+        except Exception:
+            pass
         return {
             'returncode': -1,
             'stdout': '',
             'stderr': str(e),
             'success': False
         }
+    finally:
+        # Always ensure streams are closed, even if function returns early or raises
+        # This is critical on Windows with ProactorEventLoop to avoid "Event loop is closed" errors
+        # On Windows ProactorEventLoop, close() schedules async close operations
+        # If the event loop is already closing, these operations will fail with RuntimeError
+        # We catch and ignore these errors since we're just cleaning up resources
+        if 'process' in locals() and process:
+            try:
+                # Close stdout stream
+                if process.stdout:
+                    try:
+                        # On Windows ProactorEventLoop, close() schedules close on event loop
+                        # This will fail gracefully if event loop is already closing
+                        process.stdout.close()
+                    except RuntimeError as close_err:
+                        # Event loop is closed - this is expected when shutting down
+                        # The stream will be cleaned up by the garbage collector
+                        if "Event loop is closed" not in str(close_err):
+                            logger.debug(f"Error closing stdout in finally: {close_err}")
+                    except (OSError, ValueError, AttributeError) as close_err:
+                        logger.debug(f"Error closing stdout in finally: {close_err}")
+                        pass  # Stream might already be closed
+                # Close stderr stream
+                if process.stderr:
+                    try:
+                        process.stderr.close()
+                    except RuntimeError as close_err:
+                        # Event loop is closed - this is expected when shutting down
+                        # The stream will be cleaned up by the garbage collector
+                        if "Event loop is closed" not in str(close_err):
+                            logger.debug(f"Error closing stderr in finally: {close_err}")
+                    except (OSError, ValueError, AttributeError) as close_err:
+                        logger.debug(f"Error closing stderr in finally: {close_err}")
+                        pass  # Stream might already be closed
+            except Exception as cleanup_err:
+                # Ignore all errors in finally block - we're just trying to clean up
+                # Any errors here are non-fatal since we're just cleaning up resources
+                pass
 
 
 async def process_media_group(media_group_id: str, messages: List, context: ContextTypes.DEFAULT_TYPE, channel_config: dict = None) -> None:
