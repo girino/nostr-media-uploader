@@ -797,6 +797,16 @@ test_encoder_with_ffmpeg() {
 			PIX_FMT="nv12"
 			ENCODER_OPTS=(-c:v h264_qsv -preset slow -pix_fmt "$PIX_FMT" -b:v 1000k)
 			;;
+		hevc_vaapi)
+			# VAAPI encoder for older Intel processors (fallback when QSV not available)
+			# VAAPI requires hardware acceleration and specific pixel format
+			ENCODER_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi -c:v hevc_vaapi -b:v 1000k)
+			;;
+		h264_vaapi)
+			# VAAPI encoder for older Intel processors (fallback when QSV not available)
+			# VAAPI requires hardware acceleration and specific pixel format
+			ENCODER_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi -c:v h264_vaapi -b:v 1000k)
+			;;
 		hevc_nvenc)
 			ENCODER_OPTS=(-c:v hevc_nvenc -preset slow -rc:v vbr -b:v 1000k)
 			;;
@@ -876,11 +886,11 @@ map_encoder_to_spec() {
 	
 	case "$ENCODER_NAME" in
 		# h265 hardware encoders
-		hevc_qsv|hevc_nvenc|hevc_videotoolbox|hevc_amf)
+		hevc_qsv|hevc_nvenc|hevc_videotoolbox|hevc_amf|hevc_vaapi)
 			echo "${ENCODER_NAME}:h265:1"
 			;;
 		# h264 hardware encoders
-		h264_qsv|h264_nvenc|h264_videotoolbox|h264_amf|h264_v4l2m2m)
+		h264_qsv|h264_nvenc|h264_videotoolbox|h264_amf|h264_v4l2m2m|h264_vaapi)
 			echo "${ENCODER_NAME}:h264:1"
 			;;
 		# h265 software encoder
@@ -960,9 +970,18 @@ get_available_encoders_priority() {
 	
 	# h265 hardware encoders (only if H265 is enabled)
 	if [ "$ENABLE_H265" -eq 1 ]; then
+		# Check QSV first (preferred for Intel processors)
 		if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_qsv\b'; then
 			if check_hardware_encoder_available "hevc_qsv"; then
 				ENCODER_LIST+=("hevc_qsv:h265:1")
+			fi
+		fi
+		# If QSV is not available, try VAAPI (fallback for older Intel processors)
+		if ! echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_qsv\b' || ! check_hardware_encoder_available "hevc_qsv" 2>/dev/null; then
+			if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_vaapi\b'; then
+				if check_hardware_encoder_available "hevc_vaapi"; then
+					ENCODER_LIST+=("hevc_vaapi:h265:1")
+				fi
 			fi
 		fi
 		if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_nvenc\b'; then
@@ -983,9 +1002,18 @@ get_available_encoders_priority() {
 	fi
 	
 	# h264 hardware encoders
+	# Check QSV first (preferred for Intel processors)
 	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_qsv\b'; then
 		if check_hardware_encoder_available "h264_qsv"; then
 			ENCODER_LIST+=("h264_qsv:h264:1")
+		fi
+	fi
+	# If QSV is not available, try VAAPI (fallback for older Intel processors)
+	if ! echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_qsv\b' || ! check_hardware_encoder_available "h264_qsv" 2>/dev/null; then
+		if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_vaapi\b'; then
+			if check_hardware_encoder_available "h264_vaapi"; then
+				ENCODER_LIST+=("h264_vaapi:h264:1")
+			fi
 		fi
 	fi
 	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_nvenc\b'; then
@@ -1113,6 +1141,10 @@ convert_video_with_encoder() {
 		PRESET="slow"
 		PIX_FMT="nv12"
 		ENCODER_OPTS=(-c:v hevc_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
+	elif [ "$ENCODER" = "hevc_vaapi" ]; then
+		# VAAPI encoder for older Intel processors (fallback when QSV not available)
+		# VAAPI requires hardware acceleration and specific pixel format
+		ENCODER_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi -c:v hevc_vaapi -b:v "${TARGET_BITRATE}")
 	elif [ "$ENCODER" = "hevc_nvenc" ]; then
 		PRESET="slow"
 		ENCODER_OPTS=(-c:v hevc_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
@@ -1129,6 +1161,10 @@ convert_video_with_encoder() {
 		PRESET="slow"
 		PIX_FMT="nv12"
 		ENCODER_OPTS=(-c:v h264_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
+	elif [ "$ENCODER" = "h264_vaapi" ]; then
+		# VAAPI encoder for older Intel processors (fallback when QSV not available)
+		# VAAPI requires hardware acceleration and specific pixel format
+		ENCODER_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi -c:v h264_vaapi -b:v "${TARGET_BITRATE}")
 	elif [ "$ENCODER" = "h264_nvenc" ]; then
 		PRESET="slow"
 		ENCODER_OPTS=(-c:v h264_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
