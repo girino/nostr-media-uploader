@@ -786,6 +786,7 @@ test_encoder_with_ffmpeg() {
 	
 	# Build encoder-specific test command
 	local ENCODER_OPTS=()
+	local INPUT_OPTS=()  # Options that must come before -i (like -hwaccel for VAAPI)
 	local PIX_FMT=""
 	
 	case "$ENCODER_NAME" in
@@ -799,13 +800,15 @@ test_encoder_with_ffmpeg() {
 			;;
 		hevc_vaapi)
 			# VAAPI encoder for older Intel processors (fallback when QSV not available)
-			# VAAPI requires hardware acceleration and specific pixel format
-			ENCODER_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi -c:v hevc_vaapi -b:v 1000k)
+			# VAAPI requires hardware acceleration options before -i input file
+			INPUT_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi)
+			ENCODER_OPTS=(-c:v hevc_vaapi -b:v 1000k)
 			;;
 		h264_vaapi)
 			# VAAPI encoder for older Intel processors (fallback when QSV not available)
-			# VAAPI requires hardware acceleration and specific pixel format
-			ENCODER_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi -c:v h264_vaapi -b:v 1000k)
+			# VAAPI requires hardware acceleration options before -i input file
+			INPUT_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi)
+			ENCODER_OPTS=(-c:v h264_vaapi -b:v 1000k)
 			;;
 		hevc_nvenc)
 			ENCODER_OPTS=(-c:v hevc_nvenc -preset slow -rc:v vbr -b:v 1000k)
@@ -836,8 +839,9 @@ test_encoder_with_ffmpeg() {
 	# Test encoding: generate a 1-second test pattern and try to encode it
 	# Use a small resolution (320x240) and low frame rate (1fps) for speed
 	# Output to /dev/null since we only care if encoding succeeds
+	# INPUT_OPTS must come before -i, ENCODER_OPTS come after -i
 	local TEST_OUTPUT
-	TEST_OUTPUT=$(ffmpeg -f lavfi -i "testsrc=duration=1:size=320x240:rate=1" \
+	TEST_OUTPUT=$(ffmpeg -f lavfi "${INPUT_OPTS[@]}" -i "testsrc=duration=1:size=320x240:rate=1" \
 		"${ENCODER_OPTS[@]}" \
 		-t 1 -f null - 2>&1)
 	local TEST_EXIT=$?
@@ -1129,6 +1133,7 @@ convert_video_with_encoder() {
 	
 	# Build encoder-specific options
 	local ENCODER_OPTS=()
+	local INPUT_OPTS=()  # Options that must come before -i (like -hwaccel for VAAPI)
 	local PRESET=""
 	local PIX_FMT=""
 	local EXTRA_OPTS=()
@@ -1139,8 +1144,9 @@ convert_video_with_encoder() {
 		ENCODER_OPTS=(-c:v hevc_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
 	elif [ "$ENCODER" = "hevc_vaapi" ]; then
 		# VAAPI encoder for older Intel processors (fallback when QSV not available)
-		# VAAPI requires hardware acceleration and specific pixel format
-		ENCODER_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi -c:v hevc_vaapi -b:v "${TARGET_BITRATE}")
+		# VAAPI requires hardware acceleration options before -i input file
+		INPUT_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi)
+		ENCODER_OPTS=(-c:v hevc_vaapi -b:v "${TARGET_BITRATE}")
 	elif [ "$ENCODER" = "hevc_nvenc" ]; then
 		PRESET="slow"
 		ENCODER_OPTS=(-c:v hevc_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
@@ -1159,8 +1165,9 @@ convert_video_with_encoder() {
 		ENCODER_OPTS=(-c:v h264_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
 	elif [ "$ENCODER" = "h264_vaapi" ]; then
 		# VAAPI encoder for older Intel processors (fallback when QSV not available)
-		# VAAPI requires hardware acceleration and specific pixel format
-		ENCODER_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi -c:v h264_vaapi -b:v "${TARGET_BITRATE}")
+		# VAAPI requires hardware acceleration options before -i input file
+		INPUT_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi)
+		ENCODER_OPTS=(-c:v h264_vaapi -b:v "${TARGET_BITRATE}")
 	elif [ "$ENCODER" = "h264_nvenc" ]; then
 		PRESET="slow"
 		ENCODER_OPTS=(-c:v h264_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
@@ -1191,7 +1198,8 @@ convert_video_with_encoder() {
 	
 	# Build ffmpeg command with comprehensive aspect ratio and resolution preservation
 	# This provides maximum hints to the blossom server for proper re-encoding
-	local FFMPEG_CMD=(-y -i "$WIN_INPUT" "${ENCODER_OPTS[@]}" "${EXTRA_OPTS[@]}")
+	# INPUT_OPTS must come before -i, ENCODER_OPTS and EXTRA_OPTS come after -i
+	local FFMPEG_CMD=(-y "${INPUT_OPTS[@]}" -i "$WIN_INPUT" "${ENCODER_OPTS[@]}" "${EXTRA_OPTS[@]}")
 	
 	# Preserve resolution using scale filter (most important hint for server re-encoding)
 	if [ -n "$INPUT_WIDTH" ] && [ -n "$INPUT_HEIGHT" ] && [ "$INPUT_WIDTH" != "N/A" ] && [ "$INPUT_HEIGHT" != "N/A" ]; then
