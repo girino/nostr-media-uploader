@@ -800,15 +800,17 @@ test_encoder_with_ffmpeg() {
 			;;
 		hevc_vaapi)
 			# VAAPI encoder for older Intel processors (fallback when QSV not available)
-			# VAAPI requires hardware acceleration options before -i input file
-			INPUT_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi)
-			ENCODER_OPTS=(-c:v hevc_vaapi -b:v 1000k)
+			# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
+			# Convert to nv12 format and upload to VAAPI surface using filter
+			# INPUT_OPTS left empty - use software decoding
+			ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v hevc_vaapi -b:v 1000k)
 			;;
 		h264_vaapi)
 			# VAAPI encoder for older Intel processors (fallback when QSV not available)
-			# VAAPI requires hardware acceleration options before -i input file
-			INPUT_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi)
-			ENCODER_OPTS=(-c:v h264_vaapi -b:v 1000k)
+			# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
+			# Convert to nv12 format and upload to VAAPI surface using filter
+			# INPUT_OPTS left empty - use software decoding
+			ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v h264_vaapi -b:v 1000k)
 			;;
 		hevc_nvenc)
 			ENCODER_OPTS=(-c:v hevc_nvenc -preset slow -rc:v vbr -b:v 1000k)
@@ -1144,9 +1146,10 @@ convert_video_with_encoder() {
 		ENCODER_OPTS=(-c:v hevc_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
 	elif [ "$ENCODER" = "hevc_vaapi" ]; then
 		# VAAPI encoder for older Intel processors (fallback when QSV not available)
-		# VAAPI requires hardware acceleration options before -i input file
-		INPUT_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi)
-		ENCODER_OPTS=(-c:v hevc_vaapi -b:v "${TARGET_BITRATE}")
+		# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
+		# Convert to nv12 format and upload to VAAPI surface using filter
+		# INPUT_OPTS left empty - use software decoding
+		ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v hevc_vaapi -b:v "${TARGET_BITRATE}")
 	elif [ "$ENCODER" = "hevc_nvenc" ]; then
 		PRESET="slow"
 		ENCODER_OPTS=(-c:v hevc_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
@@ -1165,9 +1168,10 @@ convert_video_with_encoder() {
 		ENCODER_OPTS=(-c:v h264_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
 	elif [ "$ENCODER" = "h264_vaapi" ]; then
 		# VAAPI encoder for older Intel processors (fallback when QSV not available)
-		# VAAPI requires hardware acceleration options before -i input file
-		INPUT_OPTS=(-hwaccel vaapi -hwaccel_output_format vaapi)
-		ENCODER_OPTS=(-c:v h264_vaapi -b:v "${TARGET_BITRATE}")
+		# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
+		# Convert to nv12 format and upload to VAAPI surface using filter
+		# INPUT_OPTS left empty - use software decoding
+		ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v h264_vaapi -b:v "${TARGET_BITRATE}")
 	elif [ "$ENCODER" = "h264_nvenc" ]; then
 		PRESET="slow"
 		ENCODER_OPTS=(-c:v h264_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
@@ -1196,15 +1200,41 @@ convert_video_with_encoder() {
 	
 	echo "Converting video using $ENCODER $HW_ACCEL at bitrate ${TARGET_BITRATE}" >&2
 	
+	# For VAAPI encoders, we need to combine scale with the format/hwupload filter
+	# Check if ENCODER_OPTS already contains a VAAPI filter (format=nv12,hwupload)
+	local HAS_VAAPI_FILTER=0
+	local VAAPI_FILTER_INDEX=-1
+	for i in "${!ENCODER_OPTS[@]}"; do
+		if [[ "${ENCODER_OPTS[$i]}" == "-vf" ]] && [[ "${ENCODER_OPTS[$((i+1))]}" =~ format=nv12,hwupload ]]; then
+			HAS_VAAPI_FILTER=1
+			VAAPI_FILTER_INDEX=$i
+			break
+		fi
+	done
+	
+	# Preserve resolution using scale filter (most important hint for server re-encoding)
+	if [ -n "$INPUT_WIDTH" ] && [ -n "$INPUT_HEIGHT" ] && [ "$INPUT_WIDTH" != "N/A" ] && [ "$INPUT_HEIGHT" != "N/A" ]; then
+		if [ "$HAS_VAAPI_FILTER" -eq 1 ] && [ "$VAAPI_FILTER_INDEX" -ge 0 ]; then
+			# For VAAPI: combine scale with format/hwupload filter
+			# Replace the existing filter in ENCODER_OPTS with combined filter
+			local VAAPI_FILTER="scale=${INPUT_WIDTH}:${INPUT_HEIGHT},format=nv12,hwupload"
+			ENCODER_OPTS[$((VAAPI_FILTER_INDEX+1))]="$VAAPI_FILTER"
+			echo "Preserving resolution with VAAPI: ${INPUT_WIDTH}x${INPUT_HEIGHT}" >&2
+		fi
+	fi
+	
 	# Build ffmpeg command with comprehensive aspect ratio and resolution preservation
 	# This provides maximum hints to the blossom server for proper re-encoding
 	# INPUT_OPTS must come before -i, ENCODER_OPTS and EXTRA_OPTS come after -i
 	local FFMPEG_CMD=(-y "${INPUT_OPTS[@]}" -i "$WIN_INPUT" "${ENCODER_OPTS[@]}" "${EXTRA_OPTS[@]}")
 	
-	# Preserve resolution using scale filter (most important hint for server re-encoding)
+	# For non-VAAPI encoders: add scale filter if not already in ENCODER_OPTS
 	if [ -n "$INPUT_WIDTH" ] && [ -n "$INPUT_HEIGHT" ] && [ "$INPUT_WIDTH" != "N/A" ] && [ "$INPUT_HEIGHT" != "N/A" ]; then
-		FFMPEG_CMD+=(-vf "scale=${INPUT_WIDTH}:${INPUT_HEIGHT}")
-		echo "Preserving resolution: ${INPUT_WIDTH}x${INPUT_HEIGHT}" >&2
+		if [ "$HAS_VAAPI_FILTER" -eq 0 ]; then
+			# For other encoders: add scale filter normally
+			FFMPEG_CMD+=(-vf "scale=${INPUT_WIDTH}:${INPUT_HEIGHT}")
+			echo "Preserving resolution: ${INPUT_WIDTH}x${INPUT_HEIGHT}" >&2
+		fi
 	fi
 	
 	# Set display aspect ratio (DAR) metadata (only if valid)
