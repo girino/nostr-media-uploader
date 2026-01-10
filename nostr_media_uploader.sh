@@ -970,18 +970,16 @@ get_available_encoders_priority() {
 	
 	# h265 hardware encoders (only if H265 is enabled)
 	if [ "$ENABLE_H265" -eq 1 ]; then
-		# Check QSV first (preferred for Intel processors)
+		# Check QSV (preferred for Intel processors)
 		if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_qsv\b'; then
 			if check_hardware_encoder_available "hevc_qsv"; then
 				ENCODER_LIST+=("hevc_qsv:h265:1")
 			fi
 		fi
-		# If QSV is not available, try VAAPI (fallback for older Intel processors)
-		if ! echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_qsv\b' || ! check_hardware_encoder_available "hevc_qsv" 2>/dev/null; then
-			if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_vaapi\b'; then
-				if check_hardware_encoder_available "hevc_vaapi"; then
-					ENCODER_LIST+=("hevc_vaapi:h265:1")
-				fi
+		# Always try VAAPI (fallback for older Intel processors or alternative option)
+		if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_vaapi\b'; then
+			if check_hardware_encoder_available "hevc_vaapi"; then
+				ENCODER_LIST+=("hevc_vaapi:h265:1")
 			fi
 		fi
 		if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_nvenc\b'; then
@@ -1002,18 +1000,16 @@ get_available_encoders_priority() {
 	fi
 	
 	# h264 hardware encoders
-	# Check QSV first (preferred for Intel processors)
+	# Check QSV (preferred for Intel processors)
 	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_qsv\b'; then
 		if check_hardware_encoder_available "h264_qsv"; then
 			ENCODER_LIST+=("h264_qsv:h264:1")
 		fi
 	fi
-	# If QSV is not available, try VAAPI (fallback for older Intel processors)
-	if ! echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_qsv\b' || ! check_hardware_encoder_available "h264_qsv" 2>/dev/null; then
-		if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_vaapi\b'; then
-			if check_hardware_encoder_available "h264_vaapi"; then
-				ENCODER_LIST+=("h264_vaapi:h264:1")
-			fi
+	# Always try VAAPI (fallback for older Intel processors or alternative option)
+	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_vaapi\b'; then
+		if check_hardware_encoder_available "h264_vaapi"; then
+			ENCODER_LIST+=("h264_vaapi:h264:1")
 		fi
 	fi
 	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_nvenc\b'; then
