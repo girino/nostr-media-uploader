@@ -799,14 +799,14 @@ test_encoder_with_ffmpeg() {
 			ENCODER_OPTS=(-c:v h264_qsv -preset slow -pix_fmt "$PIX_FMT" -b:v 1000k)
 			;;
 		hevc_vaapi)
-			# VAAPI encoder for older Intel processors (fallback when QSV not available)
+			# VAAPI encoder for older Intel processors (optional, must be explicitly enabled)
 			# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
 			# Specify VAAPI device and convert to nv12 format, then upload to VAAPI surface
 			INPUT_OPTS=(-vaapi_device /dev/dri/renderD128)
 			ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v hevc_vaapi -b:v 1000k)
 			;;
 		h264_vaapi)
-			# VAAPI encoder for older Intel processors (fallback when QSV not available)
+			# VAAPI encoder for older Intel processors (optional, must be explicitly enabled)
 			# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
 			# Specify VAAPI device and convert to nv12 format, then upload to VAAPI surface
 			INPUT_OPTS=(-vaapi_device /dev/dri/renderD128)
@@ -982,12 +982,12 @@ get_available_encoders_priority() {
 				ENCODER_LIST+=("hevc_qsv:h265:1")
 			fi
 		fi
-		# Always try VAAPI (fallback for older Intel processors or alternative option)
-		if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_vaapi\b'; then
-			if check_hardware_encoder_available "hevc_vaapi"; then
-				ENCODER_LIST+=("hevc_vaapi:h265:1")
-			fi
-		fi
+		# VAAPI is not automatically added - must be explicitly enabled via --encoders
+		# if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_vaapi\b'; then
+		# 	if check_hardware_encoder_available "hevc_vaapi"; then
+		# 		ENCODER_LIST+=("hevc_vaapi:h265:1")
+		# 	fi
+		# fi
 		if echo "$AVAILABLE_ENCODERS" | grep -q '\bhevc_nvenc\b'; then
 			if check_hardware_encoder_available "hevc_nvenc"; then
 				ENCODER_LIST+=("hevc_nvenc:h265:1")
@@ -1012,12 +1012,12 @@ get_available_encoders_priority() {
 			ENCODER_LIST+=("h264_qsv:h264:1")
 		fi
 	fi
-	# Always try VAAPI (fallback for older Intel processors or alternative option)
-	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_vaapi\b'; then
-		if check_hardware_encoder_available "h264_vaapi"; then
-			ENCODER_LIST+=("h264_vaapi:h264:1")
-		fi
-	fi
+	# VAAPI is not automatically added - must be explicitly enabled via --encoders
+	# if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_vaapi\b'; then
+	# 	if check_hardware_encoder_available "h264_vaapi"; then
+	# 		ENCODER_LIST+=("h264_vaapi:h264:1")
+	# 	fi
+	# fi
 	if echo "$AVAILABLE_ENCODERS" | grep -q '\bh264_nvenc\b'; then
 		if check_hardware_encoder_available "h264_nvenc"; then
 			ENCODER_LIST+=("h264_nvenc:h264:1")
@@ -1145,7 +1145,7 @@ convert_video_with_encoder() {
 		PIX_FMT="nv12"
 		ENCODER_OPTS=(-c:v hevc_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
 	elif [ "$ENCODER" = "hevc_vaapi" ]; then
-		# VAAPI encoder for older Intel processors (fallback when QSV not available)
+		# VAAPI encoder for older Intel processors (optional, must be explicitly enabled)
 		# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
 		# Specify VAAPI device and convert to nv12 format, then upload to VAAPI surface
 		INPUT_OPTS=(-vaapi_device /dev/dri/renderD128)
@@ -1167,7 +1167,7 @@ convert_video_with_encoder() {
 		PIX_FMT="nv12"
 		ENCODER_OPTS=(-c:v h264_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
 	elif [ "$ENCODER" = "h264_vaapi" ]; then
-		# VAAPI encoder for older Intel processors (fallback when QSV not available)
+		# VAAPI encoder for older Intel processors (optional, must be explicitly enabled)
 		# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
 		# Specify VAAPI device and convert to nv12 format, then upload to VAAPI surface
 		INPUT_OPTS=(-vaapi_device /dev/dri/renderD128)
