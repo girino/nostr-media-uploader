@@ -1,0 +1,88 @@
+# Docker Compose configuration for VAAPI (Video Acceleration API) hardware acceleration
+# 
+# This configuration enables VAAPI support for older Intel processors that don't support QSV,
+# or for AMD/other GPUs that support VAAPI but not QSV.
+#
+# IMPORTANT: The Dockerfile now includes VAAPI libraries by default:
+#   - libva2 (VAAPI runtime library)
+#   - libva-drm2 (VAAPI DRM backend for /dev/dri access)
+#   - mesa-va-drivers (provides i965 driver for older Intel Gen7 and earlier processors)
+#   - vainfo (for testing VAAPI availability)
+#
+# Note: If mesa-va-drivers doesn't include i965 driver on your system, you may need to:
+#   - Install intel-media-va-driver-non-free for newer Intel processors (uses iHD driver)
+#   - Or use an older version of mesa-va-drivers that includes i965
+#   - Check available drivers: docker-compose -f docker-compose.vaapi.yml exec telegram-bot vainfo
+#
+# To check if VAAPI is available in the container after building:
+#   docker-compose -f docker-compose.vaapi.yml run --rm telegram-bot vainfo
+#   docker-compose -f docker-compose.vaapi.yml run --rm telegram-bot ffmpeg -hwaccels
+#
+# Usage:
+#   docker-compose -f docker-compose.vaapi.yml up -d
+#   docker-compose -f docker-compose.vaapi.yml logs -f
+#
+# Troubleshooting:
+# - If you get "No VA display found" errors, ensure /dev/dri devices are accessible
+# - Check device permissions: ls -l /dev/dri/renderD*
+# - Verify video group GID matches host: getent group video
+# - Test VAAPI: docker-compose -f docker-compose.vaapi.yml exec telegram-bot vainfo
+
+version: '3.8'
+
+services:
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.vaapi
+    container_name: nostr-telegram-bot-vaapi
+    restart: unless-stopped
+    
+    # Mount DRI devices for VAAPI hardware acceleration
+    # /dev/dri contains render nodes (renderD128, renderD129, etc.) required for VAAPI
+    # These devices allow access to Intel/AMD/other GPU hardware acceleration
+    devices:
+      - /dev/dri:/dev/dri
+    
+    # Mount .nostr directory from host to container
+    volumes:
+      # Mount .nostr directory must be writable because of history files
+      - ${HOME}/.nostr:/root/.nostr:rw
+      # Mount firefox_cookies.txt to be writable by the container
+      # yp-dlp tries to save cookies back to the file
+      - ./firefox_cookies.txt:/app/firefox_cookies.txt:rw
+      # Mount telegram_bot.yaml config file
+      - ./telegram_bot.yaml:/app/telegram_bot.yaml:ro
+      # Mount nostr_media_uploader.sh and other scripts (needed by the bot)
+      # These override the copies in the image, allowing updates without rebuild
+      - ./nostr_media_uploader.sh:/app/nostr_media_uploader.sh:ro
+      - ./image_uploader.sh:/app/image_uploader.sh:ro
+      - ./aiart.sh:/app/aiart.sh:ro
+    
+    # Pass cookies file as command line parameter
+    command: python telegram_bot.py --cookies /app/firefox_cookies.txt
+    
+    # Environment variables
+    environment:
+      - TELEGRAM_BOT_CONFIG=/app/telegram_bot.yaml
+      - LIBVA_DRIVER_NAME=i965  # Intel Gen7 and older processors (i965 driver)
+      # Optional: Set LIBVA_DRIVERS_PATH if using custom VAAPI drivers
+      # - LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
+    
+    # Group permissions: Access to /dev/dri devices requires render and video group membership
+    # The render group provides access to render nodes (/dev/dri/renderD*)
+    # The video group provides additional GPU device access
+    # Both groups are typically GID 44 on most Linux distributions, but can vary
+    group_add:
+      - render  # Access to render nodes for VAAPI
+      - video   # Access to video devices
+    
+    # Keep container running
+    stdin_open: true
+    tty: true
+    
+    # Optional: If you encounter permission issues, you may need to add capabilities
+    # Uncomment the following if devices aren't accessible:
+    # cap_add:
+    #   - SYS_ADMIN
+    # However, using proper group permissions (video group) is preferred over privileged mode

@@ -13,5 +13,4 @@ firefox_cookies.txt
 venv/
 venv_windows/
 venv_linux/
-docker-compose.vaapi.yml
-Dockerfile.vaapi
+docker-compose.yml
