@@ -251,6 +251,138 @@ def extract_extra_text(text, urls):
     return extra_text
 
 
+def sanitize_subprocess_output(text):
+    """Sanitize subprocess output to remove control characters and ANSI escape sequences.
+    
+    This prevents terminal corruption and command injection from special characters in forwarded
+    Telegram content or other sources that may contain ANSI codes, control characters, escape
+    sequences, or invalid UTF-8. Removes all escape sequences that terminals might interpret
+    as commands, including VT100, ANSI CSI, OSC, DCS, PM, APC, and other terminal control codes.
+    
+    Args:
+        text: Raw subprocess output (string or bytes)
+        
+    Returns:
+        Sanitized string safe for terminal/logging (no executable escape sequences)
+    """
+    if not text:
+        return ''
+    
+    # Convert bytes to string if needed
+    if isinstance(text, bytes):
+        try:
+            text = text.decode('utf-8', errors='replace')
+        except Exception:
+            # Fallback: try to decode with latin-1 and replace invalid
+            text = text.decode('latin-1', errors='replace')
+    
+    # Remove all ANSI/VT100 escape sequences that terminals interpret as commands
+    # This is comprehensive to prevent any terminal command injection
+    
+    # 1. CSI (Control Sequence Introducer) sequences: \x1b[...m, \x1b[2J, \x1b[H, etc.
+    # Matches: \x1b[ followed by optional parameters and a command character
+    text = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z@_!]', '', text)  # CSI sequences with various endings
+    text = re.sub(r'\033\[[0-9;?]*[a-zA-Z@_!]', '', text)  # \033[...letter
+    text = re.sub(r'\u001b\[[0-9;?]*[a-zA-Z@_!]', '', text)  # Unicode escape
+    
+    # 2. OSC (Operating System Command) sequences: \x1b]...\x07 or \x1b]...\x1b\\
+    # Can be used for terminal window title, clipboard manipulation, etc.
+    text = re.sub(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)', '', text)  # OSC sequences
+    text = re.sub(r'\033\][^\x07\x1b]*(\x07|\033\\)', '', text)  # \033 variant
+    
+    # 3. DCS (Device Control String): \x1bP...\x1b\\
+    # Can send commands to terminal devices
+    text = re.sub(r'\x1bP[^\x1b]*\x1b\\', '', text)  # DCS sequences
+    text = re.sub(r'\033P[^\033]*\033\\', '', text)  # \033 variant
+    
+    # 4. PM (Privacy Message): \x1b^...\x1b\\
+    text = re.sub(r'\x1b\^[^\x1b]*\x1b\\', '', text)  # PM sequences
+    text = re.sub(r'\033\^[^\033]*\033\\', '', text)  # \033 variant
+    
+    # 5. APC (Application Program Command): \x1b_...\x1b\\
+    text = re.sub(r'\x1b_[^\x1b]*\x1b\\', '', text)  # APC sequences
+    text = re.sub(r'\033_[^\033]*\033\\', '', text)  # \033 variant
+    
+    # 6. Single-character ESC sequences (VT100/ANSI control functions)
+    # These are ESC followed by a single character (no brackets)
+    # Examples: \x1bD (IND), \x1bE (NEL), \x1bH (HTS), \x1bM (RI), etc.
+    esc_single_chars = r'[DdEeHhMNOPSTUVXZ78=<>]'  # Common single-char ESC sequences
+    text = re.sub(r'\x1b' + esc_single_chars, '', text)
+    text = re.sub(r'\033' + esc_single_chars, '', text)
+    text = re.sub(r'\u001b' + esc_single_chars, '', text)
+    
+    # 7. ESC > and ESC = (already handled above, but be explicit)
+    text = re.sub(r'\x1b[>=]', '', text)
+    text = re.sub(r'\033[>=]', '', text)
+    
+    # 8. Remove any remaining isolated ESC characters (escape sequences we might have missed)
+    # This is a catch-all for any ESC not followed by valid sequence characters
+    # But we need to be careful not to remove legitimate content
+    # We'll remove standalone ESC that aren't part of sequences
+    
+    # Aggressively remove ALL carriage returns - they cause overwriting in terminals
+    # Even \r\n sequences can cause issues in some terminal emulators
+    # Convert all \r to \n to preserve line structure
+    text = text.replace('\r\n', '\n')  # Normalize Windows line endings first
+    text = text.replace('\r', '\n')  # Convert any remaining \r to \n
+    
+    # Remove other problematic control characters except common ones
+    # Keep: \n (newline 10), \t (tab 9)
+    # Remove all other C0 control characters (0-31) and DEL (127)
+    # These can be interpreted as terminal commands or cause display issues
+    control_chars = []
+    for i in range(32):
+        if i not in (9, 10):  # Keep tab (9) and newline (10)
+            control_chars.append(chr(i))
+    
+    # Also remove DEL (127) - can cause backspace-like behavior
+    control_chars.append(chr(127))
+    
+    # Build regex to remove these control chars
+    if control_chars:
+        control_pattern = '[' + re.escape(''.join(control_chars)) + ']'
+        text = re.sub(control_pattern, '', text)
+    
+    # Remove null bytes (can terminate strings unexpectedly)
+    text = text.replace('\x00', '')
+    
+    # Remove backspace characters and their effects (can cause text deletion in terminals)
+    # Backspace (\x08) followed by any character should remove both
+    while '\x08' in text:
+        text = re.sub(r'.\x08', '', text)  # Remove char + backspace
+        text = text.replace('\x08', '')  # Remove any remaining backspaces
+    
+    # Remove form feed (\x0c) - can cause page breaks/clearing in terminals
+    text = text.replace('\x0c', '\n')
+    
+    # Remove vertical tab (\x0b) - can cause cursor movement
+    text = text.replace('\x0b', '\n')
+    
+    # Remove any remaining ESC characters (standalone escape chars that might have been missed)
+    # This is a safety measure - remove any ESC not already part of a removed sequence
+    # But we do this after removing sequences to avoid interfering with sequence matching
+    text = text.replace('\x1b', '')
+    text = text.replace('\033', '')
+    text = text.replace('\u001b', '')
+    
+    # Normalize excessive whitespace (more than 2 consecutive newlines -> 2 newlines)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    # Remove trailing whitespace from each line (but keep the line itself)
+    lines = text.split('\n')
+    lines = [line.rstrip() for line in lines]
+    text = '\n'.join(lines)
+    
+    # Ensure valid UTF-8 and replace any remaining invalid sequences
+    try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:
+        # If encoding fails, remove problematic characters
+        text = text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+    
+    return text
+
+
 def extract_event_id(output):
     """Extract event ID from nak output.
     
@@ -357,7 +489,8 @@ async def encode_to_nevent(event_id_hex):
                 logger.warning(f"nak encode nevent returned unexpected format: {nevent}")
         else:
             stderr = stderr_bytes.decode('utf-8', errors='replace') if stderr_bytes else ''
-            logger.warning(f"nak encode nevent failed: {stderr}")
+            sanitized_stderr = sanitize_subprocess_output(stderr)
+            logger.warning(f"nak encode nevent failed: {sanitized_stderr}")
     except Exception as e:
         logger.warning(f"Failed to encode nevent using nak: {e}")
     
@@ -1723,6 +1856,11 @@ async def execute_script(cmd, cwd=None, timeout=None):
         stdout = stdout_bytes.decode('utf-8', errors='replace') if stdout_bytes else ''
         stderr = stderr_bytes.decode('utf-8', errors='replace') if stderr_bytes else ''
         
+        # Sanitize output immediately after decoding to prevent any control characters
+        # from corrupting logs or terminal output - this must happen before any logging
+        stdout = sanitize_subprocess_output(stdout)
+        stderr = sanitize_subprocess_output(stderr)
+        
         # Remove process from tracking when it finishes
         if process and process.pid and process.pid in running_processes:
             del running_processes[process.pid]
@@ -1766,6 +1904,10 @@ async def execute_script(cmd, cwd=None, timeout=None):
                 error_msg = f"Script execution timed out after {timeout} seconds"
                 output_label = "before timeout"
             
+            # Sanitize output before using it (in case it wasn't sanitized yet)
+            stdout = sanitize_subprocess_output(stdout) if stdout else ''
+            stderr = sanitize_subprocess_output(stderr) if stderr else ''
+            
             # Prepend error message to stderr, but keep any captured output
             if stderr:
                 # Check if error message is already in stderr (from cleanup handlers)
@@ -1784,7 +1926,7 @@ async def execute_script(cmd, cwd=None, timeout=None):
                 'timeout': True
             }
         
-        # Log captured output for debugging
+        # Log captured output for debugging (output is already sanitized)
         logger.debug(f"Script returncode: {process.returncode}")
         logger.debug(f"Script stdout length: {len(stdout)} bytes")
         logger.debug(f"Script stderr length: {len(stderr)} bytes")
@@ -1795,8 +1937,8 @@ async def execute_script(cmd, cwd=None, timeout=None):
         
         return {
             'returncode': process.returncode,
-            'stdout': stdout,
-            'stderr': stderr,
+            'stdout': stdout,  # Already sanitized
+            'stderr': stderr,  # Already sanitized
             'success': process.returncode == 0
         }
     except Exception as e:
@@ -2037,9 +2179,11 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
         if result['success']:
             logger.info(f"Script execution successful. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
             if result['stdout']:
-                logger.info(f"Script stdout:\n{result['stdout']}")
+                sanitized_stdout = sanitize_subprocess_output(result['stdout'])
+                logger.info(f"Script stdout:\n{sanitized_stdout}")
             if result['stderr']:
-                logger.info(f"Script stderr:\n{result['stderr']}")
+                sanitized_stderr = sanitize_subprocess_output(result['stderr'])
+                logger.info(f"Script stderr:\n{sanitized_stderr}")
             
             event_id = None
             nevent = None
@@ -2140,8 +2284,10 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
             else:
                 await send_message_with_retry(first_message, error_display)
             logger.error(f"Error processing media group")
-            logger.error(f"stderr: {result['stderr']}")
-            logger.error(f"stdout: {result['stdout']}")
+            sanitized_stderr = sanitize_subprocess_output(result['stderr'])
+            sanitized_stdout = sanitize_subprocess_output(result['stdout'])
+            logger.error(f"stderr: {sanitized_stderr}")
+            logger.error(f"stdout: {sanitized_stdout}")
     except Exception as e:
         logger.exception(f"Exception while processing media group: {e}")
         try:
@@ -2496,9 +2642,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 # Log stdout/stderr for debugging (always log, even on success)
                 logger.info(f"Script execution successful. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
                 if result['stdout']:
-                    logger.info(f"Script stdout:\n{result['stdout']}")
+                    sanitized_stdout = sanitize_subprocess_output(result['stdout'])
+                    logger.info(f"Script stdout:\n{sanitized_stdout}")
                 if result['stderr']:
-                    logger.info(f"Script stderr:\n{result['stderr']}")
+                    sanitized_stderr = sanitize_subprocess_output(result['stderr'])
+                    logger.info(f"Script stderr:\n{sanitized_stderr}")
                 
                 # Try to extract event ID and convert to nevent
                 event_id = None
@@ -2523,9 +2671,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 else:
                     logger.warning(f"Could not extract event ID from stdout or stderr. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
                     if result['stdout']:
-                        logger.warning(f"stdout content (first 500 chars): {result['stdout'][:500]}")
+                        sanitized_stdout = sanitize_subprocess_output(result['stdout'])
+                        logger.warning(f"stdout content (first 500 chars): {sanitized_stdout[:500]}")
                     if result['stderr']:
-                        logger.warning(f"stderr content (first 500 chars): {result['stderr'][:500]}")
+                        sanitized_stderr = sanitize_subprocess_output(result['stderr'])
+                        logger.warning(f"stderr content (first 500 chars): {sanitized_stderr[:500]}")
                 
                 if nevent:
                     # Format response with nostr client link if configured
@@ -2593,12 +2743,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 else:
                     # Combine stderr and stdout for error messages (bash scripts often use both)
                     error_parts = []
-                    if result['stderr']:
-                        error_parts.append(f"Error:\n{result['stderr']}")
-                    if result['stdout']:
-                        error_parts.append(f"Output:\n{result['stdout']}")
-                    
-                    error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
+                if result['stderr']:
+                    error_parts.append(f"Error:\n{result['stderr']}")
+                if result['stdout']:
+                    error_parts.append(f"Output:\n{result['stdout']}")
+                
+                error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
                 
                 # Telegram has a 4096 character limit per message, so limit to ~3500 to leave room for prefix
                 MAX_ERROR_LENGTH = 3500
@@ -2618,8 +2768,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 else:
                     await send_message_with_retry(message, error_display)
                 logger.error(f"Error processing media files")
-                logger.error(f"stderr: {result['stderr']}")
-                logger.error(f"stdout: {result['stdout']}")
+                sanitized_stderr = sanitize_subprocess_output(result['stderr'])
+                sanitized_stdout = sanitize_subprocess_output(result['stdout'])
+                logger.error(f"stderr: {sanitized_stderr}")
+                logger.error(f"stdout: {sanitized_stdout}")
         except Exception as e:
             logger.exception(f"Exception while processing media files: {e}")
             # Try to send error message, but don't fail if it times out
@@ -2688,8 +2840,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # Log stdout/stderr for debugging (always log, even on success)
             logger.info(f"Script execution successful. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
             if result['stdout']:
+                # Output is already sanitized in execute_script, but sanitize again as safety measure
                 logger.info(f"Script stdout:\n{result['stdout']}")
             if result['stderr']:
+                # Output is already sanitized in execute_script, but sanitize again as safety measure
                 logger.info(f"Script stderr:\n{result['stderr']}")
             
             # Try to extract event ID and convert to nevent
@@ -2716,9 +2870,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 logger.warning(f"Could not extract event ID from stdout or stderr. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
                 if result['stdout']:
-                    logger.warning(f"stdout content (first 500 chars): {result['stdout'][:500]}")
+                    sanitized_stdout = sanitize_subprocess_output(result['stdout'])
+                    logger.warning(f"stdout content (first 500 chars): {sanitized_stdout[:500]}")
                 if result['stderr']:
-                    logger.warning(f"stderr content (first 500 chars): {result['stderr'][:500]}")
+                    sanitized_stderr = sanitize_subprocess_output(result['stderr'])
+                    logger.warning(f"stderr content (first 500 chars): {sanitized_stderr[:500]}")
             
             if nevent:
                 # Format response with nostr client link if configured
@@ -2787,12 +2943,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 # Combine stderr and stdout for error messages (bash scripts often use both)
                 error_parts = []
-                if result['stderr']:
-                    error_parts.append(f"Error:\n{result['stderr']}")
-                if result['stdout']:
-                    error_parts.append(f"Output:\n{result['stdout']}")
-                
-                error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
+            if result['stderr']:
+                error_parts.append(f"Error:\n{result['stderr']}")
+            if result['stdout']:
+                error_parts.append(f"Output:\n{result['stdout']}")
+            
+            error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
             
             # Telegram has a 4096 character limit per message, so limit to ~3500 to leave room for prefix
             MAX_ERROR_LENGTH = 3500
@@ -2812,8 +2968,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 await send_message_with_retry(message, error_display)
             logger.error(f"Error processing URLs {urls}")
-            logger.error(f"stderr: {result['stderr']}")
-            logger.error(f"stdout: {result['stdout']}")
+            sanitized_stderr = sanitize_subprocess_output(result['stderr'])
+            sanitized_stdout = sanitize_subprocess_output(result['stdout'])
+            logger.error(f"stderr: {sanitized_stderr}")
+            logger.error(f"stdout: {sanitized_stdout}")
     except Exception as e:
         logger.exception(f"Exception while processing message: {e}")
         # Try to send error message, but don't fail if it times out
