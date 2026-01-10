@@ -801,16 +801,16 @@ test_encoder_with_ffmpeg() {
 		hevc_vaapi)
 			# VAAPI encoder for older Intel processors (fallback when QSV not available)
 			# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
-			# Initialize VAAPI device and convert to nv12 format, then upload to VAAPI surface
-			INPUT_OPTS=(-init_hw_device vaapi=vaapi0:/dev/dri/renderD128)
-			ENCODER_OPTS=(-filter_hw_device vaapi0 -vf "format=nv12,hwupload=extra_hw_frames=64" -c:v hevc_vaapi -b:v 1000k)
+			# Specify VAAPI device and convert to nv12 format, then upload to VAAPI surface
+			INPUT_OPTS=(-vaapi_device /dev/dri/renderD128)
+			ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v hevc_vaapi -b:v 1000k)
 			;;
 		h264_vaapi)
 			# VAAPI encoder for older Intel processors (fallback when QSV not available)
 			# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
-			# Initialize VAAPI device and convert to nv12 format, then upload to VAAPI surface
-			INPUT_OPTS=(-init_hw_device vaapi=vaapi0:/dev/dri/renderD128)
-			ENCODER_OPTS=(-filter_hw_device vaapi0 -vf "format=nv12,hwupload=extra_hw_frames=64" -c:v h264_vaapi -b:v 1000k)
+			# Specify VAAPI device and convert to nv12 format, then upload to VAAPI surface
+			INPUT_OPTS=(-vaapi_device /dev/dri/renderD128)
+			ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v h264_vaapi -b:v 1000k)
 			;;
 		hevc_nvenc)
 			ENCODER_OPTS=(-c:v hevc_nvenc -preset slow -rc:v vbr -b:v 1000k)
@@ -1147,11 +1147,9 @@ convert_video_with_encoder() {
 	elif [ "$ENCODER" = "hevc_vaapi" ]; then
 		# VAAPI encoder for older Intel processors (fallback when QSV not available)
 		# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
-		# Initialize VAAPI device and convert to nv12 format, then upload to VAAPI surface
-		# INPUT_OPTS: Initialize VAAPI hardware device (use first available render node)
-		INPUT_OPTS=(-init_hw_device vaapi=vaapi0:/dev/dri/renderD128)
-		# ENCODER_OPTS: Use filter with hardware device, convert format, upload, then encode
-		ENCODER_OPTS=(-filter_hw_device vaapi0 -vf "format=nv12,hwupload=extra_hw_frames=64" -c:v hevc_vaapi -b:v "${TARGET_BITRATE}")
+		# Specify VAAPI device and convert to nv12 format, then upload to VAAPI surface
+		INPUT_OPTS=(-vaapi_device /dev/dri/renderD128)
+		ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v hevc_vaapi -b:v "${TARGET_BITRATE}")
 	elif [ "$ENCODER" = "hevc_nvenc" ]; then
 		PRESET="slow"
 		ENCODER_OPTS=(-c:v hevc_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
@@ -1171,11 +1169,9 @@ convert_video_with_encoder() {
 	elif [ "$ENCODER" = "h264_vaapi" ]; then
 		# VAAPI encoder for older Intel processors (fallback when QSV not available)
 		# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
-		# Initialize VAAPI device and convert to nv12 format, then upload to VAAPI surface
-		# INPUT_OPTS: Initialize VAAPI hardware device (use first available render node)
-		INPUT_OPTS=(-init_hw_device vaapi=vaapi0:/dev/dri/renderD128)
-		# ENCODER_OPTS: Use filter with hardware device, convert format, upload, then encode
-		ENCODER_OPTS=(-filter_hw_device vaapi0 -vf "format=nv12,hwupload=extra_hw_frames=64" -c:v h264_vaapi -b:v "${TARGET_BITRATE}")
+		# Specify VAAPI device and convert to nv12 format, then upload to VAAPI surface
+		INPUT_OPTS=(-vaapi_device /dev/dri/renderD128)
+		ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v h264_vaapi -b:v "${TARGET_BITRATE}")
 	elif [ "$ENCODER" = "h264_nvenc" ]; then
 		PRESET="slow"
 		ENCODER_OPTS=(-c:v h264_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
@@ -1221,13 +1217,7 @@ convert_video_with_encoder() {
 		if [ "$HAS_VAAPI_FILTER" -eq 1 ] && [ "$VAAPI_FILTER_INDEX" -ge 0 ]; then
 			# For VAAPI: combine scale with format/hwupload filter
 			# Replace the existing filter in ENCODER_OPTS with combined filter
-			# Extract extra_hw_frames parameter if present, otherwise use default
-			local CURRENT_FILTER="${ENCODER_OPTS[$((VAAPI_FILTER_INDEX+1))]}"
-			local EXTRA_FRAMES="extra_hw_frames=64"
-			if [[ "$CURRENT_FILTER" =~ extra_hw_frames=([0-9]+) ]]; then
-				EXTRA_FRAMES="extra_hw_frames=${BASH_REMATCH[1]}"
-			fi
-			local VAAPI_FILTER="scale=${INPUT_WIDTH}:${INPUT_HEIGHT},format=nv12,hwupload=${EXTRA_FRAMES}"
+			local VAAPI_FILTER="scale=${INPUT_WIDTH}:${INPUT_HEIGHT},format=nv12,hwupload"
 			ENCODER_OPTS[$((VAAPI_FILTER_INDEX+1))]="$VAAPI_FILTER"
 			echo "Preserving resolution with VAAPI: ${INPUT_WIDTH}x${INPUT_HEIGHT}" >&2
 		fi
