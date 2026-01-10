@@ -14,3 +14,4 @@ venv/
 venv_windows/
 venv_linux/
 docker-compose.yml
+telegram_bot.yaml*

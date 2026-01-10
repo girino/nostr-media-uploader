@@ -45,8 +45,15 @@ IS_CYGWIN = sys.platform == 'cygwin'
 # Format: {media_group_id: {'messages': [messages], 'task': asyncio.Task, 'processed': bool}}
 pending_media_groups: Dict[str, Dict] = {}
 
+# Split media group handling: track groups that might be split across multiple media_group_ids
+# Format: {(chat_id, caption_hash): {'groups': [{'media_group_id': str, 'messages': [messages]}], 'task': asyncio.Task, 'processed': bool, 'channel_config': dict}}
+pending_split_groups: Dict[tuple, Dict] = {}
+
 # Timeout for waiting for more messages in a media group (in seconds)
 MEDIA_GROUP_TIMEOUT = 2.0
+
+# Timeout for waiting for additional split groups with the same caption (in seconds)
+SPLIT_GROUP_TIMEOUT = 3.0
 
 # Track running processes for cleanup on shutdown
 # Format: {pid: {'process': subprocess.Process, 'cmd': list}}
@@ -2017,8 +2024,71 @@ async def execute_script(cmd, cwd=None, timeout=None):
                 # Any errors here are non-fatal since we're just cleaning up resources
                 pass
 
+def get_split_group_key(message, caption: str) -> Optional[tuple]:
+    """Create a key for tracking split media groups.
+    
+    Split groups have the same caption and come from the same chat.
+    Returns (chat_id, caption_hash) tuple, or None if caption is empty.
+    """
+    if not caption or not caption.strip():
+        return None
+    
+    chat_id = message.chat.id if message.chat else None
+    if chat_id is None:
+        return None
+    
+    # Use a hash of the caption for the key (normalize whitespace)
+    caption_normalized = caption.strip()
+    caption_hash = hash(caption_normalized)
+    
+    return (chat_id, caption_hash)
 
-async def process_media_group(media_group_id: str, messages: List, context: ContextTypes.DEFAULT_TYPE, channel_config: dict = None) -> None:
+
+async def process_split_groups(split_key: tuple, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process all media groups in a split group together.
+    
+    Args:
+        split_key: The split group key (chat_id, caption_hash)
+        context: Bot context
+    """
+    if split_key not in pending_split_groups:
+        return
+    
+    split_data = pending_split_groups[split_key]
+    if split_data.get('processed', False):
+        return
+    
+    split_data['processed'] = True
+    groups = split_data.get('groups', [])
+    channel_config = split_data.get('channel_config')
+    
+    if not groups:
+        logger.warning(f"Split group {split_key} has no groups, skipping")
+        del pending_split_groups[split_key]
+        return
+    
+    # Combine all messages from all groups
+    all_messages = []
+    for group in groups:
+        all_messages.extend(group['messages'])
+    
+    if not all_messages:
+        logger.warning(f"Split group {split_key} has no messages, skipping")
+        del pending_split_groups[split_key]
+        return
+    
+    logger.info(f"Processing split group {split_key} with {len(groups)} group(s) and {len(all_messages)} total message(s)")
+    
+    # Process all messages as a single combined media group
+    # Use the first message's media_group_id for logging purposes
+    first_media_group_id = groups[0].get('media_group_id', 'split_combined')
+    await process_media_group(first_media_group_id, all_messages, context, channel_config, is_split_group=True)
+    
+    # Clean up
+    del pending_split_groups[split_key]
+
+
+async def process_media_group(media_group_id: str, messages: List, context: ContextTypes.DEFAULT_TYPE, channel_config: dict = None, is_split_group: bool = False) -> None:
     """Process all messages in a media group together.
     
     Args:
@@ -2026,6 +2096,10 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
         messages: List of messages in the group
         context: Bot context
         channel_config: Optional channel configuration dict (if None, will be detected from messages)
+        is_split_group: If True, this is already a combined split group and should be processed immediately.
+                        If False, may check for split groups (groups with same caption split across multiple media_group_ids).
+                        Telegram splits large media groups based on total size, so groups with the same caption are matched
+                        regardless of the number of files in each group.
     """
     if not messages:
         return
@@ -2082,13 +2156,81 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
         logger.error(f"Channel config found but profile_name is missing, ignoring")
         return
     
-    # Collect all media files from all messages in the group
-    media_files = []
     # Collect caption from the first message (Telegram usually puts caption on first message)
     text = first_message.caption or first_message.text or ""
     
     logger.info(f"Processing media group {media_group_id} with {len(messages)} message(s)")
     
+    # Check for split groups: if we have a caption and this is not already a split group,
+    # check if this might be part of a split group or start a new split group tracker
+    # Telegram splits large groups based on total size, not file count, so we match by caption only
+    if not is_split_group and text and text.strip():
+        split_key = get_split_group_key(first_message, text)
+        if split_key:
+            # Check if there's already a pending split group with this key
+            if split_key in pending_split_groups:
+                split_data = pending_split_groups[split_key]
+                if not split_data.get('processed', False):
+                    # Add this group to the split group
+                    split_data['groups'].append({
+                        'media_group_id': media_group_id,
+                        'messages': messages
+                    })
+                    logger.info(f"Added media group {media_group_id} to split group {split_key} (total groups: {len(split_data['groups'])})")
+                    
+                    # Cancel previous timeout and create new one (reset timeout)
+                    if 'task' in split_data and not split_data['task'].done():
+                        try:
+                            split_data['task'].cancel()
+                        except Exception as e:
+                            logger.warning(f"Error cancelling split group timeout task: {e}")
+                    
+                    # Create new timeout task
+                    async def process_split_after_timeout():
+                        try:
+                            await asyncio.sleep(SPLIT_GROUP_TIMEOUT)
+                            if split_key in pending_split_groups:
+                                await process_split_groups(split_key, context)
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as e:
+                            logger.exception(f"Error in split group timeout task: {e}")
+                            if split_key in pending_split_groups:
+                                del pending_split_groups[split_key]
+                    
+                    split_data['task'] = asyncio.create_task(process_split_after_timeout())
+                    # Return early - don't download yet, wait for more groups
+                    return
+            else:
+                # Create new split group tracker
+                logger.info(f"Starting new split group {split_key} with media group {media_group_id} (caption detected)")
+                
+                async def process_split_after_timeout():
+                    try:
+                        await asyncio.sleep(SPLIT_GROUP_TIMEOUT)
+                        if split_key in pending_split_groups:
+                            await process_split_groups(split_key, context)
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logger.exception(f"Error in split group timeout task: {e}")
+                        if split_key in pending_split_groups:
+                            del pending_split_groups[split_key]
+                
+                pending_split_groups[split_key] = {
+                    'groups': [{
+                        'media_group_id': media_group_id,
+                        'messages': messages
+                    }],
+                    'task': asyncio.create_task(process_split_after_timeout()),
+                    'processed': False,
+                    'channel_config': channel_config
+                }
+                # Return early - don't download yet, wait for more groups
+                return
+    
+    # Collect all media files from all messages in the group (download now)
+    media_files = []
     for msg in messages:
         # Download media from each message
         if msg.photo:
@@ -2514,6 +2656,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             # First message in a new media group
             logger.info(f"Starting new media group {media_group_id}")
+            
+            # Check if this might match an existing split group (same caption, same chat)
+            # This allows us to track groups that arrive while another group is already waiting for split groups
+            caption_text = message.caption or message.text or ""
+            potential_split_key = get_split_group_key(message, caption_text)
+            if potential_split_key and potential_split_key in pending_split_groups:
+                split_data = pending_split_groups[potential_split_key]
+                if not split_data.get('processed', False):
+                    logger.info(f"New media group {media_group_id} matches pending split group {potential_split_key}, will be added when processed")
+                    # Store a reference to the split group in the media group data for later use
+                    # The actual addition will happen in process_media_group after timeout
             
             # Create timeout task
             async def process_group_after_timeout():
