@@ -1,0 +1,98 @@
+# Docker Compose configuration for NVIDIA NVENC hardware acceleration
+# 
+# This configuration enables NVIDIA NVENC support for NVIDIA GPUs.
+# NVENC provides hardware-accelerated H.264 and HEVC encoding.
+#
+# PREREQUISITES:
+# 1. Install NVIDIA drivers on your host system
+# 2. Install NVIDIA Container Toolkit on your host system:
+#    - Ubuntu/Debian: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#    - After installation, restart Docker: sudo systemctl restart docker
+# 3. Verify NVIDIA Container Toolkit is working:
+
+#    docker run --rm --gpus all nvidia/cuda:13.1.0-base-ubuntu24.04 nvidia-smi
+#
+# IMPORTANT: The Dockerfile.nvidia includes FFmpeg built with NVENC support.
+# The NVENC encoders (h264_nvenc, hevc_nvenc) will be available in the container
+# when NVIDIA Container Toolkit is properly configured on the host.
+#
+# To check if NVENC is available in the container after building:
+#   docker-compose -f docker-compose.nvidia.yml run --rm telegram-bot ffmpeg -encoders | grep nvenc
+#   docker-compose -f docker-compose.nvidia.yml run --rm telegram-bot ffmpeg -hwaccels
+#
+# Usage:
+#   docker-compose -f docker-compose.nvidia.yml up -d
+#   docker-compose -f docker-compose.nvidia.yml logs -f
+#
+# To use specific GPU(s):
+#   Set NVIDIA_VISIBLE_DEVICES environment variable (e.g., "0" for first GPU, "0,1" for multiple GPUs)
+#
+# Troubleshooting:
+# - If you get "No such file or directory" errors for ffmpeg, ensure Dockerfile.nvidia built successfully
+# - If NVENC encoders are not available, check that NVIDIA Container Toolkit is installed and configured
+# - Verify GPU access: docker-compose -f docker-compose.nvidia.yml exec telegram-bot nvidia-smi
+# - Check FFmpeg NVENC support: docker-compose -f docker-compose.nvidia.yml exec telegram-bot ffmpeg -encoders | grep nvenc
+# - If you see "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver":
+#   - Ensure NVIDIA drivers are installed on the host
+#   - Ensure NVIDIA Container Toolkit is installed and Docker is restarted
+#   - Check that the GPU is accessible: nvidia-smi (on the host)
+
+version: '3.8'
+
+services:
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.nvidia
+    container_name: nostr-telegram-bot-nvidia
+    restart: unless-stopped
+    
+    # Use NVIDIA runtime for GPU access
+    # For newer Docker Compose versions (v1.28+), use deploy.resources.reservations.devices instead
+    runtime: nvidia
+    
+    # Environment variables for NVIDIA GPU access
+    environment:
+      - TELEGRAM_BOT_CONFIG=/app/telegram_bot.yaml
+      # NVIDIA_VISIBLE_DEVICES: Controls which GPUs are visible to the container
+      # - "all" (default): All GPUs are visible
+      # - "0": Only first GPU is visible
+      # - "0,1": First and second GPUs are visible
+      - NVIDIA_VISIBLE_DEVICES=all
+      # NVIDIA_DRIVER_CAPABILITIES: Controls which driver capabilities are exposed
+      # - "compute,video,utility": Enable compute, video encoding/decoding, and utility capabilities
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+      # Optional: Set specific CUDA version if needed
+      # - CUDA_VERSION=13.1.0
+    
+    # Mount .nostr directory from host to container
+    volumes:
+      # Mount .nostr directory must be writable because of history files
+      - ./.nostr:/root/.nostr:rw
+      # Mount firefox_cookies.txt to be writable by the container
+      # yt-dlp tries to save cookies back to the file
+      - ./firefox_cookies.txt:/app/firefox_cookies.txt:rw
+      # Mount telegram_bot.yaml config file
+      - ./telegram_bot.yaml:/app/telegram_bot.yaml:ro
+      # Mount nostr_media_uploader.sh and other scripts (needed by the bot)
+      # These override the copies in the image, allowing updates without rebuild
+      - ./nostr_media_uploader.sh:/app/nostr_media_uploader.sh:ro
+      - ./image_uploader.sh:/app/image_uploader.sh:ro
+      - ./aiart.sh:/app/aiart.sh:ro
+    
+    # Pass cookies file as command line parameter
+    command: python telegram_bot.py --cookies /app/firefox_cookies.txt
+    
+    # Keep container running
+    stdin_open: true
+    tty: true
+    
+    # Alternative: For newer Docker Compose versions (v1.28+), use deploy section instead of runtime
+    # Uncomment the following and remove the "runtime: nvidia" line above if using newer Docker Compose:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu, compute, video]

@@ -47,7 +47,7 @@ services:
     # Mount .nostr directory from host to container
     volumes:
       # Mount .nostr directory must be writable because of history files
-      - ${HOME}/.nostr:/root/.nostr:rw
+      - ./.nostr:/root/.nostr:rw
       # Mount firefox_cookies.txt to be writable by the container
       # yp-dlp tries to save cookies back to the file
       - ./firefox_cookies.txt:/app/firefox_cookies.txt:rw
