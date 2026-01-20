@@ -2227,6 +2227,45 @@ upload_file_to_filedrop() {
 	return 0
 }
 
+# Function to calculate expiration time for blossom upload based on file size
+# Parameters:
+#   $1: FILE - path to file
+# Returns: expiration time in format "Xm" (e.g., "5m") via stdout
+# Exit code: 0 on success, 1 on failure
+calculate_blossom_expiration() {
+	local FILE="$1"
+	
+	if [ ! -f "$FILE" ]; then
+		echo "File does not exist: $FILE" >&2
+		return 1
+	fi
+	
+	# Calculate expiration time based on file size (3x estimated upload time for slow WiFi)
+	# Assume slow WiFi speed: 1 Mbps = 125,000 bytes/second
+	local FILE_SIZE_BYTES=$(stat -f%z "$FILE" 2>/dev/null || stat -c%s "$FILE" 2>/dev/null || echo "0")
+	
+	if [ "$FILE_SIZE_BYTES" -eq 0 ]; then
+		echo "Failed to get file size: $FILE" >&2
+		return 1
+	fi
+	
+	local SLOW_WIFI_BYTES_PER_SEC=125000
+	local ESTIMATED_UPLOAD_SECONDS=$((FILE_SIZE_BYTES / SLOW_WIFI_BYTES_PER_SEC))
+	local EXPIRATION_SECONDS=$((ESTIMATED_UPLOAD_SECONDS * 3))
+	
+	# Minimum expiration is 5 minutes (300 seconds)
+	if [ $EXPIRATION_SECONDS -lt 300 ]; then
+		EXPIRATION_SECONDS=300
+	fi
+	
+	# Convert to minutes (blossom-cli format: e.g., "5m"), rounding up
+	local EXPIRATION_MINUTES=$(((EXPIRATION_SECONDS + 59) / 60))
+	local EXPIRATION="${EXPIRATION_MINUTES}m"
+	
+	echo "$EXPIRATION"
+	return 0
+}
+
 # Function to upload a file to a blossom server
 # Parameters:
 #   $1: FILE - path to file to upload
@@ -2251,7 +2290,13 @@ upload_file_to_blossom() {
 	
 	# Try blossom-cli first if available
 	if command -v blossom-cli >/dev/null 2>&1; then
-		upload_output=$(blossom-cli upload -file "$FILE_WIN" -server "$BLOSSOM" -privkey "$KEY" 2>/dev/null)
+		local EXPIRATION=$(calculate_blossom_expiration "$FILE")
+		if [ $? -ne 0 ]; then
+			# If expiration calculation fails, use minimum 5m
+			EXPIRATION="5m"
+		fi
+		
+		upload_output=$(blossom-cli upload -file "$FILE_WIN" -server "$BLOSSOM" -privkey "$KEY" -expiration "$EXPIRATION" 2>/dev/null)
 		RESULT=$?
 		if [ $RESULT -ne 0 ]; then
 			echo "Failed to upload file $FILE to $BLOSSOM with blossom-cli, trying with nak" >&2
