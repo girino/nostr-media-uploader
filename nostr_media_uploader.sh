@@ -2246,13 +2246,24 @@ upload_file_to_blossom() {
 	fi
 	
 	echo "Uploading $FILE to $BLOSSOM" >&2
-	local upload_output=$(nak blossom upload --server "$BLOSSOM" "$FILE_WIN" "--sec" "$KEY")
-	local RESULT=$?
-	if [ $RESULT -ne 0 ]; then
-		echo "Failed to upload file $FILE to $BLOSSOM with nak, trying with blossom-cli" >&2
+	local upload_output=""
+	local RESULT=1
+	
+	# Try blossom-cli first if available
+	if command -v blossom-cli >/dev/null 2>&1; then
 		upload_output=$(blossom-cli upload -file "$FILE_WIN" -server "$BLOSSOM" -privkey "$KEY" 2>/dev/null)
 		RESULT=$?
+		if [ $RESULT -ne 0 ]; then
+			echo "Failed to upload file $FILE to $BLOSSOM with blossom-cli, trying with nak" >&2
+		fi
 	fi
+	
+	# If blossom-cli not available or failed, try nak
+	if [ $RESULT -ne 0 ]; then
+		upload_output=$(nak blossom upload --server "$BLOSSOM" "$FILE_WIN" "--sec" "$KEY")
+		RESULT=$?
+	fi
+	
 	if [ $RESULT -ne 0 ]; then
 		echo "Failed to upload file $FILE to $BLOSSOM: $upload_output" >&2
 		return 1
@@ -3989,4 +4000,3 @@ export PARSED_SOURCE_CANDIDATE
 
 # Call main function (no arguments needed, already parsed)
 main
-
