@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 from urllib.parse import urlparse
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from telegram.error import TimedOut, NetworkError
+from telegram.error import TimedOut, NetworkError, BadRequest
 
 
 # Configure logging
@@ -774,6 +774,19 @@ async def download_media_file(bot, file, file_extension=None, max_retries=3, ret
                 try:
                     file_obj = await bot.get_file(file.file_id)
                     break
+                except BadRequest as e:
+                    # Telegram Bot API allows getFile only for files up to 20 MB
+                    msg = str(e).lower() if e else ""
+                    if "too big" in msg or "too large" in msg or "file is too big" in msg:
+                        logger.warning(
+                            "Skipping file: exceeds Telegram Bot API download limit (20 MB). "
+                            "Only files under 20 MB can be downloaded by the bot."
+                        )
+                        file_obj = None
+                        break
+                    # Other BadRequest: don't retry
+                    logger.error(f"Non-retryable error getting file: {e}")
+                    raise
                 except (TimedOut, NetworkError) as e:
                     last_exception = e
                     if attempt < max_retries - 1:
@@ -783,12 +796,13 @@ async def download_media_file(bot, file, file_extension=None, max_retries=3, ret
                     else:
                         logger.error(f"Failed to get_file after {max_retries} attempts: {e}")
                 except Exception as e:
-                    # For non-network errors, don't retry
+                    # For other errors, don't retry
                     logger.error(f"Non-retryable error getting file: {e}")
                     raise
             
             if file_obj is None:
-                logger.error(f"Could not get file object after {max_retries} attempts. Last error: {last_exception}")
+                if last_exception is not None:
+                    logger.error(f"Could not get file object after {max_retries} attempts. Last error: {last_exception}")
                 return None
         else:
             # If it's already a File object
@@ -2269,6 +2283,13 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
     
     if not media_files:
         logger.warning(f"No media files collected from media group {media_group_id}")
+        try:
+            await send_message_with_retry(
+                first_message,
+                "Could not download any files from this group. Files larger than 20 MB cannot be downloaded by the bot."
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send error reply: {e}")
         return
     
     # Try to send acknowledgment
@@ -2743,7 +2764,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     media_files.append(temp_file)
     
     # If we have media files, process them
-    if media_files:
+    if not media_files and (message.photo or message.video or message.document):
+        try:
+            await send_message_with_retry(
+                message,
+                "Could not download the file. Files larger than 20 MB cannot be downloaded by the bot."
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send error reply: {e}")
+    elif media_files:
         # Try to send acknowledgment, but don't fail if it times out
         status_msg = None
         try:

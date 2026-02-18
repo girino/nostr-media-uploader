@@ -1,7 +1,17 @@
 #!/bin/bash
 
 # Script-level constants (read-only after definition)
-SCRIPT_DIR=$(dirname "$0")
+# Resolve script path (follow symlinks) so SCRIPT_DIR is correct when invoked via symlink
+SCRIPT_PATH="$0"
+while [ -L "$SCRIPT_PATH" ]; do
+	SCRIPT_DIR_LOOP=$(dirname "$SCRIPT_PATH")
+	SCRIPT_PATH=$(readlink "$SCRIPT_PATH")
+	case "$SCRIPT_PATH" in
+		/*) ;;
+		*) SCRIPT_PATH="${SCRIPT_DIR_LOOP}/${SCRIPT_PATH}" ;;
+	esac
+done
+SCRIPT_DIR=$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)
 readonly SCRIPT_DIR
 
 BLOSSOMS=(
@@ -2528,6 +2538,8 @@ usage() {
 	echo "  --nsfw              Mark the post as NSFW by adding content-warning tag"
 	echo "                    Can also be set via NSFW=1 environment variable in config file"
 	echo "                    Automatically enabled if #NSFW or #nsfw hashtag is found in content"
+	echo "  --auto-nsfw         Run nude_detector (same venv as run_telegram_bot) on files; if result is nsfw: true, mark as unsafe and add #nsfw"
+	echo "                    Requires run_nude_detector.sh and venv to exist; fails if venv is missing"
 	echo
 	echo "Arguments:"
 	echo "  file|url          One or more paths to image or video files, or URLs to download videos"
@@ -2699,6 +2711,7 @@ prepare_gallery_dl_params() {
 #   parse_command_line_ret_file_drop_url_prefix - URL prefix if --file-drop-url-prefix option was used
 #   parse_command_line_ret_enable_h265 - 1 if --enable-h265 was used, 0 otherwise
 #   parse_command_line_ret_nsfw - 1 if --nsfw was used, 0 otherwise
+#   parse_command_line_ret_auto_nsfw - 1 if --auto-nsfw was used, 0 otherwise
 # Side effects: Also exports PROFILE_NAME as a global variable for early use
 parse_command_line() {
 	# Initialize default values (hardcoded defaults, NOT from environment)
@@ -2719,6 +2732,7 @@ parse_command_line() {
 	local FILE_DROP_URL_PREFIX=""
 	local ENABLE_H265=0
 	local NSFW=0
+	local AUTO_NSFW=0
 	
 	local ALL_MEDIA_FILES=()
 	local DESCRIPTION_CANDIDATE=""
@@ -2833,6 +2847,8 @@ while (( "$#" )); do
 		ENABLE_H265=1
 	elif [[ "$PARAM" == "--nsfw" || "$PARAM" == "-nsfw" ]]; then
 		NSFW=1
+	elif [[ "$PARAM" == "--auto-nsfw" || "$PARAM" == "-auto-nsfw" ]]; then
+		AUTO_NSFW=1
 	elif [[ "$PARAM" =~ ^- ]]; then
 		# Unrecognized option starting with - or --
 		local SCRIPT_NAME_ERR=$(basename "$0")
@@ -2891,6 +2907,7 @@ fi
 	parse_command_line_ret_file_drop_url_prefix="$FILE_DROP_URL_PREFIX"
 	parse_command_line_ret_enable_h265="$ENABLE_H265"
 	parse_command_line_ret_nsfw="$NSFW"
+	parse_command_line_ret_auto_nsfw="$AUTO_NSFW"
 	
 	# Export PROFILE_NAME as a side effect for early use (before ENV loading)
 	export PROFILE_NAME
@@ -3361,6 +3378,9 @@ process_media_items() {
 #   $11: DESCRIPTION - global description to append at the end
 #   $12: FILE_DROP_URL - file-drop server URL (empty if not set, will fall back to blossom)
 #   $13: FILE_DROP_URL_PREFIX - URL prefix to replace https://dweb.link/ (empty if not set)
+#   $14: SCRIPT_DIR - script directory (for run_nude_detector.sh path)
+#   $15: AUTO_NSFW - 1 to run auto-nsfw detector before upload, 0 otherwise
+#   $16: NSFW - 1 to add content-warning tag (explicit --nsfw), 0 otherwise
 # Returns: Exit code (0=success, dies on failure)
 upload_and_publish_event() {
 	local PROCESSED_FILES_STR="$1"
@@ -3376,6 +3396,9 @@ upload_and_publish_event() {
 	local DESCRIPTION="${11}"
 	local FILE_DROP_URL="${12}"
 	local FILE_DROP_URL_PREFIX="${13}"
+	local SCRIPT_DIR_PARAM="${14}"
+	local AUTO_NSFW_PARAM="${15}"
+	local NSFW_PARAM="${16}"
 	
 	# Deserialize arrays
 	local PROCESSED_FILES=()
@@ -3403,6 +3426,35 @@ upload_and_publish_event() {
 if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
 	die "No files to upload"
 fi
+
+	# Auto-NSFW: run detector before uploading; on any error abort (do not upload)
+	local AUTO_NSFW_DETECTED=0
+	if [ "${AUTO_NSFW_PARAM:-0}" -eq 1 ]; then
+		local RUN_NUDE_DETECTOR="$SCRIPT_DIR_PARAM/run_nude_detector.sh"
+		if [ ! -f "$RUN_NUDE_DETECTOR" ]; then
+			echo "Error: auto-nsfw is set but run_nude_detector.sh not found at $RUN_NUDE_DETECTOR" >&2
+			exit 1
+		fi
+		local DETECTOR_JSON DETECTOR_STDERR
+		DETECTOR_STDERR=$(mktemp -t nude_detector_stderr.XXXXXX 2>/dev/null || echo "/tmp/nude_detector_stderr.$$")
+		DETECTOR_JSON=$(NOSTR_MEDIA_UPLOADER_SCRIPT_DIR="$SCRIPT_DIR_PARAM" "$RUN_NUDE_DETECTOR" --full-results "${PROCESSED_FILES[@]}" 2>"$DETECTOR_STDERR")
+		local DETECTOR_EXIT=$?
+		if [ "$DETECTOR_EXIT" -ne 0 ]; then
+			echo "Error: auto-nsfw detector failed (exit $DETECTOR_EXIT). Aborting without uploading." >&2
+			if [ -s "$DETECTOR_STDERR" ]; then
+				echo "Detector stderr:" >&2
+				cat "$DETECTOR_STDERR" >&2
+			fi
+			rm -f "$DETECTOR_STDERR"
+			exit 1
+		fi
+		rm -f "$DETECTOR_STDERR"
+		echo "Auto-NSFW detector result: $DETECTOR_JSON"
+		if echo "$DETECTOR_JSON" | jq -e '.nsfw == true' >/dev/null 2>&1; then
+			AUTO_NSFW_DETECTED=1
+			echo "Auto-NSFW: detector reported nsfw, will mark as unsafe and add #nsfw"
+		fi
+	fi
 
 	local UPLOAD_URLS=()
 	local RESULT=0
@@ -3508,7 +3560,16 @@ fi
 	# Check if NSFW tag should be added
 	# Check if NSFW is enabled via command line or environment variable
 	local ADD_NSFW_TAG=0
-	if [ "${NSFW:-0}" -eq 1 ]; then
+	if [ "$AUTO_NSFW_DETECTED" -eq 1 ]; then
+		ADD_NSFW_TAG=1
+		echo "Auto-NSFW: marking as unsafe and adding #nsfw"
+		if [ -n "$CONTENT" ] && ! echo "$CONTENT" | grep -qiE '#nsfw\b'; then
+			CONTENT="${CONTENT} #nsfw"
+		elif [ -z "$CONTENT" ]; then
+			CONTENT="#nsfw"
+		fi
+	fi
+	if [ "${NSFW_PARAM:-0}" -eq 1 ]; then
 		ADD_NSFW_TAG=1
 		echo "NSFW flag is enabled"
 	fi
@@ -3783,7 +3844,8 @@ main() {
 	local FILE_DROP_URL_PREFIX="${FILE_DROP_URL_PREFIX:-}"
 	upload_and_publish_event "$PROCESSED_FILES_STR" "$FILE_CAPTIONS_STR" "$FILE_SOURCES_STR" \
 		"$FILE_GALLERIES_STR" "$BLOSSOMS_LIST_STR" "$RELAYS_LIST" "$KEY_DECRYPTED" \
-		"$POW_DIFF" "$DISPLAY_SOURCE" "$SEND_TO_RELAY" "$DESCRIPTION_CANDIDATE" "$FILE_DROP_URL" "$FILE_DROP_URL_PREFIX"
+		"$POW_DIFF" "$DISPLAY_SOURCE" "$SEND_TO_RELAY" "$DESCRIPTION_CANDIDATE" "$FILE_DROP_URL" "$FILE_DROP_URL_PREFIX" \
+		"$SCRIPT_DIR" "$AUTO_NSFW" "$NSFW"
 	
 	# ========================================================================
 	# UPDATE HISTORY FILE
@@ -3839,6 +3901,7 @@ PARSED_FILE_DROP_URL="$parse_command_line_ret_file_drop_url"
 PARSED_FILE_DROP_URL_PREFIX="$parse_command_line_ret_file_drop_url_prefix"
 PARSED_ENABLE_H265="$parse_command_line_ret_enable_h265"
 PARSED_NSFW="$parse_command_line_ret_nsfw"
+PARSED_AUTO_NSFW="$parse_command_line_ret_auto_nsfw"
 
 # Use extracted PROFILE_NAME to load config
 if [ -n "$PARSED_PROFILE_NAME" ]; then
@@ -4006,6 +4069,19 @@ else
 	NSFW=0
 fi
 
+# Merge AUTO_NSFW: Command-line takes precedence over environment variable
+if [ "${PARSED_AUTO_NSFW:-0}" -eq 1 ]; then
+	AUTO_NSFW=1
+elif [ -n "${AUTO_NSFW:-}" ]; then
+	if [[ "${AUTO_NSFW}" == "1" ]] || [[ "${AUTO_NSFW}" == "true" ]] || [[ "${AUTO_NSFW}" == "yes" ]]; then
+		AUTO_NSFW=1
+	else
+		AUTO_NSFW=0
+	fi
+else
+	AUTO_NSFW=0
+fi
+
 # ========================================================================
 # EXPORT MERGED VARIABLES FOR main() TO READ
 # ========================================================================
@@ -4028,6 +4104,7 @@ export FILE_DROP_URL
 export FILE_DROP_URL_PREFIX
 export ENABLE_H265
 export NSFW
+export AUTO_NSFW
 
 # Export parsed command-line results for main() to use
 export PARSED_MEDIA_FILES
