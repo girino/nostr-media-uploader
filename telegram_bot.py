@@ -880,7 +880,7 @@ async def download_media_file(bot, file, file_extension=None, max_retries=3, ret
         return None
 
 
-def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None):
+def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None, auto_nsfw=False):
     """Build the command to execute nostr_media_uploader.sh.
     
     Args:
@@ -893,6 +893,7 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
         config: Config dict (for path conversion)
         nsfw: Whether to add --nsfw flag (default: False)
         disable_cookies_for_sites: List of domain patterns to disable cookies for (default: None)
+        auto_nsfw: Whether to add --auto-nsfw flag (default: False)
     """
     # Convert script path to absolute path
     script_path = Path(script_path)
@@ -940,6 +941,11 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
     if nsfw:
         cmd.append('--nsfw')
         logger.info("Adding --nsfw parameter")
+    
+    # Add --auto-nsfw if enabled (channel config)
+    if auto_nsfw:
+        cmd.append('--auto-nsfw')
+        logger.info("Adding --auto-nsfw parameter")
     
     # Add --nocomment if there is extra text after URLs
     if extra_text and extra_text.strip():
@@ -2322,7 +2328,8 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
             config.get('cookies_file'),
             config,
             channel_config.get('nsfw', False),  # Get NSFW setting from channel config
-            disable_cookies_sites  # Get disable cookies setting from channel or global config
+            disable_cookies_sites,  # Get disable cookies setting from channel or global config
+            channel_config.get('auto_nsfw', False)  # Get auto-nsfw setting from channel config
         )
         
         # Execute script with timeout
@@ -2803,7 +2810,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 config.get('cookies_file'),
                 config,
                 channel_config.get('nsfw', False),  # Get NSFW setting from channel config
-                disable_cookies_sites  # Get disable cookies setting from channel or global config
+                disable_cookies_sites,  # Get disable cookies setting from channel or global config
+                channel_config.get('auto_nsfw', False)  # Get auto-nsfw setting from channel config
             )
             
             # Execute script with timeout
@@ -3010,7 +3018,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             config.get('cookies_file'),
             config,
             channel_config.get('nsfw', False),  # Get NSFW setting from channel config
-            disable_cookies_sites  # Get disable cookies setting from channel or global config
+            disable_cookies_sites,  # Get disable cookies setting from channel or global config
+            channel_config.get('auto_nsfw', False)  # Get auto-nsfw setting from channel config
         )
         
         # Execute script with timeout
