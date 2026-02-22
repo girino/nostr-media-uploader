@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Classify image or video files as SFW (safe for work) or NSFW.
-Backends: NudeNet (body-part detection) or Falconsai (Hugging Face ViT model).
+Backends: NudeNet (body-part detection) or Falconsai (Hugging Face ViT).
 Outputs JSON: list of {filename, nsfw, safe, unsafe, top_class} per file.
 """
 import argparse
@@ -194,7 +194,7 @@ def main() -> int:
         "--backend",
         choices=["nudenet", "falconsai"],
         default="nudenet",
-        help="Backend: nudenet (body-part detection) or falconsai (Hugging Face ViT model, Falconsai/nsfw_image_detection)",
+        help="Backend: nudenet (body-part detection) or falconsai (Hugging Face ViT, Falconsai/nsfw_image_detection)",
     )
     args = parser.parse_args()
 
@@ -218,8 +218,7 @@ def main() -> int:
                 errors.append(f"{r['filename']}: {r['error']}")
             elif r.get("nsfw"):
                 any_nsfw = True
-    else:
-        # falconsai
+    elif args.backend == "falconsai":
         try:
             from transformers import pipeline
         except ImportError as e:
