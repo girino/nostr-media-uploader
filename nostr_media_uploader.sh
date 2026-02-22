@@ -2538,8 +2538,9 @@ usage() {
 	echo "  --nsfw              Mark the post as NSFW by adding content-warning tag"
 	echo "                    Can also be set via NSFW=1 environment variable in config file"
 	echo "                    Automatically enabled if #NSFW or #nsfw hashtag is found in content"
-	echo "  --auto-nsfw         Run nude_detector (same venv as run_telegram_bot) on files; if result is nsfw: true, mark as unsafe and add #nsfw"
+	echo "  --auto-nsfw         Run nude_detector (same venv as run_telegram_bot) on files; if result is nsfw: true, mark as unsafe"
 	echo "                    Requires run_nude_detector.sh and venv to exist; fails if venv is missing"
+	echo "  --nude-detector-backend (falconsai|nudenet)  Backend for auto-nsfw (default: falconsai)"
 	echo
 	echo "Arguments:"
 	echo "  file|url          One or more paths to image or video files, or URLs to download videos"
@@ -2733,6 +2734,7 @@ parse_command_line() {
 	local ENABLE_H265=0
 	local NSFW=0
 	local AUTO_NSFW=0
+	local NUDE_DETECTOR_BACKEND="falconsai"
 	
 	local ALL_MEDIA_FILES=()
 	local DESCRIPTION_CANDIDATE=""
@@ -2849,6 +2851,13 @@ while (( "$#" )); do
 		NSFW=1
 	elif [[ "$PARAM" == "--auto-nsfw" || "$PARAM" == "-auto-nsfw" ]]; then
 		AUTO_NSFW=1
+	elif [[ "$PARAM" == "--nude-detector-backend" || "$PARAM" == "-nude-detector-backend" ]]; then
+		NUDE_DETECTOR_BACKEND="$2"
+		if [[ "$NUDE_DETECTOR_BACKEND" != "falconsai" && "$NUDE_DETECTOR_BACKEND" != "nudenet" ]]; then
+			echo "Error: --nude-detector-backend must be falconsai or nudenet" >&2
+			exit 1
+		fi
+		shift
 	elif [[ "$PARAM" =~ ^- ]]; then
 		# Unrecognized option starting with - or --
 		local SCRIPT_NAME_ERR=$(basename "$0")
@@ -2908,6 +2917,7 @@ fi
 	parse_command_line_ret_enable_h265="$ENABLE_H265"
 	parse_command_line_ret_nsfw="$NSFW"
 	parse_command_line_ret_auto_nsfw="$AUTO_NSFW"
+	parse_command_line_ret_nude_detector_backend="$NUDE_DETECTOR_BACKEND"
 	
 	# Export PROFILE_NAME as a side effect for early use (before ENV loading)
 	export PROFILE_NAME
@@ -3381,6 +3391,7 @@ process_media_items() {
 #   $14: SCRIPT_DIR - script directory (for run_nude_detector.sh path)
 #   $15: AUTO_NSFW - 1 to run auto-nsfw detector before upload, 0 otherwise
 #   $16: NSFW - 1 to add content-warning tag (explicit --nsfw), 0 otherwise
+#   $17: NUDE_DETECTOR_BACKEND - falconsai or nudenet
 # Returns: Exit code (0=success, dies on failure)
 upload_and_publish_event() {
 	local PROCESSED_FILES_STR="$1"
@@ -3399,6 +3410,7 @@ upload_and_publish_event() {
 	local SCRIPT_DIR_PARAM="${14}"
 	local AUTO_NSFW_PARAM="${15}"
 	local NSFW_PARAM="${16}"
+	local NUDE_DETECTOR_BACKEND_PARAM="${17}"
 	
 	# Deserialize arrays
 	local PROCESSED_FILES=()
@@ -3437,7 +3449,7 @@ fi
 		fi
 		local DETECTOR_JSON DETECTOR_STDERR
 		DETECTOR_STDERR=$(mktemp -t nude_detector_stderr.XXXXXX 2>/dev/null || echo "/tmp/nude_detector_stderr.$$")
-		DETECTOR_JSON=$(NOSTR_MEDIA_UPLOADER_SCRIPT_DIR="$SCRIPT_DIR_PARAM" "$RUN_NUDE_DETECTOR" --full-results "${PROCESSED_FILES[@]}" 2>"$DETECTOR_STDERR")
+		DETECTOR_JSON=$(NOSTR_MEDIA_UPLOADER_SCRIPT_DIR="$SCRIPT_DIR_PARAM" "$RUN_NUDE_DETECTOR" --backend "${NUDE_DETECTOR_BACKEND_PARAM:-falconsai}" --full-results "${PROCESSED_FILES[@]}" 2>"$DETECTOR_STDERR")
 		local DETECTOR_EXIT=$?
 		if [ "$DETECTOR_EXIT" -ne 0 ]; then
 			echo "Error: auto-nsfw detector failed (exit $DETECTOR_EXIT). Aborting without uploading." >&2
@@ -3868,7 +3880,7 @@ main() {
 	upload_and_publish_event "$PROCESSED_FILES_STR" "$FILE_CAPTIONS_STR" "$FILE_SOURCES_STR" \
 		"$FILE_GALLERIES_STR" "$BLOSSOMS_LIST_STR" "$RELAYS_LIST" "$KEY_DECRYPTED" \
 		"$POW_DIFF" "$DISPLAY_SOURCE" "$SEND_TO_RELAY" "$DESCRIPTION_CANDIDATE" "$FILE_DROP_URL" "$FILE_DROP_URL_PREFIX" \
-		"$SCRIPT_DIR" "$AUTO_NSFW" "$NSFW"
+		"$SCRIPT_DIR" "$AUTO_NSFW" "$NSFW" "$NUDE_DETECTOR_BACKEND"
 	
 	# ========================================================================
 	# UPDATE HISTORY FILE
@@ -3925,6 +3937,7 @@ PARSED_FILE_DROP_URL_PREFIX="$parse_command_line_ret_file_drop_url_prefix"
 PARSED_ENABLE_H265="$parse_command_line_ret_enable_h265"
 PARSED_NSFW="$parse_command_line_ret_nsfw"
 PARSED_AUTO_NSFW="$parse_command_line_ret_auto_nsfw"
+PARSED_NUDE_DETECTOR_BACKEND="$parse_command_line_ret_nude_detector_backend"
 
 # Use extracted PROFILE_NAME to load config
 if [ -n "$PARSED_PROFILE_NAME" ]; then
@@ -4105,6 +4118,19 @@ else
 	AUTO_NSFW=0
 fi
 
+# Merge NUDE_DETECTOR_BACKEND: parsed, then env, default falconsai
+if [ -n "$PARSED_NUDE_DETECTOR_BACKEND" ]; then
+	NUDE_DETECTOR_BACKEND="$PARSED_NUDE_DETECTOR_BACKEND"
+elif [ -n "${NUDE_DETECTOR_BACKEND:-}" ]; then
+	# already set from env
+	:
+else
+	NUDE_DETECTOR_BACKEND="falconsai"
+fi
+if [[ "$NUDE_DETECTOR_BACKEND" != "falconsai" && "$NUDE_DETECTOR_BACKEND" != "nudenet" ]]; then
+	NUDE_DETECTOR_BACKEND="falconsai"
+fi
+
 # ========================================================================
 # EXPORT MERGED VARIABLES FOR main() TO READ
 # ========================================================================
@@ -4128,6 +4154,7 @@ export FILE_DROP_URL_PREFIX
 export ENABLE_H265
 export NSFW
 export AUTO_NSFW
+export NUDE_DETECTOR_BACKEND
 
 # Export parsed command-line results for main() to use
 export PARSED_MEDIA_FILES

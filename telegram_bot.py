@@ -880,7 +880,7 @@ async def download_media_file(bot, file, file_extension=None, max_retries=3, ret
         return None
 
 
-def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None, auto_nsfw=False):
+def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None, auto_nsfw=False, nude_detector_backend='falconsai'):
     """Build the command to execute nostr_media_uploader.sh.
     
     Args:
@@ -894,6 +894,7 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
         nsfw: Whether to add --nsfw flag (default: False)
         disable_cookies_for_sites: List of domain patterns to disable cookies for (default: None)
         auto_nsfw: Whether to add --auto-nsfw flag (default: False)
+        nude_detector_backend: Backend for auto-nsfw: 'falconsai' or 'nudenet' (default: falconsai)
     """
     # Convert script path to absolute path
     script_path = Path(script_path)
@@ -945,7 +946,8 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
     # Add --auto-nsfw if enabled (channel config)
     if auto_nsfw:
         cmd.append('--auto-nsfw')
-        logger.info("Adding --auto-nsfw parameter")
+        cmd.extend(['--nude-detector-backend', nude_detector_backend])
+        logger.info("Adding --auto-nsfw parameter (backend: %s)", nude_detector_backend)
     
     # Add --nocomment if there is extra text after URLs
     if extra_text and extra_text.strip():
@@ -1534,6 +1536,16 @@ async def _kill_process_and_read_remaining_output(process, stdout_bytes, stderr_
         logger.debug(f"Error reading remaining output: {e}")
     
     return stdout_bytes, stderr_bytes
+
+
+def get_script_timeout(config, channel_config, num_files, is_url_based=False):
+    """Compute effective script timeout: base + 20s per file if auto_nsfw, + 2 min if URL-based."""
+    base = config.get('script_timeout', 360)
+    if channel_config.get('auto_nsfw', False):
+        base += 20 * num_files
+    if is_url_based:
+        base += 120
+    return base
 
 
 async def execute_script(cmd, cwd=None, timeout=None):
@@ -2329,11 +2341,12 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
             config,
             channel_config.get('nsfw', False),  # Get NSFW setting from channel config
             disable_cookies_sites,  # Get disable cookies setting from channel or global config
-            channel_config.get('auto_nsfw', False)  # Get auto-nsfw setting from channel config
+            channel_config.get('auto_nsfw', False),  # Get auto-nsfw setting from channel config
+            context.bot_data.get('nude_detector_backend', 'falconsai')
         )
         
-        # Execute script with timeout
-        timeout = config.get('script_timeout', 360)
+        # Execute script with timeout (extra time for auto_nsfw: +20s per file)
+        timeout = get_script_timeout(config, channel_config, len(media_files), is_url_based=False)
         result = await execute_script(cmd, timeout=timeout)
         
         # Clean up temporary files
@@ -2409,8 +2422,7 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
         else:
             # Check for timeout first
             if result.get('timeout'):
-                timeout_seconds = config.get('script_timeout', 360)
-                error_parts = [f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\nThe request took too long and was cancelled. This may happen with rate-limited sites."]
+                error_parts = [f"⏱️ Script execution timed out after {timeout} seconds\n\nThe request took too long and was cancelled. This may happen with rate-limited sites."]
                 
                 # Include any captured output before timeout
                 if result.get('stderr'):
@@ -2427,7 +2439,7 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
                     first_newline = truncated_msg.find('\n')
                     if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:
                         truncated_msg = truncated_msg[first_newline+1:]
-                    error_display = f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
+                    error_display = f"⏱️ Script execution timed out after {timeout} seconds\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
                 else:
                     error_display = error_msg
             else:
@@ -2811,11 +2823,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 config,
                 channel_config.get('nsfw', False),  # Get NSFW setting from channel config
                 disable_cookies_sites,  # Get disable cookies setting from channel or global config
-                channel_config.get('auto_nsfw', False)  # Get auto-nsfw setting from channel config
+                channel_config.get('auto_nsfw', False),  # Get auto-nsfw setting from channel config
+                context.bot_data.get('nude_detector_backend', 'falconsai')
             )
             
-            # Execute script with timeout
-            timeout = config.get('script_timeout', 360)
+            # Execute script with timeout (extra time for auto_nsfw: +20s per file)
+            timeout = get_script_timeout(config, channel_config, len(media_files), is_url_based=False)
             result = await execute_script(cmd, timeout=timeout)
             
             # Clean up temporary files
@@ -2909,8 +2922,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 # Check for timeout first
                 if result.get('timeout'):
-                    timeout_seconds = config.get('script_timeout', 360)
-                    error_parts = [f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\nThe request took too long and was cancelled. This may happen with rate-limited sites."]
+                    error_parts = [f"⏱️ Script execution timed out after {timeout} seconds\n\nThe request took too long and was cancelled. This may happen with rate-limited sites."]
                     
                     # Include any captured output before timeout
                     if result.get('stderr'):
@@ -2927,7 +2939,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         first_newline = truncated_msg.find('\n')
                         if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:
                             truncated_msg = truncated_msg[first_newline+1:]
-                        error_display = f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
+                        error_display = f"⏱️ Script execution timed out after {timeout} seconds\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
                     else:
                         error_display = error_msg
                 else:
@@ -3019,11 +3031,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             config,
             channel_config.get('nsfw', False),  # Get NSFW setting from channel config
             disable_cookies_sites,  # Get disable cookies setting from channel or global config
-            channel_config.get('auto_nsfw', False)  # Get auto-nsfw setting from channel config
+            channel_config.get('auto_nsfw', False),  # Get auto-nsfw setting from channel config
+            context.bot_data.get('nude_detector_backend', 'falconsai')
         )
         
-        # Execute script with timeout
-        timeout = config.get('script_timeout', 360)
+        # Execute script with timeout (extra: +20s per file if auto_nsfw, +2 min if URL-based)
+        timeout = get_script_timeout(config, channel_config, len(urls), is_url_based=True)
         result = await execute_script(cmd, timeout=timeout)
         
         # Format response
@@ -3110,8 +3123,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             # Check for timeout first
             if result.get('timeout'):
-                timeout_seconds = config.get('script_timeout', 360)
-                error_parts = [f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\nThe request took too long and was cancelled. This may happen with rate-limited sites."]
+                error_parts = [f"⏱️ Script execution timed out after {timeout} seconds\n\nThe request took too long and was cancelled. This may happen with rate-limited sites."]
                 
                 # Include any captured output before timeout
                 if result.get('stderr'):
@@ -3128,7 +3140,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     first_newline = truncated_msg.find('\n')
                     if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:
                         truncated_msg = truncated_msg[first_newline+1:]
-                    error_display = f"⏱️ Script execution timed out after {timeout_seconds} seconds\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
+                    error_display = f"⏱️ Script execution timed out after {timeout} seconds\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
                 else:
                     error_display = error_msg
             else:
@@ -3270,6 +3282,8 @@ def main() -> None:
                         help='Path to cookies file (Mozilla/Netscape format). Takes precedence over --firefox option.')
     parser.add_argument('--config', default=CONFIG_FILE,
                         help=f'Path to configuration file (default: {CONFIG_FILE})')
+    parser.add_argument('--nude-detector-backend', choices=['falconsai', 'nudenet'], default='falconsai',
+                        help='Backend for auto-nsfw: falconsai or nudenet (default: falconsai)')
     args = parser.parse_args()
     
     # Determine if Firefox should be used
@@ -3303,6 +3317,7 @@ def main() -> None:
     application.bot_data['config_path'] = args.config
     application.bot_data['use_firefox'] = use_firefox
     application.bot_data['cookies_file'] = args.cookies_file
+    application.bot_data['nude_detector_backend'] = args.nude_detector_backend
     
     # Add message handler
     # With multi-channel support, we listen to all chats and filter in the handler

@@ -13,5 +13,8 @@ firefox_cookies.txt
 venv/
 venv_windows/
 venv_linux/
+
+# Hugging Face model cache (nude_detector falconsai backend)
+.cache/
 docker-compose.yml
 telegram_bot.yaml*

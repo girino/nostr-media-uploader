@@ -6,6 +6,7 @@ Outputs JSON: list of {filename, nsfw, safe, unsafe, top_class} per file.
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -225,7 +226,18 @@ def main() -> int:
             print(f"Error: failed to import transformers (required for falconsai): {e}", file=sys.stderr)
             print(f"Python used: {sys.executable!s}", file=sys.stderr)
             return 2
-        classifier = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
+        # Use standard HF cache env vars if set; else cache next to script so runs reuse weights
+        hf_cache = (
+            os.environ.get("HF_HUB_CACHE")
+            or os.environ.get("HUGGINGFACE_HUB_CACHE")
+            or str(Path(__file__).resolve().parent / ".cache" / "huggingface")
+        )
+        Path(hf_cache).mkdir(parents=True, exist_ok=True)
+        classifier = pipeline(
+            "image-classification",
+            model="Falconsai/nsfw_image_detection",
+            model_kwargs={"cache_dir": hf_cache},
+        )
         for p in args.path:
             r = classify_one_falconsai(classifier, p, args)
             results.append(r)
