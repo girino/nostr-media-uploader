@@ -2540,7 +2540,10 @@ usage() {
 	echo "                    Automatically enabled if #NSFW or #nsfw hashtag is found in content"
 	echo "  --auto-nsfw         Run nude_detector (same venv as run_telegram_bot) on files; if result is nsfw: true, mark as unsafe"
 	echo "                    Requires run_nude_detector.sh and venv to exist; fails if venv is missing"
-	echo "  --nude-detector-backend (falconsai|nudenet)  Backend for auto-nsfw (default: falconsai)"
+	echo "  --nude-detector-backend (falconsai|nudenet|openai|sightengine)  Backend for auto-nsfw (default: sightengine); falls back to nudenet on failure"
+	echo "  --openai-api-key KEY       OpenAI API key (when backend is openai; or OPENAI_API_KEY env)"
+	echo "  --sightengine-api-user ID  Sightengine API user (when backend is sightengine)"
+	echo "  --sightengine-api-secret S Sightengine API secret (when backend is sightengine)"
 	echo
 	echo "Arguments:"
 	echo "  file|url          One or more paths to image or video files, or URLs to download videos"
@@ -2734,7 +2737,10 @@ parse_command_line() {
 	local ENABLE_H265=0
 	local NSFW=0
 	local AUTO_NSFW=0
-	local NUDE_DETECTOR_BACKEND="falconsai"
+	local NUDE_DETECTOR_BACKEND="sightengine"
+	local OPENAI_API_KEY=""
+	local SIGHTENGINE_API_USER=""
+	local SIGHTENGINE_API_SECRET=""
 	
 	local ALL_MEDIA_FILES=()
 	local DESCRIPTION_CANDIDATE=""
@@ -2853,10 +2859,19 @@ while (( "$#" )); do
 		AUTO_NSFW=1
 	elif [[ "$PARAM" == "--nude-detector-backend" || "$PARAM" == "-nude-detector-backend" ]]; then
 		NUDE_DETECTOR_BACKEND="$2"
-		if [[ "$NUDE_DETECTOR_BACKEND" != "falconsai" && "$NUDE_DETECTOR_BACKEND" != "nudenet" ]]; then
-			echo "Error: --nude-detector-backend must be falconsai or nudenet" >&2
+		if [[ "$NUDE_DETECTOR_BACKEND" != "falconsai" && "$NUDE_DETECTOR_BACKEND" != "nudenet" && "$NUDE_DETECTOR_BACKEND" != "openai" && "$NUDE_DETECTOR_BACKEND" != "sightengine" ]]; then
+			echo "Error: --nude-detector-backend must be falconsai, nudenet, openai, or sightengine" >&2
 			exit 1
 		fi
+		shift
+	elif [[ "$PARAM" == "--openai-api-key" || "$PARAM" == "-openai-api-key" ]]; then
+		OPENAI_API_KEY="$2"
+		shift
+	elif [[ "$PARAM" == "--sightengine-api-user" || "$PARAM" == "-sightengine-api-user" ]]; then
+		SIGHTENGINE_API_USER="$2"
+		shift
+	elif [[ "$PARAM" == "--sightengine-api-secret" || "$PARAM" == "-sightengine-api-secret" ]]; then
+		SIGHTENGINE_API_SECRET="$2"
 		shift
 	elif [[ "$PARAM" =~ ^- ]]; then
 		# Unrecognized option starting with - or --
@@ -2918,6 +2933,9 @@ fi
 	parse_command_line_ret_nsfw="$NSFW"
 	parse_command_line_ret_auto_nsfw="$AUTO_NSFW"
 	parse_command_line_ret_nude_detector_backend="$NUDE_DETECTOR_BACKEND"
+	parse_command_line_ret_openai_api_key="$OPENAI_API_KEY"
+	parse_command_line_ret_sightengine_api_user="$SIGHTENGINE_API_USER"
+	parse_command_line_ret_sightengine_api_secret="$SIGHTENGINE_API_SECRET"
 	
 	# Export PROFILE_NAME as a side effect for early use (before ENV loading)
 	export PROFILE_NAME
@@ -3391,7 +3409,7 @@ process_media_items() {
 #   $14: SCRIPT_DIR - script directory (for run_nude_detector.sh path)
 #   $15: AUTO_NSFW - 1 to run auto-nsfw detector before upload, 0 otherwise
 #   $16: NSFW - 1 to add content-warning tag (explicit --nsfw), 0 otherwise
-#   $17: NUDE_DETECTOR_BACKEND - falconsai or nudenet
+#   $17: NUDE_DETECTOR_BACKEND - falconsai, nudenet, openai, or sightengine (fallback to nudenet on failure)
 # Returns: Exit code (0=success, dies on failure)
 upload_and_publish_event() {
 	local PROCESSED_FILES_STR="$1"
@@ -3449,7 +3467,7 @@ fi
 		fi
 		local DETECTOR_JSON DETECTOR_STDERR
 		DETECTOR_STDERR=$(mktemp -t nude_detector_stderr.XXXXXX 2>/dev/null || echo "/tmp/nude_detector_stderr.$$")
-		DETECTOR_JSON=$(NOSTR_MEDIA_UPLOADER_SCRIPT_DIR="$SCRIPT_DIR_PARAM" "$RUN_NUDE_DETECTOR" --backend "${NUDE_DETECTOR_BACKEND_PARAM:-falconsai}" --full-results "${PROCESSED_FILES[@]}" 2>"$DETECTOR_STDERR")
+		DETECTOR_JSON=$(NOSTR_MEDIA_UPLOADER_SCRIPT_DIR="$SCRIPT_DIR_PARAM" "$RUN_NUDE_DETECTOR" --backend "${NUDE_DETECTOR_BACKEND_PARAM:-sightengine}" --full-results "${PROCESSED_FILES[@]}" 2>"$DETECTOR_STDERR")
 		local DETECTOR_EXIT=$?
 		if [ "$DETECTOR_EXIT" -ne 0 ]; then
 			echo "Error: auto-nsfw detector failed (exit $DETECTOR_EXIT). Aborting without uploading." >&2
@@ -3938,6 +3956,9 @@ PARSED_ENABLE_H265="$parse_command_line_ret_enable_h265"
 PARSED_NSFW="$parse_command_line_ret_nsfw"
 PARSED_AUTO_NSFW="$parse_command_line_ret_auto_nsfw"
 PARSED_NUDE_DETECTOR_BACKEND="$parse_command_line_ret_nude_detector_backend"
+PARSED_OPENAI_API_KEY="$parse_command_line_ret_openai_api_key"
+PARSED_SIGHTENGINE_API_USER="$parse_command_line_ret_sightengine_api_user"
+PARSED_SIGHTENGINE_API_SECRET="$parse_command_line_ret_sightengine_api_secret"
 
 # Use extracted PROFILE_NAME to load config
 if [ -n "$PARSED_PROFILE_NAME" ]; then
@@ -4118,21 +4139,38 @@ else
 	AUTO_NSFW=0
 fi
 
-# Merge NUDE_DETECTOR_BACKEND: parsed, then env, default falconsai
+# Merge NUDE_DETECTOR_BACKEND: parsed, then env, default sightengine
 if [ -n "$PARSED_NUDE_DETECTOR_BACKEND" ]; then
 	NUDE_DETECTOR_BACKEND="$PARSED_NUDE_DETECTOR_BACKEND"
 elif [ -n "${NUDE_DETECTOR_BACKEND:-}" ]; then
 	# already set from env
 	:
 else
-	NUDE_DETECTOR_BACKEND="falconsai"
+	NUDE_DETECTOR_BACKEND="sightengine"
 fi
-if [[ "$NUDE_DETECTOR_BACKEND" != "falconsai" && "$NUDE_DETECTOR_BACKEND" != "nudenet" ]]; then
-	NUDE_DETECTOR_BACKEND="falconsai"
+if [[ "$NUDE_DETECTOR_BACKEND" != "falconsai" && "$NUDE_DETECTOR_BACKEND" != "nudenet" && "$NUDE_DETECTOR_BACKEND" != "openai" && "$NUDE_DETECTOR_BACKEND" != "sightengine" ]]; then
+	NUDE_DETECTOR_BACKEND="sightengine"
+fi
+
+# Merge OPENAI_API_KEY, SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET: parsed, then env
+if [ -n "$PARSED_OPENAI_API_KEY" ]; then
+	OPENAI_API_KEY="$PARSED_OPENAI_API_KEY"
+elif [ -z "${OPENAI_API_KEY:-}" ]; then
+	OPENAI_API_KEY=""
+fi
+if [ -n "$PARSED_SIGHTENGINE_API_USER" ]; then
+	SIGHTENGINE_API_USER="$PARSED_SIGHTENGINE_API_USER"
+elif [ -z "${SIGHTENGINE_API_USER:-}" ]; then
+	SIGHTENGINE_API_USER=""
+fi
+if [ -n "$PARSED_SIGHTENGINE_API_SECRET" ]; then
+	SIGHTENGINE_API_SECRET="$PARSED_SIGHTENGINE_API_SECRET"
+elif [ -z "${SIGHTENGINE_API_SECRET:-}" ]; then
+	SIGHTENGINE_API_SECRET=""
 fi
 
 # ========================================================================
-# EXPORT MERGED VARIABLES FOR main() TO READ
+# EXPORT MERGED VARIABLES FOR main() TO READ (and for run_nude_detector.sh child)
 # ========================================================================
 export DISPLAY_SOURCE
 export POW_DIFF
@@ -4155,6 +4193,9 @@ export ENABLE_H265
 export NSFW
 export AUTO_NSFW
 export NUDE_DETECTOR_BACKEND
+export OPENAI_API_KEY
+export SIGHTENGINE_API_USER
+export SIGHTENGINE_API_SECRET
 
 # Export parsed command-line results for main() to use
 export PARSED_MEDIA_FILES

@@ -140,12 +140,18 @@ def load_config(config_path, use_firefox=True, cookies_file=None):
         'cookies_file': cookies_file,
         'disable_cookies_for_sites': config_data.get('disable_cookies_for_sites'),  # Optional: list of domains to disable cookies for
         'script_timeout': script_timeout,  # Timeout for script execution in seconds (default: 360 = 6 minutes)
+        'nude_detector_backend': config_data.get('nude_detector_backend'),  # Optional: falconsai, nudenet, openai, sightengine
+        'sightengine_api_user': config_data.get('sightengine_api_user'),
+        'sightengine_api_secret': config_data.get('sightengine_api_secret'),
+        'openai_api_key': config_data.get('openai_api_key'),
     }
 
 
 def find_channel_config(config, chat_id=None, chat_username=None):
     """Find channel configuration matching the given chat_id or username.
     
+    Channel config may include: profile_name, chat_id, auto_nsfw, nsfw,
+    nude_detector_backend (optional; overrides global), disable_cookies_for_sites.
     Returns the channel config dict if found, None otherwise.
     """
     channels = config.get('channels', {})
@@ -880,7 +886,7 @@ async def download_media_file(bot, file, file_extension=None, max_retries=3, ret
         return None
 
 
-def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None, auto_nsfw=False, nude_detector_backend='falconsai'):
+def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None, auto_nsfw=False, nude_detector_backend='sightengine', sightengine_api_user=None, sightengine_api_secret=None, openai_api_key=None):
     """Build the command to execute nostr_media_uploader.sh.
     
     Args:
@@ -894,7 +900,10 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
         nsfw: Whether to add --nsfw flag (default: False)
         disable_cookies_for_sites: List of domain patterns to disable cookies for (default: None)
         auto_nsfw: Whether to add --auto-nsfw flag (default: False)
-        nude_detector_backend: Backend for auto-nsfw: 'falconsai' or 'nudenet' (default: falconsai)
+        nude_detector_backend: Backend for auto-nsfw: falconsai, nudenet, openai, or sightengine (default: sightengine)
+        sightengine_api_user: Sightengine API user (from config, passed when backend is sightengine)
+        sightengine_api_secret: Sightengine API secret (from config)
+        openai_api_key: OpenAI API key (from config, passed when backend is openai)
     """
     # Convert script path to absolute path
     script_path = Path(script_path)
@@ -947,6 +956,10 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
     if auto_nsfw:
         cmd.append('--auto-nsfw')
         cmd.extend(['--nude-detector-backend', nude_detector_backend])
+        if nude_detector_backend == 'sightengine' and sightengine_api_user and sightengine_api_secret:
+            cmd.extend(['--sightengine-api-user', str(sightengine_api_user), '--sightengine-api-secret', str(sightengine_api_secret)])
+        if nude_detector_backend == 'openai' and openai_api_key:
+            cmd.extend(['--openai-api-key', str(openai_api_key)])
         logger.info("Adding --auto-nsfw parameter (backend: %s)", nude_detector_backend)
     
     # Add --nocomment if there is extra text after URLs
@@ -2330,7 +2343,8 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
         else:
             disable_cookies_sites = config.get('disable_cookies_for_sites')
         
-        # Build command with all media files
+        # Build command with all media files (nude_detector_backend: channel overrides global)
+        nude_backend = channel_config.get('nude_detector_backend') or config.get('nude_detector_backend') or context.bot_data.get('nude_detector_backend', 'sightengine')
         cmd = build_command(
             profile_name,
             config['script_path'],
@@ -2342,7 +2356,10 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
             channel_config.get('nsfw', False),  # Get NSFW setting from channel config
             disable_cookies_sites,  # Get disable cookies setting from channel or global config
             channel_config.get('auto_nsfw', False),  # Get auto-nsfw setting from channel config
-            context.bot_data.get('nude_detector_backend', 'falconsai')
+            nude_backend,
+            config.get('sightengine_api_user'),
+            config.get('sightengine_api_secret'),
+            config.get('openai_api_key'),
         )
         
         # Execute script with timeout (extra time for auto_nsfw: +20s per file)
@@ -2812,7 +2829,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 disable_cookies_sites = config.get('disable_cookies_for_sites')
             
-            # Build command with local files
+            # Build command with local files (nude_detector_backend: channel overrides global)
+            nude_backend = channel_config.get('nude_detector_backend') or config.get('nude_detector_backend') or context.bot_data.get('nude_detector_backend', 'sightengine')
             cmd = build_command(
                 profile_name,
                 config['script_path'],
@@ -2824,7 +2842,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 channel_config.get('nsfw', False),  # Get NSFW setting from channel config
                 disable_cookies_sites,  # Get disable cookies setting from channel or global config
                 channel_config.get('auto_nsfw', False),  # Get auto-nsfw setting from channel config
-                context.bot_data.get('nude_detector_backend', 'falconsai')
+                nude_backend,
+                config.get('sightengine_api_user'),
+                config.get('sightengine_api_secret'),
+                config.get('openai_api_key'),
             )
             
             # Execute script with timeout (extra time for auto_nsfw: +20s per file)
@@ -3021,6 +3042,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             disable_cookies_sites = config.get('disable_cookies_for_sites')
         
         # Build command
+        nude_backend = channel_config.get('nude_detector_backend') or config.get('nude_detector_backend') or context.bot_data.get('nude_detector_backend', 'sightengine')
         cmd = build_command(
             profile_name,
             config['script_path'],
@@ -3032,7 +3054,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             channel_config.get('nsfw', False),  # Get NSFW setting from channel config
             disable_cookies_sites,  # Get disable cookies setting from channel or global config
             channel_config.get('auto_nsfw', False),  # Get auto-nsfw setting from channel config
-            context.bot_data.get('nude_detector_backend', 'falconsai')
+            nude_backend,
+            config.get('sightengine_api_user'),
+            config.get('sightengine_api_secret'),
+            config.get('openai_api_key'),
         )
         
         # Execute script with timeout (extra: +20s per file if auto_nsfw, +2 min if URL-based)
@@ -3282,8 +3307,8 @@ def main() -> None:
                         help='Path to cookies file (Mozilla/Netscape format). Takes precedence over --firefox option.')
     parser.add_argument('--config', default=CONFIG_FILE,
                         help=f'Path to configuration file (default: {CONFIG_FILE})')
-    parser.add_argument('--nude-detector-backend', choices=['falconsai', 'nudenet'], default='falconsai',
-                        help='Backend for auto-nsfw: falconsai or nudenet (default: falconsai)')
+    parser.add_argument('--nude-detector-backend', choices=['falconsai', 'nudenet', 'openai', 'sightengine'], default='sightengine',
+                        help='Backend for auto-nsfw (default: sightengine); uploader falls back to nudenet on failure')
     args = parser.parse_args()
     
     # Determine if Firefox should be used

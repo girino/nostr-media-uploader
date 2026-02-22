@@ -6,3 +6,5 @@ nudenet>=3.4.2
 transformers>=4.30.0
 torch>=2.0.0
 Pillow>=9.0.0
+# OpenAI backend (omni-moderation-latest)
+openai>=1.0.0
