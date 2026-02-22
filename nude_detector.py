@@ -139,7 +139,7 @@ def classify_one_falconsai(pipeline, path: Path, args) -> dict:
         unsafe = round(nsfw_score, 3)
         safe = round(1.0 - unsafe, 3)
         is_nsfw = unsafe > args.threshold
-        top_class = "nsfw" if is_nsfw else None
+        top_class = "FALCONSAI"
         return {"filename": filename, "nsfw": is_nsfw, "safe": safe, "unsafe": unsafe, "top_class": top_class}
     else:
         import cv2
@@ -174,7 +174,7 @@ def classify_one_falconsai(pipeline, path: Path, args) -> dict:
         unsafe = round(unsafe, 3)
         safe = round(1.0 - unsafe, 3)
         is_nsfw = unsafe > args.threshold
-        top_class = "nsfw" if is_nsfw else None
+        top_class = "FALCONSAI"
         return {"filename": filename, "nsfw": is_nsfw, "safe": safe, "unsafe": unsafe, "top_class": top_class}
 
 

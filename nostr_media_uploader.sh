@@ -3616,8 +3616,8 @@ fi
 		echo "Adding content-warning tag for NSFW content"
 	fi
 	
-	# Add nude_detector tags for files that were detected as NSFW
-	if [ -n "$DETECTOR_RESULTS_JSON" ] && [ "$AUTO_NSFW_DETECTED" -eq 1 ]; then
+	# Add nude_detector tags for all files when auto-nsfw was run (whether or not any were marked nsfw)
+	if [ -n "$DETECTOR_RESULTS_JSON" ]; then
 		# Match by array index: PROCESSED_FILES[i] corresponds to results[i] in detector JSON
 		# (detector processes files in the order they were passed)
 		local idx=0
