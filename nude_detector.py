@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Classify image or video files as SFW (safe for work) or NSFW using NudeNet.
-Uses NudeDetector (nudenet 3.4+); SFW/NSFW is derived from detection of exposed body parts.
-Outputs JSON: list of {filename, nsfw, safe, unsafe} per file.
+Classify image or video files as SFW (safe for work) or NSFW.
+Backends: NudeNet (body-part detection) or Falconsai (Hugging Face ViT model).
+Outputs JSON: list of {filename, nsfw, safe, unsafe, top_class} per file.
 """
 import argparse
 import json
@@ -62,8 +62,8 @@ def unsafe_score_and_class_from_detections(detections: list, nsfw_classes: set) 
     return max(matching, key=lambda x: x[0])
 
 
-def classify_one(detector, path: Path, args, nsfw_classes: set) -> dict:
-    """Classify one file; return {filename, nsfw, safe, unsafe} or {filename, error} on failure."""
+def classify_one_nudenet(detector, path: Path, args, nsfw_classes: set) -> dict:
+    """Classify one file with NudeNet; return {filename, nsfw, safe, unsafe, top_class} or {filename, error}."""
     path = path.resolve()
     filename = path.name
     if not path.is_file():
@@ -111,6 +111,72 @@ def classify_one(detector, path: Path, args, nsfw_classes: set) -> dict:
     return {"filename": filename, "nsfw": is_nsfw, "safe": safe, "unsafe": unsafe, "top_class": top_class}
 
 
+def classify_one_falconsai(pipeline, path: Path, args) -> dict:
+    """Classify one file with Falconsai (Hugging Face); return same shape as NudeNet."""
+    from PIL import Image
+
+    path = path.resolve()
+    filename = path.name
+    if not path.is_file():
+        return {"filename": filename, "error": f"not a file: {path}"}
+    try:
+        file_type = get_file_type(path)
+    except ValueError as e:
+        return {"filename": filename, "error": str(e)}
+
+    path_str = str(path)
+
+    if file_type == "image":
+        img = Image.open(path_str).convert("RGB")
+        preds = pipeline(img)
+        # preds e.g. [{"label": "nsfw", "score": 0.9}, {"label": "normal", "score": 0.1}]
+        nsfw_score = 0.0
+        for p in preds:
+            if p.get("label", "").lower() == "nsfw":
+                nsfw_score = p.get("score", 0.0)
+                break
+        unsafe = round(nsfw_score, 3)
+        safe = round(1.0 - unsafe, 3)
+        is_nsfw = unsafe > args.threshold
+        top_class = "nsfw" if is_nsfw else None
+        return {"filename": filename, "nsfw": is_nsfw, "safe": safe, "unsafe": unsafe, "top_class": top_class}
+    else:
+        import cv2
+        cap = cv2.VideoCapture(path_str)
+        if not cap.isOpened():
+            return {"filename": filename, "error": f"could not open video: {path}"}
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+        num_samples = args.video_frames
+        if total_frames <= num_samples:
+            frame_indices = list(range(total_frames))
+        else:
+            frame_indices = [int(round(i * (total_frames - 1) / (num_samples - 1))) for i in range(num_samples)]
+        unsafe = 0.0
+        try:
+            for idx in frame_indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                # BGR -> RGB, numpy -> PIL
+                import numpy as np
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(frame_rgb)
+                preds = pipeline(pil_img)
+                for p in preds:
+                    if p.get("label", "").lower() == "nsfw":
+                        if p.get("score", 0.0) > unsafe:
+                            unsafe = p.get("score", 0.0)
+                        break
+        finally:
+            cap.release()
+        unsafe = round(unsafe, 3)
+        safe = round(1.0 - unsafe, 3)
+        is_nsfw = unsafe > args.threshold
+        top_class = "nsfw" if is_nsfw else None
+        return {"filename": filename, "nsfw": is_nsfw, "safe": safe, "unsafe": unsafe, "top_class": top_class}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Classify images/videos as SFW/NSFW using NudeNet. Outputs JSON.")
     parser.add_argument("path", type=Path, nargs="+", help="Path(s) to image or video file(s)")
@@ -124,27 +190,50 @@ def main() -> int:
         help="low=exposed only (nudity); high=exposed+belly/feet/armpits (default: high)",
     )
     parser.add_argument("--full-results", action="store_true", help="Include per-file results list; otherwise only global nsfw status")
+    parser.add_argument(
+        "--backend",
+        choices=["nudenet", "falconsai"],
+        default="nudenet",
+        help="Backend: nudenet (body-part detection) or falconsai (Hugging Face ViT model, Falconsai/nsfw_image_detection)",
+    )
     args = parser.parse_args()
 
-    try:
-        from nudenet import NudeDetector
-    except ImportError as e:
-        print(f"Error: failed to import nudenet: {e}", file=sys.stderr)
-        print(f"Python used: {sys.executable!s}", file=sys.stderr)
-        return 2
-
-    nsfw_classes = SENSITIVITY_CLASSES[args.sensitivity]
-    detector = NudeDetector()
     results = []
     any_nsfw = False
     errors = []
-    for p in args.path:
-        r = classify_one(detector, p, args, nsfw_classes)
-        results.append(r)
-        if "error" in r:
-            errors.append(f"{r['filename']}: {r['error']}")
-        elif r.get("nsfw"):
-            any_nsfw = True
+
+    if args.backend == "nudenet":
+        try:
+            from nudenet import NudeDetector
+        except ImportError as e:
+            print(f"Error: failed to import nudenet: {e}", file=sys.stderr)
+            print(f"Python used: {sys.executable!s}", file=sys.stderr)
+            return 2
+        nsfw_classes = SENSITIVITY_CLASSES[args.sensitivity]
+        detector = NudeDetector()
+        for p in args.path:
+            r = classify_one_nudenet(detector, p, args, nsfw_classes)
+            results.append(r)
+            if "error" in r:
+                errors.append(f"{r['filename']}: {r['error']}")
+            elif r.get("nsfw"):
+                any_nsfw = True
+    else:
+        # falconsai
+        try:
+            from transformers import pipeline
+        except ImportError as e:
+            print(f"Error: failed to import transformers (required for falconsai): {e}", file=sys.stderr)
+            print(f"Python used: {sys.executable!s}", file=sys.stderr)
+            return 2
+        classifier = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
+        for p in args.path:
+            r = classify_one_falconsai(classifier, p, args)
+            results.append(r)
+            if "error" in r:
+                errors.append(f"{r['filename']}: {r['error']}")
+            elif r.get("nsfw"):
+                any_nsfw = True
 
     success = len(errors) == 0
     out = {"success": success, "nsfw": any_nsfw}
