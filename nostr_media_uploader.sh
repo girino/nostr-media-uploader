@@ -3411,6 +3411,7 @@ process_media_items() {
 #   $16: NSFW - 1 to add content-warning tag (explicit --nsfw), 0 otherwise
 #   $17: NUDE_DETECTOR_BACKEND - falconsai, nudenet, openai, or sightengine (fallback to nudenet on failure)
 # Returns: Exit code (0=success, dies on failure)
+# Note: Caller must run check_all_media_history and calculate_file_hashes before calling this (already-processed check before upload).
 upload_and_publish_event() {
 	local PROCESSED_FILES_STR="$1"
 	local FILE_CAPTIONS_STR="$2"
@@ -3453,9 +3454,9 @@ upload_and_publish_event() {
 	done
 	BLOSSOMS_LIST=("${FILTERED_BLOSSOMS[@]}")
 
-if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
-	die "No files to upload"
-fi
+	if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
+		die "No files to upload"
+	fi
 
 	# Auto-NSFW: run detector before uploading; on any error abort (do not upload)
 	local AUTO_NSFW_DETECTED=0
@@ -3844,7 +3845,7 @@ main() {
 	fi
 	
 	# ========================================================================
-	# CHECK MEDIA HISTORY
+	# CHECK MEDIA HISTORY (filename/URL) - before conversion to avoid converting files twice
 	# ========================================================================
 	local ORIGINAL_URLS_STR
 	check_all_media_history "$ALL_MEDIA_FILES_STR" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"
@@ -3884,14 +3885,14 @@ main() {
 	FILE_GALLERIES_STR="$process_media_items_ret_galleries"
 	
 	# ========================================================================
-	# CALCULATE FILE HASHES
+	# CHECK ALREADY PROCESSED BY HASH (before upload and before moderation - do not spend tokens on duplicates)
 	# ========================================================================
 	local FILE_HASHES_STR
 	calculate_file_hashes "$PROCESSED_FILES_STR" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"
 	FILE_HASHES_STR="$calculate_file_hashes_ret_hashes"
 	
 	# ========================================================================
-	# UPLOAD AND PUBLISH EVENT
+	# UPLOAD AND PUBLISH EVENT (moderation then upload; already-processed check was done above)
 	# ========================================================================
 	local FILE_DROP_URL="${FILE_DROP_URL:-}"
 	local FILE_DROP_URL_PREFIX="${FILE_DROP_URL_PREFIX:-}"
