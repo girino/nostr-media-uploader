@@ -3454,6 +3454,10 @@ fi
 			AUTO_NSFW_DETECTED=1
 			echo "Auto-NSFW: detector reported nsfw, will mark as unsafe and add #nsfw"
 		fi
+		# Store detector results for later tag generation (filename -> {nsfw, top_class, unsafe})
+		local DETECTOR_RESULTS_JSON="$DETECTOR_JSON"
+	else
+		local DETECTOR_RESULTS_JSON=""
 	fi
 
 	local UPLOAD_URLS=()
@@ -3562,12 +3566,7 @@ fi
 	local ADD_NSFW_TAG=0
 	if [ "$AUTO_NSFW_DETECTED" -eq 1 ]; then
 		ADD_NSFW_TAG=1
-		echo "Auto-NSFW: marking as unsafe and adding #nsfw"
-		if [ -n "$CONTENT" ] && ! echo "$CONTENT" | grep -qiE '#nsfw\b'; then
-			CONTENT="${CONTENT} #nsfw"
-		elif [ -z "$CONTENT" ]; then
-			CONTENT="#nsfw"
-		fi
+		echo "Auto-NSFW: marking as unsafe"
 	fi
 	if [ "${NSFW_PARAM:-0}" -eq 1 ]; then
 		ADD_NSFW_TAG=1
@@ -3603,6 +3602,30 @@ fi
 	if [ $ADD_NSFW_TAG -eq 1 ]; then
 		NAK_CMD+=("-t" "content-warning=nsfw")
 		echo "Adding content-warning tag for NSFW content"
+	fi
+	
+	# Add nude_detector tags for files that were detected as NSFW
+	if [ -n "$DETECTOR_RESULTS_JSON" ] && [ "$AUTO_NSFW_DETECTED" -eq 1 ]; then
+		# Match by array index: PROCESSED_FILES[i] corresponds to results[i] in detector JSON
+		# (detector processes files in the order they were passed)
+		local idx=0
+		while [ $idx -lt ${#PROCESSED_FILES[@]} ]; do
+			local file_path="${PROCESSED_FILES[$idx]}"
+			local upload_url="${UPLOAD_URLS[$idx]}"
+			
+			# Extract detector result for this index (results array matches input order)
+			local file_result=$(echo "$DETECTOR_RESULTS_JSON" | jq -r --argjson idx "$idx" '.results[$idx]? // empty')
+			if [ -n "$file_result" ] && [ "$file_result" != "null" ] && [ "$file_result" != "" ]; then
+				# Add tag for ALL files, regardless of nsfw status
+				local top_class=$(echo "$file_result" | jq -r '.top_class // ""')
+				local unsafe_score=$(echo "$file_result" | jq -r '.unsafe // 0')
+				# Format: nude_detector=URL CLASS SCORE (CLASS may be empty/null for safe files)
+				local tag_value="${upload_url} ${top_class} ${unsafe_score}"
+				NAK_CMD+=("-t" "nude_detector=${tag_value}")
+				echo "Adding nude_detector tag: ${upload_url} ${top_class} ${unsafe_score}"
+			fi
+			idx=$((idx + 1))
+		done
 	fi
 	
 	# Extract hashtags from content and add them as tags
