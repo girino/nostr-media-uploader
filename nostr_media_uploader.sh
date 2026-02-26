@@ -2541,6 +2541,7 @@ usage() {
 	echo "  --auto-nsfw         Run nude_detector (same venv as run_telegram_bot) on files; if result is nsfw: true, mark as unsafe"
 	echo "                    Requires run_nude_detector.sh and venv to exist; fails if venv is missing"
 	echo "  --nude-detector-backend (falconsai|nudenet|openai|sightengine)  Backend for auto-nsfw (default: sightengine); falls back to nudenet on failure"
+	echo "  --nude-detector-sensitivity (low|medium|high)  Sensitivity for detector (optional; backend default if omitted)"
 	echo "  --openai-api-key KEY       OpenAI API key (when backend is openai; or OPENAI_API_KEY env)"
 	echo "  --sightengine-api-user ID  Sightengine API user (when backend is sightengine)"
 	echo "  --sightengine-api-secret S Sightengine API secret (when backend is sightengine)"
@@ -2738,6 +2739,7 @@ parse_command_line() {
 	local NSFW=0
 	local AUTO_NSFW=0
 	local NUDE_DETECTOR_BACKEND="sightengine"
+	local NUDE_DETECTOR_SENSITIVITY=""
 	local OPENAI_API_KEY=""
 	local SIGHTENGINE_API_USER=""
 	local SIGHTENGINE_API_SECRET=""
@@ -2864,6 +2866,13 @@ while (( "$#" )); do
 			exit 1
 		fi
 		shift
+	elif [[ "$PARAM" == "--nude-detector-sensitivity" || "$PARAM" == "-nude-detector-sensitivity" ]]; then
+		NUDE_DETECTOR_SENSITIVITY="$2"
+		if [[ "$NUDE_DETECTOR_SENSITIVITY" != "low" && "$NUDE_DETECTOR_SENSITIVITY" != "medium" && "$NUDE_DETECTOR_SENSITIVITY" != "high" ]]; then
+			echo "Error: --nude-detector-sensitivity must be low, medium, or high" >&2
+			exit 1
+		fi
+		shift
 	elif [[ "$PARAM" == "--openai-api-key" || "$PARAM" == "-openai-api-key" ]]; then
 		OPENAI_API_KEY="$2"
 		shift
@@ -2933,6 +2942,7 @@ fi
 	parse_command_line_ret_nsfw="$NSFW"
 	parse_command_line_ret_auto_nsfw="$AUTO_NSFW"
 	parse_command_line_ret_nude_detector_backend="$NUDE_DETECTOR_BACKEND"
+	parse_command_line_ret_nude_detector_sensitivity="$NUDE_DETECTOR_SENSITIVITY"
 	parse_command_line_ret_openai_api_key="$OPENAI_API_KEY"
 	parse_command_line_ret_sightengine_api_user="$SIGHTENGINE_API_USER"
 	parse_command_line_ret_sightengine_api_secret="$SIGHTENGINE_API_SECRET"
@@ -3410,6 +3420,7 @@ process_media_items() {
 #   $15: AUTO_NSFW - 1 to run auto-nsfw detector before upload, 0 otherwise
 #   $16: NSFW - 1 to add content-warning tag (explicit --nsfw), 0 otherwise
 #   $17: NUDE_DETECTOR_BACKEND - falconsai, nudenet, openai, or sightengine (fallback to nudenet on failure)
+#   $18: NUDE_DETECTOR_SENSITIVITY - low, medium, or high (optional; detector default per backend if empty)
 # Returns: Exit code (0=success, dies on failure)
 # Note: Caller must run check_all_media_history and calculate_file_hashes before calling this (already-processed check before upload).
 upload_and_publish_event() {
@@ -3430,6 +3441,7 @@ upload_and_publish_event() {
 	local AUTO_NSFW_PARAM="${15}"
 	local NSFW_PARAM="${16}"
 	local NUDE_DETECTOR_BACKEND_PARAM="${17}"
+	local NUDE_DETECTOR_SENSITIVITY_PARAM="${18}"
 	
 	# Deserialize arrays
 	local PROCESSED_FILES=()
@@ -3468,7 +3480,11 @@ upload_and_publish_event() {
 		fi
 		local DETECTOR_JSON DETECTOR_STDERR
 		DETECTOR_STDERR=$(mktemp -t nude_detector_stderr.XXXXXX 2>/dev/null || echo "/tmp/nude_detector_stderr.$$")
-		DETECTOR_JSON=$(NOSTR_MEDIA_UPLOADER_SCRIPT_DIR="$SCRIPT_DIR_PARAM" "$RUN_NUDE_DETECTOR" --backend "${NUDE_DETECTOR_BACKEND_PARAM:-sightengine}" --full-results "${PROCESSED_FILES[@]}" 2>"$DETECTOR_STDERR")
+		local DETECTOR_SENSITIVITY_ARGS=()
+		if [ -n "${NUDE_DETECTOR_SENSITIVITY_PARAM:-}" ]; then
+			DETECTOR_SENSITIVITY_ARGS=(--sensitivity "$NUDE_DETECTOR_SENSITIVITY_PARAM")
+		fi
+		DETECTOR_JSON=$(NOSTR_MEDIA_UPLOADER_SCRIPT_DIR="$SCRIPT_DIR_PARAM" "$RUN_NUDE_DETECTOR" --backend "${NUDE_DETECTOR_BACKEND_PARAM:-sightengine}" "${DETECTOR_SENSITIVITY_ARGS[@]}" --full-results "${PROCESSED_FILES[@]}" 2>"$DETECTOR_STDERR")
 		local DETECTOR_EXIT=$?
 		if [ "$DETECTOR_EXIT" -ne 0 ]; then
 			echo "Error: auto-nsfw detector failed (exit $DETECTOR_EXIT). Aborting without uploading." >&2
@@ -3899,7 +3915,7 @@ main() {
 	upload_and_publish_event "$PROCESSED_FILES_STR" "$FILE_CAPTIONS_STR" "$FILE_SOURCES_STR" \
 		"$FILE_GALLERIES_STR" "$BLOSSOMS_LIST_STR" "$RELAYS_LIST" "$KEY_DECRYPTED" \
 		"$POW_DIFF" "$DISPLAY_SOURCE" "$SEND_TO_RELAY" "$DESCRIPTION_CANDIDATE" "$FILE_DROP_URL" "$FILE_DROP_URL_PREFIX" \
-		"$SCRIPT_DIR" "$AUTO_NSFW" "$NSFW" "$NUDE_DETECTOR_BACKEND"
+		"$SCRIPT_DIR" "$AUTO_NSFW" "$NSFW" "$NUDE_DETECTOR_BACKEND" "${NUDE_DETECTOR_SENSITIVITY:-}"
 	
 	# ========================================================================
 	# UPDATE HISTORY FILE
@@ -3957,6 +3973,7 @@ PARSED_ENABLE_H265="$parse_command_line_ret_enable_h265"
 PARSED_NSFW="$parse_command_line_ret_nsfw"
 PARSED_AUTO_NSFW="$parse_command_line_ret_auto_nsfw"
 PARSED_NUDE_DETECTOR_BACKEND="$parse_command_line_ret_nude_detector_backend"
+PARSED_NUDE_DETECTOR_SENSITIVITY="$parse_command_line_ret_nude_detector_sensitivity"
 PARSED_OPENAI_API_KEY="$parse_command_line_ret_openai_api_key"
 PARSED_SIGHTENGINE_API_USER="$parse_command_line_ret_sightengine_api_user"
 PARSED_SIGHTENGINE_API_SECRET="$parse_command_line_ret_sightengine_api_secret"
@@ -4153,6 +4170,13 @@ if [[ "$NUDE_DETECTOR_BACKEND" != "falconsai" && "$NUDE_DETECTOR_BACKEND" != "nu
 	NUDE_DETECTOR_BACKEND="sightengine"
 fi
 
+# Merge NUDE_DETECTOR_SENSITIVITY: parsed, then env (optional; detector uses backend default if empty)
+if [ -n "${PARSED_NUDE_DETECTOR_SENSITIVITY:-}" ]; then
+	NUDE_DETECTOR_SENSITIVITY="$PARSED_NUDE_DETECTOR_SENSITIVITY"
+elif [ -z "${NUDE_DETECTOR_SENSITIVITY:-}" ]; then
+	NUDE_DETECTOR_SENSITIVITY=""
+fi
+
 # Merge OPENAI_API_KEY, SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET: parsed, then env
 if [ -n "$PARSED_OPENAI_API_KEY" ]; then
 	OPENAI_API_KEY="$PARSED_OPENAI_API_KEY"
@@ -4194,6 +4218,7 @@ export ENABLE_H265
 export NSFW
 export AUTO_NSFW
 export NUDE_DETECTOR_BACKEND
+export NUDE_DETECTOR_SENSITIVITY
 export OPENAI_API_KEY
 export SIGHTENGINE_API_USER
 export SIGHTENGINE_API_SECRET

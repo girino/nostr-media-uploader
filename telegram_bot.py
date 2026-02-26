@@ -147,11 +147,34 @@ def load_config(config_path, use_firefox=True, cookies_file=None):
     }
 
 
+def get_auto_nsfw_config(channel_config, config):
+    """Parse hierarchical auto_nsfw from channel (and global fallbacks).
+    
+    auto_nsfw can be:
+      - false: moderation disabled. Returns (False, None, None).
+      - true (legacy): enabled with channel/global nude_detector_backend, sensitivity low. Returns (True, engine, 'low').
+      - dict with engine/sensitivity: Returns (True, engine, sensitivity). Omitted keys use global default or 'low'.
+    """
+    raw = channel_config.get('auto_nsfw')
+    if raw is None or raw is False:
+        return False, None, None
+    if raw is True:
+        # Legacy: flat nude_detector_backend
+        engine = (channel_config.get('nude_detector_backend') or config.get('nude_detector_backend') or
+                  'sightengine')
+        return True, engine, 'low'
+    if isinstance(raw, dict):
+        engine = raw.get('engine') or config.get('nude_detector_backend') or 'sightengine'
+        sensitivity = raw.get('sensitivity') or None  # optional; detector uses backend default when None
+        return True, engine, sensitivity
+    return False, None, None
+
+
 def find_channel_config(config, chat_id=None, chat_username=None):
     """Find channel configuration matching the given chat_id or username.
     
-    Channel config may include: profile_name, chat_id, auto_nsfw, nsfw,
-    nude_detector_backend (optional; overrides global), disable_cookies_for_sites.
+    Channel config may include: profile_name, chat_id, auto_nsfw (false or {engine, sensitivity}),
+    nsfw, disable_cookies_for_sites.
     Returns the channel config dict if found, None otherwise.
     """
     channels = config.get('channels', {})
@@ -886,7 +909,7 @@ async def download_media_file(bot, file, file_extension=None, max_retries=3, ret
         return None
 
 
-def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None, auto_nsfw=False, nude_detector_backend='sightengine', sightengine_api_user=None, sightengine_api_secret=None, openai_api_key=None):
+def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None, auto_nsfw=False, nude_detector_backend='sightengine', nude_detector_sensitivity=None, sightengine_api_user=None, sightengine_api_secret=None, openai_api_key=None):
     """Build the command to execute nostr_media_uploader.sh.
     
     Args:
@@ -901,6 +924,7 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
         disable_cookies_for_sites: List of domain patterns to disable cookies for (default: None)
         auto_nsfw: Whether to add --auto-nsfw flag (default: False)
         nude_detector_backend: Backend for auto-nsfw: falconsai, nudenet, openai, or sightengine (default: sightengine)
+        nude_detector_sensitivity: Sensitivity for auto-nsfw: low, medium, or high (optional; detector default used if None)
         sightengine_api_user: Sightengine API user (from config, passed when backend is sightengine)
         sightengine_api_secret: Sightengine API secret (from config)
         openai_api_key: OpenAI API key (from config, passed when backend is openai)
@@ -956,11 +980,13 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
     if auto_nsfw:
         cmd.append('--auto-nsfw')
         cmd.extend(['--nude-detector-backend', nude_detector_backend])
+        if nude_detector_sensitivity:
+            cmd.extend(['--nude-detector-sensitivity', nude_detector_sensitivity])
         if nude_detector_backend == 'sightengine' and sightengine_api_user and sightengine_api_secret:
             cmd.extend(['--sightengine-api-user', str(sightengine_api_user), '--sightengine-api-secret', str(sightengine_api_secret)])
         if nude_detector_backend == 'openai' and openai_api_key:
             cmd.extend(['--openai-api-key', str(openai_api_key)])
-        logger.info("Adding --auto-nsfw parameter (backend: %s)", nude_detector_backend)
+        logger.info("Adding --auto-nsfw parameter (backend: %s, sensitivity: %s)", nude_detector_backend, nude_detector_sensitivity or 'default')
     
     # Add --nocomment if there is extra text after URLs
     if extra_text and extra_text.strip():
@@ -1554,7 +1580,8 @@ async def _kill_process_and_read_remaining_output(process, stdout_bytes, stderr_
 def get_script_timeout(config, channel_config, num_files, is_url_based=False):
     """Compute effective script timeout: base + 20s per file if auto_nsfw, + 2 min if URL-based."""
     base = config.get('script_timeout', 360)
-    if channel_config.get('auto_nsfw', False):
+    auto_nsfw_enabled, _, _ = get_auto_nsfw_config(channel_config, config)
+    if auto_nsfw_enabled:
         base += 20 * num_files
     if is_url_based:
         base += 120
@@ -2343,8 +2370,8 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
         else:
             disable_cookies_sites = config.get('disable_cookies_for_sites')
         
-        # Build command with all media files (nude_detector_backend: channel overrides global)
-        nude_backend = channel_config.get('nude_detector_backend') or config.get('nude_detector_backend') or context.bot_data.get('nude_detector_backend', 'sightengine')
+        # Build command with all media files (auto_nsfw from channel: engine + sensitivity)
+        auto_nsfw_enabled, nude_engine, nude_sensitivity = get_auto_nsfw_config(channel_config, config)
         cmd = build_command(
             profile_name,
             config['script_path'],
@@ -2355,8 +2382,9 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
             config,
             channel_config.get('nsfw', False),  # Get NSFW setting from channel config
             disable_cookies_sites,  # Get disable cookies setting from channel or global config
-            channel_config.get('auto_nsfw', False),  # Get auto-nsfw setting from channel config
-            nude_backend,
+            auto_nsfw_enabled,
+            nude_engine or 'sightengine',
+            nude_sensitivity,
             config.get('sightengine_api_user'),
             config.get('sightengine_api_secret'),
             config.get('openai_api_key'),
@@ -2829,8 +2857,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 disable_cookies_sites = config.get('disable_cookies_for_sites')
             
-            # Build command with local files (nude_detector_backend: channel overrides global)
-            nude_backend = channel_config.get('nude_detector_backend') or config.get('nude_detector_backend') or context.bot_data.get('nude_detector_backend', 'sightengine')
+            # Build command with local files (auto_nsfw from channel: engine + sensitivity)
+            auto_nsfw_enabled, nude_engine, nude_sensitivity = get_auto_nsfw_config(channel_config, config)
             cmd = build_command(
                 profile_name,
                 config['script_path'],
@@ -2841,8 +2869,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 config,
                 channel_config.get('nsfw', False),  # Get NSFW setting from channel config
                 disable_cookies_sites,  # Get disable cookies setting from channel or global config
-                channel_config.get('auto_nsfw', False),  # Get auto-nsfw setting from channel config
-                nude_backend,
+                auto_nsfw_enabled,
+                nude_engine or 'sightengine',
+                nude_sensitivity,
                 config.get('sightengine_api_user'),
                 config.get('sightengine_api_secret'),
                 config.get('openai_api_key'),
@@ -3041,8 +3070,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             disable_cookies_sites = config.get('disable_cookies_for_sites')
         
-        # Build command
-        nude_backend = channel_config.get('nude_detector_backend') or config.get('nude_detector_backend') or context.bot_data.get('nude_detector_backend', 'sightengine')
+        # Build command (auto_nsfw from channel: engine + sensitivity)
+        auto_nsfw_enabled, nude_engine, nude_sensitivity = get_auto_nsfw_config(channel_config, config)
         cmd = build_command(
             profile_name,
             config['script_path'],
@@ -3053,8 +3082,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             config,
             channel_config.get('nsfw', False),  # Get NSFW setting from channel config
             disable_cookies_sites,  # Get disable cookies setting from channel or global config
-            channel_config.get('auto_nsfw', False),  # Get auto-nsfw setting from channel config
-            nude_backend,
+            auto_nsfw_enabled,
+            nude_engine or 'sightengine',
+            nude_sensitivity,
             config.get('sightengine_api_user'),
             config.get('sightengine_api_secret'),
             config.get('openai_api_key'),

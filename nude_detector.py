@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Classify image or video files as SFW (safe for work) or NSFW.
@@ -16,47 +17,56 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# Sightengine nudity-2.1: all classes and subclasses. Disable by setting to None (like commenting out in NudeNet).
-# Only non-None entries count toward unsafe and top_class. Enable by replacing None with the string.
-SIGHTENGINE_NSFW_CLASSES = [
-    # ---- Intensity (7) ----
-    "sexual_activity",
-    "sexual_display",
-    "erotica",
-    "very_suggestive",
-    "suggestive",
-    None,  # "mildly_suggestive",
-    None,  # "none",
-    # ---- Suggestive classes ----
-    "suggestive_classes.visibly_undressed",
-    "suggestive_classes.sextoy",
-    "suggestive_classes.suggestive_focus",
-    "suggestive_classes.suggestive_pose",
-    "suggestive_classes.lingerie",
-    "suggestive_classes.male_underwear",
-    None,  # "suggestive_classes.cleavage",
-    "suggestive_classes.cleavage_categories.very_revealing",
-    "suggestive_classes.cleavage_categories.revealing",
-    None,  # "suggestive_classes.cleavage_categories.none",
-    None,  # "suggestive_classes.male_chest",
-    "suggestive_classes.male_chest_categories.very_revealing",
-    "suggestive_classes.male_chest_categories.revealing",
-    None,  # "suggestive_classes.male_chest_categories.slightly_revealing",
-    None,  # "suggestive_classes.male_chest_categories.none",
-    "suggestive_classes.nudity_art",
-    None,  # "suggestive_classes.schematic",
-    "suggestive_classes.bikini",
-    "suggestive_classes.swimwear_one_piece",
-    "suggestive_classes.swimwear_male",
-    None,  # "suggestive_classes.minishort",
-    None,  # "suggestive_classes.miniskirt",
-    None,  # "suggestive_classes.other",
-    # ---- Context (3) ----
-    None,  # "context.sea_lake_pool",
-    None,  # "context.outdoor_other",
-    None,  # "context.indoor_other",
-]
-SIGHTENGINE_NSFW_CLASSES_ENABLED = {c for c in SIGHTENGINE_NSFW_CLASSES if c is not None}
+# Sightengine nudity-2.1: sensitivity levels. low = sexual/erotica; medium = + very_suggestive/suggestive; high = + mildly_suggestive and subclasses.
+SIGHTENGINE_SENSITIVITY_CLASSES = {
+    "low": {
+        "sexual_activity",
+        "sexual_display",
+        "erotica",
+    },
+    "medium": {
+        "sexual_activity",
+        "sexual_display",
+        "erotica",
+        "very_suggestive",
+        "suggestive",
+    },
+    "high": {
+        "sexual_activity",
+        "sexual_display",
+        "erotica",
+        "very_suggestive",
+        "suggestive",
+        "mildly_suggestive",
+        "suggestive_classes.visibly_undressed",
+        "suggestive_classes.sextoy",
+        "suggestive_classes.suggestive_focus",
+        "suggestive_classes.suggestive_pose",
+        "suggestive_classes.lingerie",
+        "suggestive_classes.male_underwear",
+        "suggestive_classes.cleavage_categories.very_revealing",
+        "suggestive_classes.cleavage_categories.revealing",
+        "suggestive_classes.male_chest_categories.very_revealing",
+        "suggestive_classes.male_chest_categories.revealing",
+        "suggestive_classes.nudity_art",
+        "suggestive_classes.bikini",
+        "suggestive_classes.swimwear_one_piece",
+        "suggestive_classes.swimwear_male",
+        # Optional for future adjustments (uncomment to enable):
+        # "suggestive_classes.cleavage",
+        # "suggestive_classes.cleavage_categories.none",
+        # "suggestive_classes.male_chest",
+        # "suggestive_classes.male_chest_categories.slightly_revealing",
+        # "suggestive_classes.male_chest_categories.none",
+        # "suggestive_classes.schematic",
+        # "suggestive_classes.minishort",
+        # "suggestive_classes.miniskirt",
+        # "suggestive_classes.other",
+        # "context.sea_lake_pool",
+        # "context.outdoor_other",
+        # "context.indoor_other",
+    },
+}
 
 # Ordered list for top_class (most explicit first); only used when picking top_class among enabled
 SIGHTENGINE_INTENSITY_ORDER = [
@@ -75,7 +85,7 @@ SIGHTENGINE_VIDEO_SYNC_URL = "https://api.sightengine.com/1.0/video/check-sync.j
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".wmv", ".flv", ".m4v"}
 
-# Sensitivity: low = exposed only (nudity); high = exposed + extra (belly, feet, armpits exposed)
+# NudeNet sensitivity: low = exposed only; medium = + extra except belly; high = + breast covered, armpits, buttocks covered.
 NSFW_EXPOSED = {
     "FEMALE_GENITALIA_EXPOSED",
     "MALE_GENITALIA_EXPOSED",
@@ -83,24 +93,24 @@ NSFW_EXPOSED = {
     "BUTTOCKS_EXPOSED",
     "ANUS_EXPOSED",
 }
-NSFW_EXTRA = {
-    "BELLY_EXPOSED",
+# Medium = current high minus BELLY_EXPOSED
+NSFW_EXTRA_NO_BELLY = {
     "MALE_BREAST_EXPOSED",
     "FEMALE_GENITALIA_COVERED",
     "ANUS_COVERED",
-    # "FEMALE_BREAST_COVERED",
-    # "ARMPITS_EXPOSED",
-    # "FEET_EXPOSED",
-    # "BELLY_COVERED",
-    # "FEET_COVERED",
-    # "BUTTOCKS_COVERED",
-    # "ARMPITS_COVERED",
-    # "FACE_FEMALE",
-    # "FACE_MALE",
 }
+# High = medium + these (others commented for future adjustments)
+NSFW_HIGH_EXTRA = {
+    "FEMALE_BREAST_COVERED",
+    "ARMPITS_EXPOSED",
+    "BUTTOCKS_COVERED",
+}
+# Optional for future adjustments (uncomment to enable):
+# "FEET_EXPOSED", "BELLY_COVERED", "FEET_COVERED", "ARMPITS_COVERED", "FACE_FEMALE", "FACE_MALE", "BELLY_EXPOSED"
 SENSITIVITY_CLASSES = {
     "low": NSFW_EXPOSED,
-    "high": NSFW_EXPOSED | NSFW_EXTRA,
+    "medium": NSFW_EXPOSED | NSFW_EXTRA_NO_BELLY,
+    "high": NSFW_EXPOSED | NSFW_EXTRA_NO_BELLY | NSFW_HIGH_EXTRA,
 }
 
 
@@ -452,12 +462,11 @@ def _flatten_nudity(nudity: dict, prefix: str = "") -> dict[str, float]:
     return out
 
 
-def _nudity_to_unsafe_and_class(flat_scores: dict[str, float]) -> tuple[float, str]:
+def _nudity_to_unsafe_and_class(flat_scores: dict[str, float], enabled: set[str]) -> tuple[float, str]:
     """From flattened Sightengine scores (dot-key -> score) return (unsafe_score, top_class).
-    Only classes in SIGHTENGINE_NSFW_CLASSES_ENABLED count. Unsafe = max of their scores.
+    Only classes in enabled count. Unsafe = max of their scores.
     top_class = enabled class with highest score (prefer earlier in SIGHTENGINE_INTENSITY_ORDER on tie).
     """
-    enabled = SIGHTENGINE_NSFW_CLASSES_ENABLED
     scores = {k: v for k, v in flat_scores.items() if k in enabled}
     unsafe = max(scores.values(), default=0.0)
     if not scores:
@@ -551,7 +560,8 @@ def classify_sightengine(api_user: str, api_secret: str, paths: list[Path], args
         if is_video and debug:
             print(f"[sightengine] Full result (flat) for {filename}:\n{json.dumps(flat_scores, indent=2)}", file=sys.stderr)
 
-        unsafe, top_class = _nudity_to_unsafe_and_class(flat_scores)
+        se_enabled = SIGHTENGINE_SENSITIVITY_CLASSES.get(args.sensitivity, SIGHTENGINE_SENSITIVITY_CLASSES["low"])
+        unsafe, top_class = _nudity_to_unsafe_and_class(flat_scores, se_enabled)
         safe = round(1.0 - unsafe, 3)
         is_nsfw = unsafe > args.threshold
         out.append({
@@ -586,6 +596,8 @@ def _run_backend(backend: str, paths: list[Path], args: argparse.Namespace) -> t
             elif r.get("nsfw"):
                 any_nsfw = True
     elif backend == "falconsai":
+        if args.sensitivity != "medium":
+            raise RuntimeError(f"backend falconsai accepts only sensitivity=medium (got {args.sensitivity!r})")
         try:
             from transformers import pipeline
         except ImportError as e:
@@ -609,6 +621,8 @@ def _run_backend(backend: str, paths: list[Path], args: argparse.Namespace) -> t
             elif r.get("nsfw"):
                 any_nsfw = True
     elif backend == "openai":
+        if args.sensitivity != "low":
+            raise RuntimeError(f"backend openai accepts only sensitivity=low (got {args.sensitivity!r})")
         api_key = getattr(args, "api_key", None) or os.environ.get("OPENAI_API_KEY")
         if not api_key or not (api_key if isinstance(api_key, str) else "").strip():
             raise RuntimeError("--api-key or OPENAI_API_KEY required for backend openai")
@@ -644,9 +658,9 @@ def main() -> int:
     parser.add_argument("--video-frames", type=int, default=20, help="Number of frames to sample from video (default: 20)")
     parser.add_argument(
         "--sensitivity",
-        choices=["low", "high"],
-        default="high",
-        help="low=exposed only (nudity); high=exposed+belly/feet/armpits (default: high)",
+        choices=["low", "medium", "high"],
+        default=None,
+        help="Sensitivity: low/medium/high. Default varies by backend: low (nudenet, sightengine, openai), medium (falconsai).",
     )
     parser.add_argument("--full-results", action="store_true", help="Include per-file results list; otherwise only global nsfw status")
     parser.add_argument(
@@ -672,6 +686,11 @@ def main() -> int:
     )
     parser.add_argument("--debug", action="store_true", help="Print debug messages to stderr")
     args = parser.parse_args()
+
+    # Default sensitivity by backend: low for nudenet/sightengine/openai; medium for falconsai.
+    BACKEND_DEFAULT_SENSITIVITY = {"nudenet": "low", "sightengine": "low", "falconsai": "medium", "openai": "low"}
+    if args.sensitivity is None:
+        args.sensitivity = BACKEND_DEFAULT_SENSITIVITY[args.backend]
 
     primary = args.backend
     fallback_reason: str | None = None
