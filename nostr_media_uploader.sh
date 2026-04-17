@@ -2545,6 +2545,8 @@ usage() {
 	echo "  --openai-api-key KEY       OpenAI API key (when backend is openai; or OPENAI_API_KEY env)"
 	echo "  --sightengine-api-user ID  Sightengine API user (when backend is sightengine)"
 	echo "  --sightengine-api-secret S Sightengine API secret (when backend is sightengine)"
+	echo "  --copy-only DIR         Download/convert media only; copy results to DIR (no upload, no nostr event)"
+	echo "                          Does not require nostr keys; history checks are skipped"
 	echo
 	echo "Arguments:"
 	echo "  file|url          One or more paths to image or video files, or URLs to download videos"
@@ -2555,6 +2557,8 @@ usage() {
 	echo "  $SCRIPT_NAME video.mp4"
 	echo "  $SCRIPT_NAME image1.jpg image2.jpg 'This is a description'"
 	echo "  $SCRIPT_NAME https://example.com/video 'Description' 'Source'"
+	echo "  $SCRIPT_NAME --copy-only ~/exports video.mp4"
+	echo "  $SCRIPT_NAME -p myprofile --copy-only /path/to/out https://example.com/reel"
 	echo
 }
 
@@ -2717,6 +2721,7 @@ prepare_gallery_dl_params() {
 #   parse_command_line_ret_enable_h265 - 1 if --enable-h265 was used, 0 otherwise
 #   parse_command_line_ret_nsfw - 1 if --nsfw was used, 0 otherwise
 #   parse_command_line_ret_auto_nsfw - 1 if --auto-nsfw was used, 0 otherwise
+#   parse_command_line_ret_copy_only_dir - destination dir if --copy-only was used (else empty)
 # Side effects: Also exports PROFILE_NAME as a global variable for early use
 parse_command_line() {
 	# Initialize default values (hardcoded defaults, NOT from environment)
@@ -2743,6 +2748,7 @@ parse_command_line() {
 	local OPENAI_API_KEY=""
 	local SIGHTENGINE_API_USER=""
 	local SIGHTENGINE_API_SECRET=""
+	local COPY_ONLY_DIR=""
 	
 	local ALL_MEDIA_FILES=()
 	local DESCRIPTION_CANDIDATE=""
@@ -2882,6 +2888,13 @@ while (( "$#" )); do
 	elif [[ "$PARAM" == "--sightengine-api-secret" || "$PARAM" == "-sightengine-api-secret" ]]; then
 		SIGHTENGINE_API_SECRET="$2"
 		shift
+	elif [[ "$PARAM" == "--copy-only" || "$PARAM" == "-copy-only" ]]; then
+		COPY_ONLY_DIR="$2"
+		if [ -z "$COPY_ONLY_DIR" ]; then
+			echo "Error: directory path is required after --copy-only" >&2
+			exit 1
+		fi
+		shift
 	elif [[ "$PARAM" =~ ^- ]]; then
 		# Unrecognized option starting with - or --
 		local SCRIPT_NAME_ERR=$(basename "$0")
@@ -2946,6 +2959,7 @@ fi
 	parse_command_line_ret_openai_api_key="$OPENAI_API_KEY"
 	parse_command_line_ret_sightengine_api_user="$SIGHTENGINE_API_USER"
 	parse_command_line_ret_sightengine_api_secret="$SIGHTENGINE_API_SECRET"
+	parse_command_line_ret_copy_only_dir="$COPY_ONLY_DIR"
 	
 	# Export PROFILE_NAME as a side effect for early use (before ENV loading)
 	export PROFILE_NAME
@@ -3793,6 +3807,99 @@ update_history_file() {
 	return 0
 }
 
+# Copy processed media files into a directory; basename collisions get _1, _2, ...
+# Parameters:
+#   $1: PROCESSED_FILES_STR - serialized array of file paths
+#   $2: DEST_DIR - destination directory (created if missing)
+copy_processed_files_to_destination() {
+	local PROCESSED_FILES_STR="$1"
+	local DEST_DIR="$2"
+	local PROCESSED_FILES=()
+	eval "PROCESSED_FILES=($PROCESSED_FILES_STR)"
+	if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
+		die "copy-only: no processed files to copy"
+	fi
+	mkdir -p "$DEST_DIR" || die "Failed to create destination directory: $DEST_DIR"
+	local FILE
+	local base
+	local dest
+	local name
+	local ext
+	local i
+	local copied=0
+	for FILE in "${PROCESSED_FILES[@]}"; do
+		if [ ! -f "$FILE" ]; then
+			echo "Warning: copy-only: skipping missing file: $FILE" >&2
+			continue
+		fi
+		base=$(basename "$FILE")
+		dest="$DEST_DIR/$base"
+		if [ -e "$dest" ]; then
+			name="${base%.*}"
+			ext="${base#*.}"
+			if [ "$ext" = "$base" ]; then
+				ext=""
+			else
+				ext=".$ext"
+			fi
+			i=1
+			while [ -e "$DEST_DIR/${name}_${i}${ext}" ]; do
+				i=$((i + 1))
+			done
+			dest="$DEST_DIR/${name}_${i}${ext}"
+		fi
+		cp -p "$FILE" "$dest" || die "Failed to copy $FILE to $dest"
+		echo "Copied: $dest"
+		copied=$((copied + 1))
+	done
+	if [ "$copied" -eq 0 ]; then
+		die "copy-only: no files were copied (all inputs missing?)"
+	fi
+}
+
+# Download/convert media and copy to a folder only (no nostr upload or event)
+main_copy_only() {
+	local ALL_MEDIA_FILES_STR="$PARSED_MEDIA_FILES"
+	local CONVERT_VIDEO="${CONVERT_VIDEO:-1}"
+	local DISABLE_HASH_CHECK=1
+	local MAX_FILE_SEARCH="${MAX_FILE_SEARCH:-10}"
+	local USE_COOKIES_FF="${USE_COOKIES_FF:-0}"
+	local APPEND_ORIGINAL_COMMENT="${APPEND_ORIGINAL_COMMENT:-1}"
+	local DESCRIPTION_CANDIDATE="$PARSED_DESCRIPTION_CANDIDATE"
+	local SOURCE_CANDIDATE="$PARSED_SOURCE_CANDIDATE"
+	local COPY_DEST="${COPY_ONLY_DIR:-}"
+	
+	if [ -z "$COPY_DEST" ]; then
+		die "copy-only: destination directory is empty"
+	fi
+	
+	# History path for download helpers; duplicate checks disabled for copy-only
+	local HISTORY_FILE
+	get_script_metadata "$PROFILE_NAME"
+	HISTORY_FILE="$get_script_metadata_ret_history_file"
+	local HISTORY_DIR
+	HISTORY_DIR=$(dirname "$HISTORY_FILE")
+	mkdir -p "$HISTORY_DIR" || die "Failed to create history directory: $HISTORY_DIR"
+	touch "$HISTORY_FILE" || die "Failed to touch history file: $HISTORY_FILE"
+	
+	local GALLERY_DL_PARAMS_STR
+	prepare_gallery_dl_params "$USE_COOKIES_FF" "$COOKIES_FILE"
+	GALLERY_DL_PARAMS_STR="$prepare_gallery_dl_params_ret_params"
+	
+	local PROCESSED_FILES_STR
+	local FILE_CAPTIONS_STR
+	local FILE_SOURCES_STR
+	local FILE_GALLERIES_STR
+	process_media_items "$ALL_MEDIA_FILES_STR" "$HISTORY_FILE" "$CONVERT_VIDEO" \
+		"$USE_COOKIES_FF" "$COOKIES_FILE" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" \
+		"$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE" "$GALLERY_DL_PARAMS_STR" \
+		"$MAX_FILE_SEARCH"
+	PROCESSED_FILES_STR="$process_media_items_ret_files"
+	
+	copy_processed_files_to_destination "$PROCESSED_FILES_STR" "$COPY_DEST"
+	echo "Copy-only finished: output directory $COPY_DEST"
+}
+
 # Main function containing all script logic
 # Parameters:
 #   $@ - command-line arguments
@@ -3977,6 +4084,7 @@ PARSED_NUDE_DETECTOR_SENSITIVITY="$parse_command_line_ret_nude_detector_sensitiv
 PARSED_OPENAI_API_KEY="$parse_command_line_ret_openai_api_key"
 PARSED_SIGHTENGINE_API_USER="$parse_command_line_ret_sightengine_api_user"
 PARSED_SIGHTENGINE_API_SECRET="$parse_command_line_ret_sightengine_api_secret"
+PARSED_COPY_ONLY_DIR="$parse_command_line_ret_copy_only_dir"
 
 # Use extracted PROFILE_NAME to load config
 if [ -n "$PARSED_PROFILE_NAME" ]; then
@@ -4038,6 +4146,13 @@ elif [ -n "${FILE_DROP_URL_PREFIX:-}" ]; then
 else
 	# No file-drop URL prefix specified
 	FILE_DROP_URL_PREFIX=""
+fi
+
+# Merge COPY_ONLY_DIR: parsed takes precedence; else environment variable
+if [ -n "${PARSED_COPY_ONLY_DIR:-}" ]; then
+	COPY_ONLY_DIR="$PARSED_COPY_ONLY_DIR"
+elif [ -z "${COPY_ONLY_DIR:-}" ]; then
+	COPY_ONLY_DIR=""
 fi
 
 # Merge ENABLE_H265: Command-line takes precedence over environment variable
@@ -4222,6 +4337,7 @@ export NUDE_DETECTOR_SENSITIVITY
 export OPENAI_API_KEY
 export SIGHTENGINE_API_USER
 export SIGHTENGINE_API_SECRET
+export COPY_ONLY_DIR
 
 # Export parsed command-line results for main() to use
 export PARSED_MEDIA_FILES
@@ -4236,6 +4352,11 @@ export PARSED_DISPLAY_SOURCE
 export PARSED_PASSWORD
 export PARSED_DESCRIPTION_CANDIDATE
 export PARSED_SOURCE_CANDIDATE
+export PARSED_COPY_ONLY_DIR
 
-# Call main function (no arguments needed, already parsed)
-main
+# Call main or copy-only path (no arguments needed, already parsed)
+if [ -n "${COPY_ONLY_DIR:-}" ]; then
+	main_copy_only
+else
+	main
+fi
