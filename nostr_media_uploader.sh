@@ -1131,17 +1131,22 @@ convert_video_with_encoder() {
 		fi
 	fi
 	
-	# Calculate bitrate multiplier based on encoder type
+	# Use bitrate mode when known, otherwise fixed-quality mode fallback.
+	local USE_FIXED_QUALITY=0
 	local BITRATE_MULTIPLIER
-	if [ "$ENCODER_TYPE" = "h265" ]; then
-		# H265 is more efficient, use 1.5x bitrate
-		BITRATE_MULTIPLIER=150
+	local TARGET_BITRATE=""
+	if [[ "$BITRATE" =~ ^[0-9]+$ ]] && [ "$BITRATE" -gt 0 ]; then
+		if [ "$ENCODER_TYPE" = "h265" ]; then
+			# H265 is more efficient, use 1.5x bitrate
+			BITRATE_MULTIPLIER=150
+		else
+			# H264 needs 2x bitrate for similar quality
+			BITRATE_MULTIPLIER=200
+		fi
+		TARGET_BITRATE=$((BITRATE * BITRATE_MULTIPLIER / 100))
 	else
-		# H264 needs 2x bitrate for similar quality
-		BITRATE_MULTIPLIER=200
+		USE_FIXED_QUALITY=1
 	fi
-	
-	local TARGET_BITRATE=$((BITRATE * BITRATE_MULTIPLIER / 100))
 	
 	# Build encoder-specific options
 	local ENCODER_OPTS=()
@@ -1153,50 +1158,102 @@ convert_video_with_encoder() {
 	if [ "$ENCODER" = "hevc_qsv" ]; then
 		PRESET="slow"
 		PIX_FMT="nv12"
-		ENCODER_OPTS=(-c:v hevc_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-c:v hevc_qsv -global_quality 26 -preset "$PRESET" -pix_fmt "$PIX_FMT")
+		else
+			ENCODER_OPTS=(-c:v hevc_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
+		fi
 	elif [ "$ENCODER" = "hevc_vaapi" ]; then
 		# VAAPI encoder for older Intel processors (optional, must be explicitly enabled)
 		# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
 		# Specify VAAPI device and convert to nv12 format, then upload to VAAPI surface
 		INPUT_OPTS=(-vaapi_device /dev/dri/renderD128)
-		ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v hevc_vaapi -b:v "${TARGET_BITRATE}")
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v hevc_vaapi -qp 26)
+		else
+			ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v hevc_vaapi -b:v "${TARGET_BITRATE}")
+		fi
 	elif [ "$ENCODER" = "hevc_nvenc" ]; then
 		PRESET="slow"
-		ENCODER_OPTS=(-c:v hevc_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-c:v hevc_nvenc -preset "$PRESET" -rc:v vbr_hq -cq 26)
+		else
+			ENCODER_OPTS=(-c:v hevc_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
+		fi
 	elif [ "$ENCODER" = "hevc_videotoolbox" ]; then
-		ENCODER_OPTS=(-c:v hevc_videotoolbox -b:v "${TARGET_BITRATE}")
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-c:v hevc_videotoolbox -q:v 55)
+		else
+			ENCODER_OPTS=(-c:v hevc_videotoolbox -b:v "${TARGET_BITRATE}")
+		fi
 	elif [ "$ENCODER" = "hevc_amf" ]; then
 		PRESET="speed"
-		ENCODER_OPTS=(-c:v hevc_amf -b:v "${TARGET_BITRATE}" -quality "$PRESET")
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-c:v hevc_amf -quality "$PRESET" -qp_i 26 -qp_p 26)
+		else
+			ENCODER_OPTS=(-c:v hevc_amf -b:v "${TARGET_BITRATE}" -quality "$PRESET")
+		fi
 	elif [ "$ENCODER" = "libx265" ]; then
 		PRESET="medium"
-		ENCODER_OPTS=(-c:v libx265 -b:v "${TARGET_BITRATE}" -preset "$PRESET")
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-c:v libx265 -crf 26 -preset "$PRESET")
+		else
+			ENCODER_OPTS=(-c:v libx265 -b:v "${TARGET_BITRATE}" -preset "$PRESET")
+		fi
 		EXTRA_OPTS=(-tag:v hvc1)
 	elif [ "$ENCODER" = "h264_qsv" ]; then
 		PRESET="slow"
 		PIX_FMT="nv12"
-		ENCODER_OPTS=(-c:v h264_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-c:v h264_qsv -global_quality 24 -preset "$PRESET" -pix_fmt "$PIX_FMT")
+		else
+			ENCODER_OPTS=(-c:v h264_qsv -b:v "${TARGET_BITRATE}" -preset "$PRESET" -pix_fmt "$PIX_FMT")
+		fi
 	elif [ "$ENCODER" = "h264_vaapi" ]; then
 		# VAAPI encoder for older Intel processors (optional, must be explicitly enabled)
 		# Use software decoding (VAAPI doesn't support all codecs like AV1) and VAAPI encoding
 		# Specify VAAPI device and convert to nv12 format, then upload to VAAPI surface
 		INPUT_OPTS=(-vaapi_device /dev/dri/renderD128)
-		ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v h264_vaapi -b:v "${TARGET_BITRATE}")
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v h264_vaapi -qp 24)
+		else
+			ENCODER_OPTS=(-vf "format=nv12,hwupload" -c:v h264_vaapi -b:v "${TARGET_BITRATE}")
+		fi
 	elif [ "$ENCODER" = "h264_nvenc" ]; then
 		PRESET="slow"
-		ENCODER_OPTS=(-c:v h264_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-c:v h264_nvenc -preset "$PRESET" -rc:v vbr_hq -cq 24)
+		else
+			ENCODER_OPTS=(-c:v h264_nvenc -b:v "${TARGET_BITRATE}" -preset "$PRESET" -rc:v vbr)
+		fi
 	elif [ "$ENCODER" = "h264_videotoolbox" ]; then
-		ENCODER_OPTS=(-c:v h264_videotoolbox -b:v "${TARGET_BITRATE}")
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-c:v h264_videotoolbox -q:v 50)
+		else
+			ENCODER_OPTS=(-c:v h264_videotoolbox -b:v "${TARGET_BITRATE}")
+		fi
 	elif [ "$ENCODER" = "h264_amf" ]; then
 		PRESET="speed"
-		ENCODER_OPTS=(-c:v h264_amf -b:v "${TARGET_BITRATE}" -quality "$PRESET")
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-c:v h264_amf -quality "$PRESET" -qp_i 24 -qp_p 24)
+		else
+			ENCODER_OPTS=(-c:v h264_amf -b:v "${TARGET_BITRATE}" -quality "$PRESET")
+		fi
 	elif [ "$ENCODER" = "h264_v4l2m2m" ]; then
 		# Raspberry Pi hardware encoder (V4L2 M2M)
-		# Note: v4l2m2m doesn't support preset, just bitrate
-		ENCODER_OPTS=(-c:v h264_v4l2m2m -b:v "${TARGET_BITRATE}")
+		# Note: v4l2m2m has limited quality controls; use bitrate mode when known, fallback to moderate bitrate.
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-c:v h264_v4l2m2m -b:v 2500000)
+		else
+			ENCODER_OPTS=(-c:v h264_v4l2m2m -b:v "${TARGET_BITRATE}")
+		fi
 	elif [ "$ENCODER" = "libx264" ]; then
 		PRESET="medium"
-		ENCODER_OPTS=(-c:v libx264 -b:v "${TARGET_BITRATE}" -preset "$PRESET")
+		if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+			ENCODER_OPTS=(-c:v libx264 -crf 23 -preset "$PRESET")
+		else
+			ENCODER_OPTS=(-c:v libx264 -b:v "${TARGET_BITRATE}" -preset "$PRESET")
+		fi
 	else
 		echo "Unknown encoder: $ENCODER" >&2
 		return 1
@@ -1208,7 +1265,11 @@ convert_video_with_encoder() {
 		HW_ACCEL="(hardware accelerated)"
 	fi
 	
-	echo "Converting video using $ENCODER $HW_ACCEL at bitrate ${TARGET_BITRATE}" >&2
+	if [ "$USE_FIXED_QUALITY" -eq 1 ]; then
+		echo "Converting video using $ENCODER $HW_ACCEL with fixed-quality fallback (bitrate unknown)" >&2
+	else
+		echo "Converting video using $ENCODER $HW_ACCEL at bitrate ${TARGET_BITRATE}" >&2
+	fi
 	
 	# For VAAPI encoders, we need to combine scale with the format/hwupload filter
 	# Check if ENCODER_OPTS already contains a VAAPI filter (format=nv12,hwupload)
@@ -1284,6 +1345,149 @@ convert_video_with_encoder() {
 	fi
 }
 
+# Infer source bitrate for conversion using multiple strategies.
+# Parameters:
+#   $1: INPUT_FILE - source video file
+# Returns:
+#   Prints bitrate in bps to stdout (empty if unknown)
+infer_video_bitrate() {
+	local INPUT_FILE="$1"
+	local WIN_INPUT_FILE
+	WIN_INPUT_FILE=$(convert_path_for_tool "$INPUT_FILE")
+
+	# 1) Video stream bitrate (preferred when available)
+	local BITRATE
+	BITRATE=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "$WIN_INPUT_FILE" 2>/dev/null)
+	BITRATE=$(echo "$BITRATE" | tr -d '\r' | tr -cd '[:digit:]')
+	if [[ "$BITRATE" =~ ^[0-9]+$ ]] && [ "$BITRATE" -gt 0 ]; then
+		echo "$BITRATE"
+		return 0
+	fi
+
+	# 2) Container/format bitrate
+	BITRATE=$(ffprobe -v error -show_entries format=bit_rate -of csv=p=0 "$WIN_INPUT_FILE" 2>/dev/null)
+	BITRATE=$(echo "$BITRATE" | tr -d '\r' | tr -cd '[:digit:]')
+	if [[ "$BITRATE" =~ ^[0-9]+$ ]] && [ "$BITRATE" -gt 0 ]; then
+		echo "$BITRATE"
+		return 0
+	fi
+
+	# 3) Estimate from filesize and duration: bits / seconds
+	local DURATION
+	DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$WIN_INPUT_FILE" 2>/dev/null)
+	DURATION=$(echo "$DURATION" | tr -d '\r')
+	local FILE_SIZE_BYTES
+	FILE_SIZE_BYTES=$(stat -c%s "$INPUT_FILE" 2>/dev/null || wc -c < "$INPUT_FILE" 2>/dev/null)
+	FILE_SIZE_BYTES=$(echo "$FILE_SIZE_BYTES" | tr -d '\r' | tr -cd '[:digit:]')
+	if [[ "$FILE_SIZE_BYTES" =~ ^[0-9]+$ ]] && [ "$FILE_SIZE_BYTES" -gt 0 ] && [ -n "$DURATION" ]; then
+		local ESTIMATED
+		ESTIMATED=$(awk -v size="$FILE_SIZE_BYTES" -v dur="$DURATION" 'BEGIN { if (dur > 0) printf("%.0f", (size * 8) / dur); }')
+		ESTIMATED=$(echo "$ESTIMATED" | tr -d '\r' | tr -cd '[:digit:]')
+		if [[ "$ESTIMATED" =~ ^[0-9]+$ ]] && [ "$ESTIMATED" -gt 0 ]; then
+			echo "$ESTIMATED"
+			return 0
+		fi
+	fi
+
+	echo ""
+	return 1
+}
+
+# Ensure a video file is iOS-compatible (h264/hevc), converting when required.
+# Parameters:
+#   $1: INPUT_FILE - source video file
+#   $2: OUTPUT_FILE - converted output path if conversion is needed
+#   $3: CONVERT_VIDEO - 1 to allow conversion, 0 to fail on incompatible codec
+#   $4: CONTEXT_LABEL - human-readable label for log/error messages
+# Return variables:
+#   ensure_compatible_video_ret_file - final file path (input or converted output)
+ensure_compatible_video() {
+	local INPUT_FILE="$1"
+	local OUTPUT_FILE="$2"
+	local CONVERT_VIDEO="$3"
+	local CONTEXT_LABEL="$4"
+	local WIN_INPUT_FILE
+	WIN_INPUT_FILE=$(convert_path_for_tool "$INPUT_FILE")
+	local VIDEO_CODEC
+	VIDEO_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$WIN_INPUT_FILE" 2>/dev/null)
+	VIDEO_CODEC=$(echo "$VIDEO_CODEC" | tr -d '\r')
+	echo "${CONTEXT_LABEL} codec: '$VIDEO_CODEC' for $INPUT_FILE"
+
+	# Already compatible - no conversion needed
+	if [ "$VIDEO_CODEC" = "h264" ] || [ "$VIDEO_CODEC" = "hevc" ]; then
+		ensure_compatible_video_ret_file="$INPUT_FILE"
+		return 0
+	fi
+
+	if [ "$CONVERT_VIDEO" -ne 1 ]; then
+		die "${CONTEXT_LABEL} codec is not h264 or hevc and conversion is disabled"
+	fi
+
+	echo "Converting ${CONTEXT_LABEL} $INPUT_FILE to compatible format (h264 or h265)"
+	local BITRATE
+	BITRATE=$(infer_video_bitrate "$INPUT_FILE")
+	if ! [[ "$BITRATE" =~ ^[0-9]+$ ]]; then
+		echo "Warning: Could not determine source bitrate for conversion." >&2
+		echo "Tried: stream bit_rate, format bit_rate, and filesize/duration estimate." >&2
+		echo "Falling back to fixed-quality conversion for ${CONTEXT_LABEL} codec '$VIDEO_CODEC'." >&2
+		BITRATE=0
+	fi
+
+	echo "Source bitrate: ${BITRATE} bps"
+	echo "Trying video encoders in priority order..."
+	local ENABLE_H265="${ENABLE_H265:-0}"
+	local ENCODERS_STR
+	ENCODERS_STR=$(get_available_encoders_priority "${ENCODERS:-}" "$ENABLE_H265")
+	local ENCODER_LIST_RESULT=$?
+	if [ $ENCODER_LIST_RESULT -ne 0 ]; then
+		echo "Error: No suitable video encoder found (h264 or h265 required)" >&2
+		die "Cannot convert ${CONTEXT_LABEL}: no compatible encoder available. Please install ffmpeg with h264/h265 support."
+	fi
+
+	local ENCODER_LIST=()
+	eval "ENCODER_LIST=($ENCODERS_STR)"
+	local CONVERSION_SUCCESS=0
+	local LAST_ERROR=""
+	local ENCODER_SPEC
+	for ENCODER_SPEC in "${ENCODER_LIST[@]}"; do
+		local ENCODER_NAME ENCODER_TYPE IS_HARDWARE
+		ENCODER_NAME=$(echo "$ENCODER_SPEC" | cut -d: -f1)
+		ENCODER_TYPE=$(echo "$ENCODER_SPEC" | cut -d: -f2)
+		IS_HARDWARE=$(echo "$ENCODER_SPEC" | cut -d: -f3)
+		if [ -z "$ENCODER_NAME" ] || [ -z "$ENCODER_TYPE" ]; then
+			continue
+		fi
+		local HW_DESC="software"
+		if [ "$IS_HARDWARE" = "1" ]; then
+			HW_DESC="hardware-accelerated"
+		fi
+		echo "Trying encoder: $ENCODER_NAME ($ENCODER_TYPE, $HW_DESC)"
+		if convert_video_with_encoder "$INPUT_FILE" "$OUTPUT_FILE" "$ENCODER_NAME" "$ENCODER_TYPE" "$IS_HARDWARE" "$BITRATE"; then
+			if [ -f "$OUTPUT_FILE" ]; then
+				echo "Conversion successful with $ENCODER_NAME"
+				CONVERSION_SUCCESS=1
+				break
+			else
+				echo "Warning: Conversion reported success but output file not found, trying next encoder..." >&2
+				LAST_ERROR="Conversion succeeded but output file not found"
+			fi
+		else
+			echo "Encoder $ENCODER_NAME failed, trying next encoder..." >&2
+			LAST_ERROR="Encoder $ENCODER_NAME failed"
+		fi
+	done
+
+	if [ $CONVERSION_SUCCESS -eq 0 ]; then
+		echo "Error: All video encoders failed - cannot convert incompatible codec ($VIDEO_CODEC)" >&2
+		echo "The ${CONTEXT_LABEL} codec '$VIDEO_CODEC' is not compatible with iOS devices." >&2
+		echo "Tried ${#ENCODER_LIST[@]} encoder(s), all failed. Last error: $LAST_ERROR" >&2
+		die "${CONTEXT_LABEL} conversion failed - cannot proceed with incompatible codec. Please ensure ffmpeg has working h264/h265 encoders."
+	fi
+
+	ensure_compatible_video_ret_file="$OUTPUT_FILE"
+	return 0
+}
+
 # Function to download video from URL using yt-dlp
 # Parameters:
 #   $1: VIDEO_URL - URL to download
@@ -1342,6 +1546,9 @@ download_video() {
 	fi
 	
 	local YT_DLP_OPTS=()
+	if [ -n "${JS_RUNTIMES:-}" ]; then
+		YT_DLP_OPTS+=(--js-runtimes "$JS_RUNTIMES")
+	fi
 	if [ -n "$COOKIES_FILE" ]; then
 		# Use cookie file if provided (takes precedence over --firefox)
 		# If cookies file is read-only, copy it to a writable temp location
@@ -1428,103 +1635,9 @@ download_video() {
 			return 0
 		fi
 		
-		# Detect and convert video codec if needed
-		local VIDEO_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$WINFILE_INT" 2>/dev/null)
-		VIDEO_CODEC=$(echo "$VIDEO_CODEC" | tr -d '\r')
-		echo "Video codec: '$VIDEO_CODEC'"
-		
-		if [ "$VIDEO_CODEC" != "h264" ] && [ "$VIDEO_CODEC" != "hevc" ]; then
-			if [ "$CONVERT_VIDEO" -eq 1 ]; then
-				echo "Converting $OUT_FILE_INT to compatible format (h264 or h265)"
-				
-				# Get source bitrate
-				local BITRATE=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "$WINFILE_INT" 2>/dev/null)
-				BITRATE=$(echo "$BITRATE" | tr -d '\r' | tr -cd '[:digit:]')
-				
-				if [[ "$BITRATE" =~ ^[0-9]+$ ]]; then
-					echo "Source bitrate: ${BITRATE} bps"
-					
-					# Try conversion with fallback chain (if H265 enabled): h265 hardware > h264 hardware > h265 software > h264 software
-					# If H265 disabled (default): h264 hardware > h264 software
-					echo "Trying video encoders in priority order..."
-					
-					# Get list of available encoders in priority order
-					# Use ENCODERS from environment/command line if set, otherwise auto-detect
-					# ENABLE_H265 defaults to 0 (disabled, only H264)
-					local ENABLE_H265="${ENABLE_H265:-0}"
-					local ENCODERS_STR
-					ENCODERS_STR=$(get_available_encoders_priority "${ENCODERS:-}" "$ENABLE_H265")
-					local ENCODER_LIST_RESULT=$?
-					
-					if [ $ENCODER_LIST_RESULT -ne 0 ]; then
-						echo "Error: No suitable video encoder found (h264 or h265 required)" >&2
-						die "Cannot convert video: no compatible encoder available. Please install ffmpeg with h264/h265 support."
-					fi
-					
-					# Deserialize encoder list
-					local ENCODER_LIST=()
-					eval "ENCODER_LIST=($ENCODERS_STR)"
-					
-					local CONVERSION_SUCCESS=0
-					local LAST_ERROR=""
-					
-					# Try each encoder in order until one succeeds
-					for ENCODER_SPEC in "${ENCODER_LIST[@]}"; do
-						# Parse encoder spec: "encoder_name:type:hw"
-						local ENCODER_NAME ENCODER_TYPE IS_HARDWARE
-						ENCODER_NAME=$(echo "$ENCODER_SPEC" | cut -d: -f1)
-						ENCODER_TYPE=$(echo "$ENCODER_SPEC" | cut -d: -f2)
-						IS_HARDWARE=$(echo "$ENCODER_SPEC" | cut -d: -f3)
-						
-						if [ -z "$ENCODER_NAME" ] || [ -z "$ENCODER_TYPE" ]; then
-							continue
-						fi
-						
-						local HW_DESC="software"
-						if [ "$IS_HARDWARE" = "1" ]; then
-							HW_DESC="hardware-accelerated"
-						fi
-						
-						echo "Trying encoder: $ENCODER_NAME ($ENCODER_TYPE, $HW_DESC)"
-						
-						# Try conversion with this encoder
-						if convert_video_with_encoder "$OUT_FILE_INT" "$OUT_FILE" "$ENCODER_NAME" "$ENCODER_TYPE" "$IS_HARDWARE" "$BITRATE"; then
-							if [ -f "$OUT_FILE" ]; then
-								echo "Conversion successful with $ENCODER_NAME"
-								download_video_ret_files+=("$OUT_FILE")
-								download_video_ret_captions+=("$file_caption")
-								CONVERSION_SUCCESS=1
-								break
-							else
-								echo "Warning: Conversion reported success but output file not found, trying next encoder..." >&2
-								LAST_ERROR="Conversion succeeded but output file not found"
-							fi
-						else
-							echo "Encoder $ENCODER_NAME failed, trying next encoder..." >&2
-							LAST_ERROR="Encoder $ENCODER_NAME failed"
-							# Continue to next encoder
-						fi
-					done
-					
-					if [ $CONVERSION_SUCCESS -eq 0 ]; then
-						echo "Error: All video encoders failed - cannot convert incompatible codec ($VIDEO_CODEC)" >&2
-						echo "The video codec '$VIDEO_CODEC' is not compatible with iOS devices." >&2
-						echo "Tried ${#ENCODER_LIST[@]} encoder(s), all failed. Last error: $LAST_ERROR" >&2
-						die "Video conversion failed - cannot proceed with incompatible codec. Please ensure ffmpeg has working h264/h265 encoders."
-					fi
-				else
-					echo "Error: Could not determine source bitrate for conversion" >&2
-					echo "Cannot convert video codec '$VIDEO_CODEC' without knowing source bitrate." >&2
-					echo "The video codec '$VIDEO_CODEC' is not compatible with iOS devices." >&2
-					die "Cannot convert video: source bitrate could not be determined. Cannot proceed with incompatible codec."
-				fi
-			else
-				die "Video codec is not h264 or hevc and conversion is disabled"
-			fi
-		else
-			download_video_ret_files+=("$OUT_FILE_INT")
-			download_video_ret_captions+=("$file_caption")
-		fi
+		ensure_compatible_video "$OUT_FILE_INT" "$OUT_FILE" "$CONVERT_VIDEO" "Downloaded video"
+		download_video_ret_files+=("$ensure_compatible_video_ret_file")
+		download_video_ret_captions+=("$file_caption")
 		echo "Downloaded as video: '${download_video_ret_files[-1]}'"
 		download_video_ret_success=0
 	fi
@@ -3386,7 +3499,18 @@ process_media_items() {
 			if [ ! -f "$MEDIA_ITEM" ]; then
 				die "File does not exist: $MEDIA_ITEM"
 			fi
-			PROCESSED_FILES+=("$MEDIA_ITEM")
+			local FINAL_LOCAL_FILE="$MEDIA_ITEM"
+			local LOCAL_MIME_TYPE
+			LOCAL_MIME_TYPE=$(file --mime-type -b "$MEDIA_ITEM" 2>/dev/null || echo "")
+			if [[ "$LOCAL_MIME_TYPE" == video/* ]]; then
+				local LOCAL_TMPDIR
+				LOCAL_TMPDIR=$(mktemp -d)
+				add_to_cleanup "$LOCAL_TMPDIR"
+				local CONVERTED_LOCAL_FILE="${LOCAL_TMPDIR}/video_converted.mp4"
+				ensure_compatible_video "$MEDIA_ITEM" "$CONVERTED_LOCAL_FILE" "$CONVERT_VIDEO" "Local video"
+				FINAL_LOCAL_FILE="$ensure_compatible_video_ret_file"
+			fi
+			PROCESSED_FILES+=("$FINAL_LOCAL_FILE")
 			
 			# Use empty string for description for local files
 			local file_caption=$(build_caption "" "" "$APPEND_ORIGINAL_COMMENT")
@@ -3400,7 +3524,7 @@ process_media_items() {
 				local cleaned_source=$(cleanup_source_url "$SOURCE_CANDIDATE")
 				FILE_SOURCES+=("$cleaned_source")
 			fi
-			echo "Using local file: $MEDIA_ITEM"
+			echo "Using local file: $FINAL_LOCAL_FILE"
 		fi
 	done
 
