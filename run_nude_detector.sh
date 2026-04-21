@@ -1,9 +1,12 @@
 #!/bin/bash
-# Run nude_detector.py using the same venv as run_telegram_bot.
-# Does NOT create the venv; exits with 1 if venv does not exist.
+# Run nude_detector.py using the same venv as run_telegram_bot (default), or system Python when requested.
+# Does NOT create the venv; exits with 1 if venv does not exist (unless using system Python).
 # Usage: run_nude_detector.sh [nude_detector options] file1 [file2 ...]
 # When invoked from nostr_media_uploader.sh, NOSTR_MEDIA_UPLOADER_SCRIPT_DIR is set to the
 # repo directory (same folder as the original script/venv), so venv is found when run via symlink.
+#
+# Docker / flat install: set RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON=1 (or true/yes) to use python3 from PATH
+# instead of SCRIPT_DIR/venv_linux (venv_windows on Cygwin). Dependencies must be on that interpreter.
 #
 # Bash: no set -e / set -u / pipefail — failures are explicit (exit 1) after error messages.
 
@@ -71,20 +74,40 @@ get_venv_python() {
     fi
 }
 
-# Venv must exist; do not create it
-if ! [ -d "$VENV_DIR" ]; then
-    echo "Error: Virtual environment not found at $VENV_DIR" >&2
-    exit 1
-fi
-if ! [ -f "$VENV_DIR/bin/activate" ] && ! [ -f "$VENV_DIR/Scripts/activate" ]; then
-    echo "Error: Virtual environment invalid (no activate script) at $VENV_DIR" >&2
-    exit 1
+USE_SYSTEM_PY=0
+if [[ "${RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON:-}" == "1" ]] || [[ "${RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON:-}" == "true" ]] || [[ "${RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON:-}" == "yes" ]]; then
+	USE_SYSTEM_PY=1
 fi
 
-VENV_PYTHON=$(get_venv_python)
-if [ -z "$VENV_PYTHON" ] || ! [ -x "$VENV_PYTHON" ]; then
-    echo "Error: Python not found in virtual environment $VENV_DIR" >&2
-    exit 1
+VENV_PYTHON=""
+if [ "$USE_SYSTEM_PY" -eq 1 ]; then
+	if command -v python3 >/dev/null 2>&1; then
+		VENV_PYTHON=$(command -v python3)
+	elif command -v python >/dev/null 2>&1; then
+		VENV_PYTHON=$(command -v python)
+	else
+		echo "Error: RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON is set but neither python3 nor python was found in PATH" >&2
+		exit 1
+	fi
+	if [ -z "$VENV_PYTHON" ] || ! [ -x "$VENV_PYTHON" ]; then
+		echo "Error: system Python at '$VENV_PYTHON' is missing or not executable" >&2
+		exit 1
+	fi
+else
+	# Venv must exist; do not create it
+	if ! [ -d "$VENV_DIR" ]; then
+		echo "Error: Virtual environment not found at $VENV_DIR" >&2
+		exit 1
+	fi
+	if ! [ -f "$VENV_DIR/bin/activate" ] && ! [ -f "$VENV_DIR/Scripts/activate" ]; then
+		echo "Error: Virtual environment invalid (no activate script) at $VENV_DIR" >&2
+		exit 1
+	fi
+	VENV_PYTHON=$(get_venv_python)
+	if [ -z "$VENV_PYTHON" ] || ! [ -x "$VENV_PYTHON" ]; then
+		echo "Error: Python not found in virtual environment $VENV_DIR" >&2
+		exit 1
+	fi
 fi
 
 if [ ! -f "$NUDE_DETECTOR" ]; then
@@ -106,5 +129,9 @@ if [ "$OS_TYPE" = "windows" ]; then
     set -- "${CONVERTED_ARGS[@]}"
 fi
 
-echo "[run_nude_detector] VENV_DIR=$VENV_DIR PYTHON=$VENV_PYTHON script=$NUDE_DETECTOR_PY argc=$# (bash ${BASH_VERSION:-?}, no errexit)"
+if [ "$USE_SYSTEM_PY" -eq 1 ]; then
+	echo "[run_nude_detector] mode=system_python PYTHON=$VENV_PYTHON script=$NUDE_DETECTOR_PY argc=$# (bash ${BASH_VERSION:-?})"
+else
+	echo "[run_nude_detector] mode=venv VENV_DIR=$VENV_DIR PYTHON=$VENV_PYTHON script=$NUDE_DETECTOR_PY argc=$# (bash ${BASH_VERSION:-?})"
+fi
 exec "$VENV_PYTHON" "$NUDE_DETECTOR_PY" "$@"

@@ -50,6 +50,11 @@ COPY image_uploader.sh .
 COPY aiart.sh .
 RUN chmod +x image_uploader.sh aiart.sh
 
+# Auto-NSFW: same interpreter as bot (requirements.txt); run_nude_detector uses system python when env is set
+COPY run_nude_detector.sh nude_detector.py .
+RUN chmod +x run_nude_detector.sh
+ENV RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON=1
+
 # Create directory for .nostr configs (will be mounted)
 RUN mkdir -p /root/.nostr
 
@@ -60,6 +65,7 @@ RUN gallery-dl --version && \
     jq --version && \
     file --version | head -n 1 && \
     nak --version && \
+    python -c "import nudenet" && \
     echo "All dependencies installed successfully"
 
 # Set default command

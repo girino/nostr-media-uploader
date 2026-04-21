@@ -54,6 +54,8 @@ services:
     # Environment variables for NVIDIA GPU access
     environment:
       - TELEGRAM_BOT_CONFIG=/app/telegram_bot.yaml
+      # run_nude_detector.sh: use python3 from PATH (image pip-installs requirements.txt); unset or 0 to require venv_linux
+      - RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON=1
       # NVIDIA_VISIBLE_DEVICES: Controls which GPUs are visible to the container
       # - "all" (default): All GPUs are visible
       # - "0": Only first GPU is visible
@@ -81,8 +83,8 @@ services:
       - ./nostr_media_uploader.sh:/app/nostr_media_uploader.sh:ro
       - ./image_uploader.sh:/app/image_uploader.sh:ro
       - ./aiart.sh:/app/aiart.sh:ro
-      # Auto-NSFW: run_nude_detector.sh + nude_detector.py from repo (NOSTR_MEDIA_UPLOADER_SCRIPT_DIR=/app).
-      # venv_linux is not mounted; created under /app when your setup scripts run.
+      # Auto-NSFW: optional bind-mounts override Dockerfile copies of run_nude_detector.sh / nude_detector.py.
+      # RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON=1 uses image Python (no venv).
       - ./run_nude_detector.sh:/app/run_nude_detector.sh:ro
       - ./nude_detector.py:/app/nude_detector.py:ro
       # venv_linux: do not mount — created under /app by your setup scripts when needed (writable container layer).

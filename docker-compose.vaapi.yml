@@ -59,7 +59,7 @@ services:
       - ./nostr_media_uploader.sh:/app/nostr_media_uploader.sh:ro
       - ./image_uploader.sh:/app/image_uploader.sh:ro
       - ./aiart.sh:/app/aiart.sh:ro
-      # Auto-NSFW: mount detector scripts from repo; venv_linux lives in container filesystem when created by your scripts.
+      # Auto-NSFW: optional overrides for detector scripts; system Python when RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON=1.
       - ./run_nude_detector.sh:/app/run_nude_detector.sh:ro
       - ./nude_detector.py:/app/nude_detector.py:ro
     
@@ -69,6 +69,7 @@ services:
     # Environment variables
     environment:
       - TELEGRAM_BOT_CONFIG=/app/telegram_bot.yaml
+      - RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON=1
       - LIBVA_DRIVER_NAME=i965  # Intel Gen7 and older processors (i965 driver)
       # Optional: Set LIBVA_DRIVERS_PATH if using custom VAAPI drivers
       # - LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
