@@ -49,15 +49,20 @@ services:
       # Mount .nostr directory must be writable because of history files
       - ./.nostr:/root/.nostr:rw
       # Mount firefox_cookies.txt to be writable by the container
-      # yp-dlp tries to save cookies back to the file
+      # yt-dlp tries to save cookies back to the file
       - ./firefox_cookies.txt:/app/firefox_cookies.txt:rw
       # Mount telegram_bot.yaml config file
       - ./telegram_bot.yaml:/app/telegram_bot.yaml:ro
+      - ./telegram_bot.py:/app/telegram_bot.py:ro
       # Mount nostr_media_uploader.sh and other scripts (needed by the bot)
       # These override the copies in the image, allowing updates without rebuild
       - ./nostr_media_uploader.sh:/app/nostr_media_uploader.sh:ro
       - ./image_uploader.sh:/app/image_uploader.sh:ro
       - ./aiart.sh:/app/aiart.sh:ro
+      # Auto-NSFW: not in VAAPI Dockerfile — mount from repo (same as docker-compose.nvidia.yml).
+      - ./run_nude_detector.sh:/app/run_nude_detector.sh:ro
+      - ./nude_detector.py:/app/nude_detector.py:ro
+      - ./venv_linux:/app/venv_linux:rw
     
     # Pass cookies file as command line parameter
     command: python telegram_bot.py --cookies /app/firefox_cookies.txt

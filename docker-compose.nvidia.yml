@@ -74,11 +74,20 @@ services:
       - ./firefox_cookies.txt:/app/firefox_cookies.txt:rw
       # Mount telegram_bot.yaml config file
       - ./telegram_bot.yaml:/app/telegram_bot.yaml:ro
+      # Bot + uploader Python (image COPY is stale until rebuild without these mounts)
+      - ./telegram_bot.py:/app/telegram_bot.py:ro
       # Mount nostr_media_uploader.sh and other scripts (needed by the bot)
       # These override the copies in the image, allowing updates without rebuild
       - ./nostr_media_uploader.sh:/app/nostr_media_uploader.sh:ro
       - ./image_uploader.sh:/app/image_uploader.sh:ro
       - ./aiart.sh:/app/aiart.sh:ro
+      # Auto-NSFW: nostr_media_uploader calls run_nude_detector.sh next to itself (NOSTR_MEDIA_UPLOADER_SCRIPT_DIR=/app).
+      # These files are NOT in the NVIDIA Dockerfile today — they must be mounted from the repo checkout.
+      - ./run_nude_detector.sh:/app/run_nude_detector.sh:ro
+      - ./nude_detector.py:/app/nude_detector.py:ro
+      # run_nude_detector.sh expects ./venv_linux (Linux) relative to script dir — same layout as run_telegram_bot.sh.
+      # Create on the host first, e.g. ./run_telegram_bot.sh (Linux) or: python3 -m venv venv_linux && ./venv_linux/bin/pip install -r requirements.txt
+      - ./venv_linux:/app/venv_linux:rw
     
     # Pass cookies file as command line parameter
     command: python telegram_bot.py --cookies /app/firefox_cookies.txt
