@@ -1,4 +1,5 @@
 #!/bin/bash
+# Strict mode (set -e / set -u / pipefail) is not enabled — documented next to log_phase() below.
 
 # Script-level constants (read-only after definition)
 # Resolve script path (follow symlinks) so SCRIPT_DIR is correct when invoked via symlink
@@ -51,7 +52,9 @@ detect_os() {
 OS_TYPE="unknown"
 detect_os
 if [ "$OS_TYPE" = "unknown" ]; then
-	die "Unsupported operating system. This script requires Cygwin or Linux."
+	# Cannot use die() here — it is defined later in this file.
+	echo "Unsupported operating system. This script requires Cygwin or Linux."
+	exit 1
 fi
 readonly OS_TYPE
 
@@ -264,6 +267,19 @@ die() {
 	local msg="${1:-Unknown fatal error (die with empty message)}"
 	echo "$msg"
 	exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Logging + bash strict mode (documented)
+# - We intentionally do NOT use: set -e (errexit), set -u (nounset), set -o pipefail.
+# - Reasons: large script with optional env vars, probes, and pipelines where a
+#   non-zero status is normal; failures are handled with explicit checks and die().
+# - Subprocess: run_nude_detector.sh ends with exec python (no bash strict flags).
+# - image_uploader.sh has optional #set -e (disabled). aiart.sh: no strict flags.
+# - Set NOSTR_MEDIA_UPLOADER_VERBOSE=1 for extra per-file diagnostics in main().
+# ---------------------------------------------------------------------------
+log_phase() {
+	echo "[nostr_media_uploader $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?')] $*"
 }
 
 # Function to build caption from description candidate and extracted content
@@ -1516,6 +1532,11 @@ download_video() {
 	local DISABLE_HASH_CHECK="$7"
 	local DESCRIPTION_CANDIDATE="$8"
 	local SOURCE_CANDIDATE="$9"
+	local _url_log="$VIDEO_URL"
+	if [ "${#_url_log}" -gt 100 ]; then
+		_url_log="${_url_log:0:100}..."
+	fi
+	log_phase "download_video: start url='${_url_log}' CONVERT_VIDEO=$CONVERT_VIDEO"
 	
 	local DOWNLOADED=0
 	# Return variables (global, set at end of function)
@@ -1640,7 +1661,8 @@ download_video() {
 		ensure_compatible_video "$OUT_FILE_INT" "$OUT_FILE" "$CONVERT_VIDEO" "Downloaded video"
 		download_video_ret_files+=("$ensure_compatible_video_ret_file")
 		download_video_ret_captions+=("$file_caption")
-		echo "Downloaded as video: '${download_video_ret_files[-1]}'"
+		local _dv_n=${#download_video_ret_files[@]}
+		echo "Downloaded as video: '${download_video_ret_files[$((_dv_n - 1))]}'"
 		download_video_ret_success=0
 	fi
 }
@@ -3134,6 +3156,7 @@ calculate_file_hashes() {
 	# Deserialize array
 	local PROCESSED_FILES=()
 	eval "PROCESSED_FILES=($PROCESSED_FILES_STR)"
+	log_phase "calculate_file_hashes: ${#PROCESSED_FILES[@]} file(s), DISABLE_HASH_CHECK=$DISABLE_HASH_CHECK"
 	
 	local FILE_HASHES=()
 	local FILE
@@ -3142,17 +3165,16 @@ calculate_file_hashes() {
 	if [ $DISABLE_HASH_CHECK -eq 0 ]; then
 		# Process all processed files
 		for FILE in "${PROCESSED_FILES[@]}"; do
-			if [ -f "$FILE" ]; then
-				# Calculate file hash
-				FILE_HASH=$(sha256sum "$FILE" | awk '{print $1}')
-				# Check if file hash exists in history file
-				if check_history "$FILE_HASH" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
-					die "File hash already processed: $FILE_HASH"
-				fi
-				# Add file hash to the array
-				FILE_HASHES+=("$FILE_HASH")
-	fi
-done
+			if [ ! -f "$FILE" ]; then
+				die "Cannot compute hash: file is missing (was it deleted before upload?): $FILE"
+			fi
+			FILE_HASH=$(sha256sum "$FILE" | awk '{print $1}')
+			if check_history "$FILE_HASH" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"; then
+				die "File hash already processed: $FILE_HASH"
+			fi
+			FILE_HASHES+=("$FILE_HASH")
+		done
+		log_phase "calculate_file_hashes: computed ${#FILE_HASHES[@]} hash(es)"
 	fi
 	
 	calculate_file_hashes_ret_hashes=$(serialize_array "${FILE_HASHES[@]}")
@@ -3192,6 +3214,7 @@ process_media_items() {
 	# Deserialize arrays
 	local ALL_MEDIA_FILES=()
 	eval "ALL_MEDIA_FILES=($ALL_MEDIA_FILES_STR)"
+	log_phase "process_media_items: ${#ALL_MEDIA_FILES[@]} input path(s)/URL(s) CONVERT_VIDEO=$CONVERT_VIDEO USE_COOKIES_FF=$USE_COOKIES_FF"
 	
 	local GALLERY_DL_PARAMS=()
 	eval "GALLERY_DL_PARAMS=($GALLERY_DL_PARAMS_STR)"
@@ -3530,6 +3553,7 @@ process_media_items() {
 		fi
 	done
 
+	log_phase "process_media_items: finished loop, ${#PROCESSED_FILES[@]} file(s) staged for upload/hash"
 	if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
 		die "No files to upload"
 	fi
@@ -3582,6 +3606,7 @@ upload_and_publish_event() {
 	local NSFW_PARAM="${16}"
 	local NUDE_DETECTOR_BACKEND_PARAM="${17}"
 	local NUDE_DETECTOR_SENSITIVITY_PARAM="${18}"
+	log_phase "upload_and_publish_event: begin AUTO_NSFW=$AUTO_NSFW_PARAM NSFW=$NSFW_PARAM detector_backend=${NUDE_DETECTOR_BACKEND_PARAM:-} SEND_TO_RELAY=$SEND_TO_RELAY POW_DIFF=$POW_DIFF file_drop=${FILE_DROP_URL:+set}"
 	
 	# Deserialize arrays
 	local PROCESSED_FILES=()
@@ -3609,14 +3634,14 @@ upload_and_publish_event() {
 	if [ ${#PROCESSED_FILES[@]} -eq 0 ]; then
 		die "No files to upload"
 	fi
+	log_phase "upload_and_publish_event: ${#PROCESSED_FILES[@]} file(s), ${#BLOSSOMS_LIST[@]} blossom server(s) after filter"
 
 	# Auto-NSFW: run detector before uploading; on any error abort (do not upload)
 	local AUTO_NSFW_DETECTED=0
 	if [ "${AUTO_NSFW_PARAM:-0}" -eq 1 ]; then
 		local RUN_NUDE_DETECTOR="$SCRIPT_DIR_PARAM/run_nude_detector.sh"
 		if [ ! -f "$RUN_NUDE_DETECTOR" ]; then
-			echo "Error: auto-nsfw is set but run_nude_detector.sh not found at $RUN_NUDE_DETECTOR" >&2
-			exit 1
+			die "auto-nsfw is set but run_nude_detector.sh not found at $RUN_NUDE_DETECTOR"
 		fi
 		local DETECTOR_JSON DETECTOR_STDERR
 		DETECTOR_STDERR=$(mktemp -t nude_detector_stderr.XXXXXX 2>/dev/null || echo "/tmp/nude_detector_stderr.$$")
@@ -3624,18 +3649,24 @@ upload_and_publish_event() {
 		if [ -n "${NUDE_DETECTOR_SENSITIVITY_PARAM:-}" ]; then
 			DETECTOR_SENSITIVITY_ARGS=(--sensitivity "$NUDE_DETECTOR_SENSITIVITY_PARAM")
 		fi
+		log_phase "upload_and_publish_event: invoking run_nude_detector.sh backend=${NUDE_DETECTOR_BACKEND_PARAM:-sightengine} files=${#PROCESSED_FILES[@]} stderr_file=$DETECTOR_STDERR"
 		DETECTOR_JSON=$(NOSTR_MEDIA_UPLOADER_SCRIPT_DIR="$SCRIPT_DIR_PARAM" "$RUN_NUDE_DETECTOR" --backend "${NUDE_DETECTOR_BACKEND_PARAM:-sightengine}" "${DETECTOR_SENSITIVITY_ARGS[@]}" --full-results "${PROCESSED_FILES[@]}" 2>"$DETECTOR_STDERR")
 		local DETECTOR_EXIT=$?
 		if [ "$DETECTOR_EXIT" -ne 0 ]; then
-			echo "Error: auto-nsfw detector failed (exit $DETECTOR_EXIT). Aborting without uploading." >&2
+			# Must use stdout (not stderr): many Docker setups only attach stdout to logs.
+			echo "Error: auto-nsfw detector failed (exit $DETECTOR_EXIT). Aborting without uploading."
 			if [ -s "$DETECTOR_STDERR" ]; then
-				echo "Detector stderr:" >&2
-				cat "$DETECTOR_STDERR" >&2
+				echo "----- run_nude_detector stderr -----"
+				cat "$DETECTOR_STDERR"
+				echo "----- end detector stderr -----"
 			fi
+			local DETAIL
+			DETAIL=$(head -c 1200 "$DETECTOR_STDERR" 2>/dev/null | tr '\n' ' ' || true)
 			rm -f "$DETECTOR_STDERR"
-			exit 1
+			die "auto-nsfw detector failed (exit $DETECTOR_EXIT). ${DETAIL}"
 		fi
 		rm -f "$DETECTOR_STDERR"
+		log_phase "upload_and_publish_event: run_nude_detector exited 0, parsing JSON result"
 		echo "Auto-NSFW detector result: $DETECTOR_JSON"
 		if echo "$DETECTOR_JSON" | jq -e '.nsfw == true' >/dev/null 2>&1; then
 			AUTO_NSFW_DETECTED=1
@@ -3645,6 +3676,7 @@ upload_and_publish_event() {
 		local DETECTOR_RESULTS_JSON="$DETECTOR_JSON"
 	else
 		local DETECTOR_RESULTS_JSON=""
+		log_phase "upload_and_publish_event: auto-nsfw disabled (AUTO_NSFW_PARAM=$AUTO_NSFW_PARAM)"
 	fi
 
 	local UPLOAD_URLS=()
@@ -3731,6 +3763,7 @@ upload_and_publish_event() {
 	if [ ${#UPLOAD_URLS[@]} -ne ${#PROCESSED_FILES[@]} ]; then
 		die "Failed to upload all files (uploaded ${#UPLOAD_URLS[@]} of ${#PROCESSED_FILES[@]}). ${LAST_UPLOAD_FAIL_DETAIL:-Check stderr above for nak/blossom-cli errors.}"
 	fi
+	log_phase "upload_and_publish_event: all ${#UPLOAD_URLS[@]} file(s) uploaded; building kind 1 content"
 
 	# Build content for kind 1 event: interleaved URL -> caption -> URL -> caption, then sources at bottom
 	# For gallery images: all URLs first, then caption for the gallery
@@ -3771,6 +3804,7 @@ upload_and_publish_event() {
 	fi
 
 	# Create kind 1 event with nak
+	log_phase "upload_and_publish_event: creating kind 1 event (content length ${#CONTENT} chars, SEND_TO_RELAY=$SEND_TO_RELAY)"
 	echo "Creating kind 1 event with content length: ${#CONTENT}"
 	
 		NAK_CMD=("nak" "event" "--kind" "1" "-sec" "$KEY_DECRYPTED" "--pow" "$POW_DIFF")
@@ -3864,6 +3898,7 @@ upload_and_publish_event() {
 		if [ -n "$NAK_OUT" ]; then
 			echo "$NAK_OUT"
 		fi
+		log_phase "upload_and_publish_event: nak event succeeded (exit 0)"
 		echo "Successfully published kind 1 event"
 		return 0
 	else
@@ -3889,8 +3924,10 @@ update_history_file() {
 	local SEND_TO_RELAY="$5"
 	local DISABLE_HASH_CHECK="$6"
 	
+	log_phase "update_history_file: SEND_TO_RELAY=$SEND_TO_RELAY DISABLE_HASH_CHECK=$DISABLE_HASH_CHECK history=$HISTORY_FILE"
 	# Only update history if sent to relays and hash check is enabled
 	if [ "$SEND_TO_RELAY" -ne 1 ] || [ "$DISABLE_HASH_CHECK" -ne 0 ]; then
+		log_phase "update_history_file: skipped (requires SEND_TO_RELAY=1 and DISABLE_HASH_CHECK=0)"
 		return 1
 	fi
 	
@@ -3936,6 +3973,7 @@ update_history_file() {
 		write_to_history "$HISTORY_FILE" "$LOCAL_FILES_STR"
 	fi
 	
+	log_phase "update_history_file: wrote history (${#FILE_HASHES[@]} hashes, ${#ORIGINAL_URLS[@]} URLs, ${#LOCAL_FILES[@]} local path(s))"
 	return 0
 }
 
@@ -4037,6 +4075,7 @@ main_copy_only() {
 #   $@ - command-line arguments
 main() {
 	# All variables declared as local
+	log_phase "main: start profile=$PROFILE_NAME bash=${BASH_VERSION:-?} (no set -e / set -u / pipefail — see header near log_phase)"
 	
 	# ========================================================================
 	# READ EXPORTED VARIABLES (read-only)
@@ -4062,7 +4101,9 @@ main() {
 	# ========================================================================
 	# VALIDATION
 	# ========================================================================
+	log_phase "main: validating configuration"
 	validate_configuration "$HISTORY_FILE" "$NSEC_KEY" "$KEY" "$NCRYPT_KEY"
+	log_phase "main: configuration OK"
 	
 	# ========================================================================
 	# PROCESS RELAYS AND BLOSSOMS
@@ -4103,13 +4144,16 @@ main() {
 	# CHECK MEDIA HISTORY (filename/URL) - before conversion to avoid converting files twice
 	# ========================================================================
 	local ORIGINAL_URLS_STR
+	log_phase "main: check_all_media_history (DISABLE_HASH_CHECK=$DISABLE_HASH_CHECK)"
 	check_all_media_history "$ALL_MEDIA_FILES_STR" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"
 	ORIGINAL_URLS_STR="$check_all_media_history_ret_original_urls"
+	log_phase "main: media history check done"
 	
 	# ========================================================================
 	# DECRYPT KEY
 	# ========================================================================
 	local KEY_DECRYPTED
+	log_phase "main: decrypt_key"
 	KEY_DECRYPTED=$(decrypt_key "$NSEC_KEY" "$NCRYPT_KEY" "$KEY" "$PASSWORD")
 	if [ $? -ne 0 ]; then
 		die "Decryption failed, key is empty"
@@ -4130,6 +4174,7 @@ main() {
 	local FILE_CAPTIONS_STR
 	local FILE_SOURCES_STR
 	local FILE_GALLERIES_STR
+	log_phase "main: process_media_items (downloads/conversions)"
 	process_media_items "$ALL_MEDIA_FILES_STR" "$HISTORY_FILE" "$CONVERT_VIDEO" \
 		"$USE_COOKIES_FF" "$COOKIES_FILE" "$APPEND_ORIGINAL_COMMENT" "$DISABLE_HASH_CHECK" \
 		"$DESCRIPTION_CANDIDATE" "$SOURCE_CANDIDATE" "$GALLERY_DL_PARAMS_STR" \
@@ -4138,29 +4183,48 @@ main() {
 	FILE_CAPTIONS_STR="$process_media_items_ret_captions"
 	FILE_SOURCES_STR="$process_media_items_ret_sources"
 	FILE_GALLERIES_STR="$process_media_items_ret_galleries"
+	log_phase "main: process_media_items done (serialized output length ${#PROCESSED_FILES_STR})"
+	if [ "${NOSTR_MEDIA_UPLOADER_VERBOSE:-0}" = 1 ]; then
+		local _vfiles=()
+		eval "_vfiles=($PROCESSED_FILES_STR)"
+		local _vf
+		for _vf in "${_vfiles[@]}"; do
+			if [ -f "$_vf" ]; then
+				log_phase "main(verbose): staged file OK: $_vf"
+			else
+				log_phase "main(verbose): staged path MISSING (not a regular file): $_vf"
+			fi
+		done
+	fi
 	
 	# ========================================================================
 	# CHECK ALREADY PROCESSED BY HASH (before upload and before moderation - do not spend tokens on duplicates)
 	# ========================================================================
 	local FILE_HASHES_STR
+	log_phase "main: calculate_file_hashes"
 	calculate_file_hashes "$PROCESSED_FILES_STR" "$HISTORY_FILE" "$DISABLE_HASH_CHECK"
 	FILE_HASHES_STR="$calculate_file_hashes_ret_hashes"
+	log_phase "main: calculate_file_hashes done"
 	
 	# ========================================================================
 	# UPLOAD AND PUBLISH EVENT (moderation then upload; already-processed check was done above)
 	# ========================================================================
 	local FILE_DROP_URL="${FILE_DROP_URL:-}"
 	local FILE_DROP_URL_PREFIX="${FILE_DROP_URL_PREFIX:-}"
+	log_phase "main: upload_and_publish_event AUTO_NSFW=${AUTO_NSFW:-0} NSFW=${NSFW:-0}"
 	upload_and_publish_event "$PROCESSED_FILES_STR" "$FILE_CAPTIONS_STR" "$FILE_SOURCES_STR" \
 		"$FILE_GALLERIES_STR" "$BLOSSOMS_LIST_STR" "$RELAYS_LIST" "$KEY_DECRYPTED" \
 		"$POW_DIFF" "$DISPLAY_SOURCE" "$SEND_TO_RELAY" "$DESCRIPTION_CANDIDATE" "$FILE_DROP_URL" "$FILE_DROP_URL_PREFIX" \
 		"$SCRIPT_DIR" "$AUTO_NSFW" "$NSFW" "$NUDE_DETECTOR_BACKEND" "${NUDE_DETECTOR_SENSITIVITY:-}"
+	log_phase "main: upload_and_publish_event completed successfully"
 	
 	# ========================================================================
 	# UPDATE HISTORY FILE
 	# ========================================================================
+	log_phase "main: update_history_file"
 	update_history_file "$HISTORY_FILE" "$FILE_HASHES_STR" "$ORIGINAL_URLS_STR" \
 		"$ALL_MEDIA_FILES_STR" "$SEND_TO_RELAY" "$DISABLE_HASH_CHECK"
+	log_phase "main: finished (exit 0 after this; EXIT trap runs cleanup)"
 
 	# Cleanup is called automatically via trap
 }

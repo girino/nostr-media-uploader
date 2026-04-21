@@ -1,4 +1,5 @@
 #!/bin/bash
+# No set -e / set -u / pipefail: this launcher uses explicit status checks so optional steps can fail softly.
 
 # Script to run the Telegram bot with virtual environment management
 # Checks if venv exists, creates/updates it if needed, then runs the bot

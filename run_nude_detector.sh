@@ -4,6 +4,8 @@
 # Usage: run_nude_detector.sh [nude_detector options] file1 [file2 ...]
 # When invoked from nostr_media_uploader.sh, NOSTR_MEDIA_UPLOADER_SCRIPT_DIR is set to the
 # repo directory (same folder as the original script/venv), so venv is found when run via symlink.
+#
+# Bash: no set -e / set -u / pipefail — failures are explicit (exit 1) after error messages.
 
 if [ -n "${NOSTR_MEDIA_UPLOADER_SCRIPT_DIR:-}" ] && [ -d "$NOSTR_MEDIA_UPLOADER_SCRIPT_DIR" ]; then
 	SCRIPT_DIR="$NOSTR_MEDIA_UPLOADER_SCRIPT_DIR"
@@ -104,4 +106,5 @@ if [ "$OS_TYPE" = "windows" ]; then
     set -- "${CONVERTED_ARGS[@]}"
 fi
 
+echo "[run_nude_detector] VENV_DIR=$VENV_DIR PYTHON=$VENV_PYTHON script=$NUDE_DETECTOR_PY argc=$# (bash ${BASH_VERSION:-?}, no errexit)"
 exec "$VENV_PYTHON" "$NUDE_DETECTOR_PY" "$@"

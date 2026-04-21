@@ -1,4 +1,5 @@
 #!/bin/bash
+# No set -e / set -u / pipefail (same style as nostr_media_uploader.sh): explicit checks and die/return.
 
 usage () {
     echo "Usage: $0 [--profile=PROFILE|-profile=PROFILE|-p=PROFILE] [--blossom=SERVER] [--file-drop=URL] [--tag=TAG] [--nsfw] [file1] [file2] ... [comment]"

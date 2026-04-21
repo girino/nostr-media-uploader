@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#set -e
+# set -e (errexit) intentionally off: many branches probe commands where non-zero exit is normal.
 BLOSSOMS=(
 	"https://blossom.primal.net"
 	"https://nostr.download"
