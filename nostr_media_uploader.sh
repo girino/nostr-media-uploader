@@ -234,14 +234,14 @@ add_to_cleanup() {
 
 # Function to delete temp files on exit
 cleanup() {
-	echo "Cleaning up..." >&2
+	echo "Cleaning up..."
 	# Clean up all files/directories listed in the cleanup array
 	for CLEANUP_ITEM in "${CLEANUP_FILES[@]}"; do
 		if [ -n "$CLEANUP_ITEM" ]; then
 			if [ -f "$CLEANUP_ITEM" ]; then
-				rm -f "$CLEANUP_ITEM" && echo "Deleted temp file $CLEANUP_ITEM" >&2
+				rm -f "$CLEANUP_ITEM" && echo "Deleted temp file $CLEANUP_ITEM"
 			elif [ -d "$CLEANUP_ITEM" ]; then
-				rm -rf "$CLEANUP_ITEM" && echo "Deleted temp directory $CLEANUP_ITEM" >&2
+				rm -rf "$CLEANUP_ITEM" && echo "Deleted temp directory $CLEANUP_ITEM"
 			fi
 		fi
 	done
@@ -250,17 +250,19 @@ cleanup() {
 	for PATTERN in "${CLEANUP_PATTERNS[@]}"; do
 		for TMP_DIR in /tmp/$PATTERN; do
 		if [ -d "$TMP_DIR" ]; then
-			rm -rf "$TMP_DIR" && echo "Deleted temp directory $TMP_DIR" >&2
+			rm -rf "$TMP_DIR" && echo "Deleted temp directory $TMP_DIR"
 		fi
 		done
 	done
-	echo "Cleanup done." >&2
+	echo "Cleanup done."
 }
-trap cleanup EXIT INT TERM
+
+# EXIT only: die() does not call cleanup, so cleanup runs once here (avoids duplicate cleanup on fatal exit).
+trap cleanup EXIT
 
 die() {
-	echo "$1" >&2
-	cleanup
+	local msg="${1:-Unknown fatal error (die with empty message)}"
+	echo "$msg"
 	exit 1
 }
 
@@ -3682,6 +3684,7 @@ upload_and_publish_event() {
 	fi
 	
 	# If file-drop not configured or failed, use blossom servers
+	local LAST_UPLOAD_FAIL_DETAIL=""
 	if [ ${#UPLOAD_URLS[@]} -eq 0 ]; then
 		# Check if we have any valid blossom servers
 		if [ ${#BLOSSOMS_LIST[@]} -eq 0 ]; then
@@ -3708,6 +3711,7 @@ upload_and_publish_event() {
 				upload_url=$(upload_file_to_blossom "$FILE" "$BLOSSOM" "$KEY_DECRYPTED")
 				if [ $? -ne 0 ]; then
 					upload_success=0
+					LAST_UPLOAD_FAIL_DETAIL="blossom=$BLOSSOM file=$FILE (nak/blossom-cli errors were printed to stderr just above)"
 					break
 				fi
 				UPLOAD_URLS+=("$upload_url")
@@ -3725,7 +3729,7 @@ upload_and_publish_event() {
 	
 	# Check if we successfully uploaded all files
 	if [ ${#UPLOAD_URLS[@]} -ne ${#PROCESSED_FILES[@]} ]; then
-		die "Failed to upload all files (uploaded ${#UPLOAD_URLS[@]} of ${#PROCESSED_FILES[@]})"
+		die "Failed to upload all files (uploaded ${#UPLOAD_URLS[@]} of ${#PROCESSED_FILES[@]}). ${LAST_UPLOAD_FAIL_DETAIL:-Check stderr above for nak/blossom-cli errors.}"
 	fi
 
 	# Build content for kind 1 event: interleaved URL -> caption -> URL -> caption, then sources at bottom
@@ -3852,15 +3856,19 @@ upload_and_publish_event() {
 	fi
 	
 	echo "${NAK_CMD[@]}"
-	"${NAK_CMD[@]}"
+	local NAK_OUT
+	NAK_OUT=$("${NAK_CMD[@]}" 2>&1)
 	RESULT=$?
 	
 	if [ $RESULT -eq 0 ]; then
+		if [ -n "$NAK_OUT" ]; then
+			echo "$NAK_OUT"
+		fi
 		echo "Successfully published kind 1 event"
 		return 0
 	else
-		echo "Failed to publish kind 1 event" >&2
-		die "Failed to publish kind 1 event"
+		echo "$NAK_OUT"
+		die "Failed to publish kind 1 event (nak exit $RESULT): $(echo "$NAK_OUT" | tr '\n' ' ' | head -c 900)"
 	fi
 }
 
