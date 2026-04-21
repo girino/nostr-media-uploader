@@ -234,14 +234,14 @@ add_to_cleanup() {
 
 # Function to delete temp files on exit
 cleanup() {
-	echo "Cleaning up..."
+	echo "Cleaning up..." >&2
 	# Clean up all files/directories listed in the cleanup array
 	for CLEANUP_ITEM in "${CLEANUP_FILES[@]}"; do
 		if [ -n "$CLEANUP_ITEM" ]; then
 			if [ -f "$CLEANUP_ITEM" ]; then
-				rm -f "$CLEANUP_ITEM" && echo "Deleted temp file $CLEANUP_ITEM"
+				rm -f "$CLEANUP_ITEM" && echo "Deleted temp file $CLEANUP_ITEM" >&2
 			elif [ -d "$CLEANUP_ITEM" ]; then
-				rm -rf "$CLEANUP_ITEM" && echo "Deleted temp directory $CLEANUP_ITEM"
+				rm -rf "$CLEANUP_ITEM" && echo "Deleted temp directory $CLEANUP_ITEM" >&2
 			fi
 		fi
 	done
@@ -250,16 +250,16 @@ cleanup() {
 	for PATTERN in "${CLEANUP_PATTERNS[@]}"; do
 		for TMP_DIR in /tmp/$PATTERN; do
 		if [ -d "$TMP_DIR" ]; then
-			rm -rf "$TMP_DIR" && echo "Deleted temp directory $TMP_DIR"
+			rm -rf "$TMP_DIR" && echo "Deleted temp directory $TMP_DIR" >&2
 		fi
 		done
 	done
-	echo "Cleanup done."
+	echo "Cleanup done." >&2
 }
 trap cleanup EXIT INT TERM
 
 die() {
-	echo "$1"
+	echo "$1" >&2
 	cleanup
 	exit 1
 }
@@ -2419,7 +2419,7 @@ upload_file_to_blossom() {
 			EXPIRATION="5m"
 		fi
 		
-		upload_output=$(blossom-cli upload -file "$FILE_WIN" -server "$BLOSSOM" -privkey "$KEY" -expiration "$EXPIRATION" 2>/dev/null)
+		upload_output=$(blossom-cli upload -file "$FILE_WIN" -server "$BLOSSOM" -privkey "$KEY" -expiration "$EXPIRATION" 2>&1)
 		RESULT=$?
 		if [ $RESULT -ne 0 ]; then
 			echo "Failed to upload file $FILE to $BLOSSOM with blossom-cli, trying with nak" >&2
@@ -2428,7 +2428,7 @@ upload_file_to_blossom() {
 	
 	# If blossom-cli not available or failed, try nak
 	if [ $RESULT -ne 0 ]; then
-		upload_output=$(nak blossom upload --server "$BLOSSOM" "$FILE_WIN" "--sec" "$KEY")
+		upload_output=$(nak blossom upload --server "$BLOSSOM" "$FILE_WIN" "--sec" "$KEY" 2>&1)
 		RESULT=$?
 	fi
 	

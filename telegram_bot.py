@@ -2013,6 +2013,25 @@ async def execute_script(cmd, cwd=None, timeout=None):
             logger.debug(f"Script stdout (first 500 chars): {stdout[:500]}")
         if stderr:
             logger.debug(f"Script stderr (first 500 chars): {stderr[:500]}")
+        if process.returncode != 0:
+            # INFO so failures are visible in default Docker / production logging
+            logger.info(
+                "nostr_media_uploader exited with code %s (stderr %s bytes, stdout %s bytes)",
+                process.returncode,
+                len(stderr or ""),
+                len(stdout or ""),
+            )
+            chunk = 2000
+            if stderr:
+                es = stderr or ""
+                logger.info("stderr (first %s chars):\n%s", chunk, es[:chunk])
+                if len(es) > chunk:
+                    logger.info("stderr (last %s chars):\n%s", chunk, es[-chunk:])
+            if stdout:
+                so = stdout or ""
+                logger.info("stdout (first %s chars):\n%s", chunk, so[:chunk])
+                if len(so) > chunk:
+                    logger.info("stdout (last %s chars):\n%s", chunk, so[-chunk:])
         
         return {
             'returncode': process.returncode,
@@ -2493,16 +2512,19 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
                     error_parts.append(f"Error:\n{result['stderr']}")
                 if result['stdout']:
                     error_parts.append(f"Output:\n{result['stdout']}")
-                
                 error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
-                
+                rc = result.get('returncode')
+                if rc is not None and rc != 0:
+                    error_msg = f"(script exit code {rc})\n\n{error_msg}"
                 MAX_ERROR_LENGTH = 3500
                 if len(error_msg) > MAX_ERROR_LENGTH:
-                    truncated_msg = error_msg[-MAX_ERROR_LENGTH:]
-                    first_newline = truncated_msg.find('\n')
-                    if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:
-                        truncated_msg = truncated_msg[first_newline+1:]
-                    error_display = f"❌ Error processing media group\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
+                    head_len = min(1600, MAX_ERROR_LENGTH // 2)
+                    tail_len = MAX_ERROR_LENGTH - head_len - 80
+                    truncated_msg = (
+                        f"{error_msg[:head_len]}\n\n... [middle omitted, {len(error_msg) - head_len - tail_len} chars] ...\n\n"
+                        f"{error_msg[-tail_len:]}"
+                    )
+                    error_display = f"❌ Error processing media group\n\n{truncated_msg}"
                 else:
                     error_display = f"❌ Error processing media group\n\n{error_msg}"
             
@@ -2995,25 +3017,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 else:
                     # Combine stderr and stdout for error messages (bash scripts often use both)
                     error_parts = []
-                if result['stderr']:
-                    error_parts.append(f"Error:\n{result['stderr']}")
-                if result['stdout']:
-                    error_parts.append(f"Output:\n{result['stdout']}")
-                
-                error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
-                
-                # Telegram has a 4096 character limit per message, so limit to ~3500 to leave room for prefix
-                MAX_ERROR_LENGTH = 3500
-                if len(error_msg) > MAX_ERROR_LENGTH:
-                    # Truncate from the beginning, keep the end (most important part with actual error)
-                    truncated_msg = error_msg[-MAX_ERROR_LENGTH:]
-                    # Try to truncate at a newline if possible (find first newline in truncated message)
-                    first_newline = truncated_msg.find('\n')
-                    if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:  # If we can find a newline in the first 20%
-                        truncated_msg = truncated_msg[first_newline+1:]
-                    error_display = f"❌ Error processing media file(s)\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
-                else:
-                    error_display = f"❌ Error processing media file(s)\n\n{error_msg}"
+                    if result['stderr']:
+                        error_parts.append(f"Error:\n{result['stderr']}")
+                    if result['stdout']:
+                        error_parts.append(f"Output:\n{result['stdout']}")
+                    error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
+                    rc = result.get('returncode')
+                    if rc is not None and rc != 0:
+                        error_msg = f"(script exit code {rc})\n\n{error_msg}"
+                    MAX_ERROR_LENGTH = 3500
+                    if len(error_msg) > MAX_ERROR_LENGTH:
+                        head_len = min(1600, MAX_ERROR_LENGTH // 2)
+                        tail_len = MAX_ERROR_LENGTH - head_len - 80
+                        truncated_msg = (
+                            f"{error_msg[:head_len]}\n\n... [middle omitted, {len(error_msg) - head_len - tail_len} chars] ...\n\n"
+                            f"{error_msg[-tail_len:]}"
+                        )
+                        error_display = f"❌ Error processing media file(s)\n\n{truncated_msg}"
+                    else:
+                        error_display = f"❌ Error processing media file(s)\n\n{error_msg}"
                 
                 if status_msg:
                     await send_message_with_retry(status_msg, error_display, edit_text=True)
@@ -3201,25 +3223,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 # Combine stderr and stdout for error messages (bash scripts often use both)
                 error_parts = []
-            if result['stderr']:
-                error_parts.append(f"Error:\n{result['stderr']}")
-            if result['stdout']:
-                error_parts.append(f"Output:\n{result['stdout']}")
-            
-            error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
-            
-            # Telegram has a 4096 character limit per message, so limit to ~3500 to leave room for prefix
-            MAX_ERROR_LENGTH = 3500
-            if len(error_msg) > MAX_ERROR_LENGTH:
-                # Truncate from the beginning, keep the end (most important part with actual error)
-                truncated_msg = error_msg[-MAX_ERROR_LENGTH:]
-                # Try to truncate at a newline if possible (find first newline in truncated message)
-                first_newline = truncated_msg.find('\n')
-                if first_newline > 0 and first_newline < MAX_ERROR_LENGTH * 0.2:  # If we can find a newline in the first 20%
-                    truncated_msg = truncated_msg[first_newline+1:]
-                error_display = f"❌ Error processing URL(s)\n\n... (truncated, full error in logs)\n\n{truncated_msg}"
-            else:
-                error_display = f"❌ Error processing URL(s)\n\n{error_msg}"
+                if result['stderr']:
+                    error_parts.append(f"Error:\n{result['stderr']}")
+                if result['stdout']:
+                    error_parts.append(f"Output:\n{result['stdout']}")
+                error_msg = "\n\n".join(error_parts) if error_parts else "Unknown error"
+                rc = result.get('returncode')
+                if rc is not None and rc != 0:
+                    error_msg = f"(script exit code {rc})\n\n{error_msg}"
+                # Telegram has a 4096 character limit per message, so limit to ~3500 to leave room for prefix
+                MAX_ERROR_LENGTH = 3500
+                if len(error_msg) > MAX_ERROR_LENGTH:
+                    # Keep start (often has the real error) and end (cleanup / last lines)
+                    head_len = min(1600, MAX_ERROR_LENGTH // 2)
+                    tail_len = MAX_ERROR_LENGTH - head_len - 80
+                    truncated_msg = (
+                        f"{error_msg[:head_len]}\n\n... [middle omitted, {len(error_msg) - head_len - tail_len} chars] ...\n\n"
+                        f"{error_msg[-tail_len:]}"
+                    )
+                    error_display = f"❌ Error processing URL(s)\n\n{truncated_msg}"
+                else:
+                    error_display = f"❌ Error processing URL(s)\n\n{error_msg}"
             
             if status_msg:
                 await send_message_with_retry(status_msg, error_display, edit_text=True)
