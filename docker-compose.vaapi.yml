@@ -59,10 +59,9 @@ services:
       - ./nostr_media_uploader.sh:/app/nostr_media_uploader.sh:ro
       - ./image_uploader.sh:/app/image_uploader.sh:ro
       - ./aiart.sh:/app/aiart.sh:ro
-      # Auto-NSFW: not in VAAPI Dockerfile — mount from repo (same as docker-compose.nvidia.yml).
+      # Auto-NSFW: mount detector scripts from repo; venv_linux lives in container filesystem when created by your scripts.
       - ./run_nude_detector.sh:/app/run_nude_detector.sh:ro
       - ./nude_detector.py:/app/nude_detector.py:ro
-      - ./venv_linux:/app/venv_linux:rw
     
     # Pass cookies file as command line parameter
     command: python telegram_bot.py --cookies /app/firefox_cookies.txt

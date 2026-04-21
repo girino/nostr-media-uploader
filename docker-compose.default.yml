@@ -26,10 +26,9 @@ services:
       - ./nostr_media_uploader.sh:/app/nostr_media_uploader.sh:ro
       - ./image_uploader.sh:/app/image_uploader.sh:ro
       - ./aiart.sh:/app/aiart.sh:ro
-      # Auto-NSFW (see run_nude_detector.sh): not baked into default image — mount from repo.
+      # Auto-NSFW: run_nude_detector.sh + nude_detector.py from repo; venv_linux is created in-container when your scripts run.
       - ./run_nude_detector.sh:/app/run_nude_detector.sh:ro
       - ./nude_detector.py:/app/nude_detector.py:ro
-      - ./venv_linux:/app/venv_linux:rw
     
     # Pass cookies file as command line parameter
     command: python telegram_bot.py --cookies /app/firefox_cookies.txt
