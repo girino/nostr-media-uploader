@@ -1598,8 +1598,19 @@ download_video() {
 	fi
 	
 	local YT_DLP_OPTS=()
-	if [ -n "${JS_RUNTIMES:-}" ]; then
-		YT_DLP_OPTS+=(--js-runtimes "$JS_RUNTIMES")
+	local EFFECTIVE_JS_RUNTIMES="${JS_RUNTIMES:-}"
+	if [ -z "$EFFECTIVE_JS_RUNTIMES" ]; then
+		if command -v deno >/dev/null 2>&1; then
+			local DENO_BIN
+			DENO_BIN=$(command -v deno)
+			if [ -n "$DENO_BIN" ]; then
+				EFFECTIVE_JS_RUNTIMES="deno:${DENO_BIN}"
+			fi
+		fi
+	fi
+	if [ -n "$EFFECTIVE_JS_RUNTIMES" ]; then
+		YT_DLP_OPTS+=(--js-runtimes "$EFFECTIVE_JS_RUNTIMES")
+		echo "yt-dlp JS runtime(s): $EFFECTIVE_JS_RUNTIMES" >&2
 	fi
 	if [ -n "$COOKIES_FILE" ]; then
 		# Use cookie file if provided (takes precedence over --firefox)
