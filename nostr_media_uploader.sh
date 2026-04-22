@@ -1623,6 +1623,11 @@ download_video() {
 		YT_DLP_OPTS+=(--js-runtimes "$EFFECTIVE_JS_RUNTIMES")
 		echo "yt-dlp JS runtime(s): $EFFECTIVE_JS_RUNTIMES" >&2
 	fi
+	# EJS solver scripts: ejs:npm (Deno/Bun on-the-fly) or ejs:github — see https://github.com/yt-dlp/yt-dlp/wiki/EJS
+	if [ -n "${YT_DLP_REMOTE_COMPONENTS:-}" ]; then
+		YT_DLP_OPTS+=(--remote-components "$YT_DLP_REMOTE_COMPONENTS")
+		echo "yt-dlp remote-components: $YT_DLP_REMOTE_COMPONENTS" >&2
+	fi
 	if [ -n "$COOKIES_FILE" ]; then
 		# Use cookie file if provided (takes precedence over --firefox)
 		# If cookies file is read-only, copy it to a writable temp location
@@ -2710,6 +2715,8 @@ usage() {
 	echo "  -cookies, --cookies FILE  Use cookies from specified file (Mozilla/Netscape format)"
 	echo "                    Takes precedence over --firefox option"
 	echo "  --firefox         Use cookies from Firefox browser"
+	echo "                    YouTube EJS (yt-dlp): profile env JS_RUNTIMES (e.g. deno:/usr/local/bin/deno),"
+	echo "                    YT_DLP_REMOTE_COMPONENTS (ejs:github or ejs:npm; Docker images default ejs:github)"
 	echo "  --encoders LIST   Comma-separated list of video encoders to use (e.g., libx264,libx265)"
 	echo "                    If not specified, automatically detects and uses available encoders"
 	echo "                    Supported encoders: libx264, libx265, hevc_qsv, h264_qsv,"

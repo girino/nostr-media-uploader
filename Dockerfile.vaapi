@@ -42,10 +42,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Python dependencies for nostr_media_uploader.sh
 # gallery-dl requires >= 1.30.6 for Facebook support
-# yt-dlp for video downloads
+# yt-dlp + yt-dlp-ejs: external JavaScript solver (EJS) for YouTube challenges; needs a JS runtime (Deno above)
+# https://github.com/yt-dlp/yt-dlp/wiki/EJS
 RUN pip install --no-cache-dir \
     gallery-dl==1.30.6 \
-    yt-dlp
+    yt-dlp \
+    yt-dlp-ejs
 
 # Copy nak binary from build stage
 COPY --from=nak-builder /go/bin/nak /usr/local/bin/nak
@@ -67,6 +69,8 @@ RUN chmod +x image_uploader.sh aiart.sh
 COPY run_nude_detector.sh nude_detector.py .
 RUN chmod +x run_nude_detector.sh
 ENV RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON=1
+# Fetch EJS challenge scripts from GitHub at runtime (override with ejs:npm if you prefer Deno/npm; unset to use wheel-only)
+ENV YT_DLP_REMOTE_COMPONENTS=ejs:github
 
 # Create directory for .nostr configs (will be mounted)
 RUN mkdir -p /root/.nostr
@@ -74,6 +78,7 @@ RUN mkdir -p /root/.nostr
 # Verify installations
 RUN gallery-dl --version && \
     yt-dlp --version && \
+    pip show yt-dlp-ejs >/dev/null && \
     deno --version && \
     ffmpeg -version | head -n 1 && \
     jq --version && \
