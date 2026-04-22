@@ -1965,6 +1965,13 @@ async def execute_script(cmd, cwd=None, timeout=None):
             logger.debug(f"Error closing process streams: {e}")
         
         if timed_out:
+            logger.error(
+                "execute_script: hit wall-clock limit (%ss); subprocess returncode=%r; stderr_len=%s stdout_len=%s",
+                timeout,
+                getattr(process, "returncode", None),
+                len(stderr_bytes or b""),
+                len(stdout_bytes or b""),
+            )
             # Determine the appropriate error message based on the reason
             # Use the stored interrupt reason from the exception handler
             if interrupt_reason:
@@ -2528,10 +2535,20 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
                 else:
                     error_display = f"❌ Error processing media group\n\n{error_msg}"
             
-            if status_msg:
-                await send_message_with_retry(status_msg, error_display, edit_text=True)
-            else:
-                await send_message_with_retry(first_message, error_display)
+            if result.get("timeout"):
+                logger.error(
+                    "nostr_media_uploader TIMEOUT after %ss (media group). stderr_len=%s stdout_len=%s",
+                    timeout,
+                    len(result.get("stderr") or ""),
+                    len(result.get("stdout") or ""),
+                )
+            await notify_script_failure(
+                first_message,
+                status_msg,
+                error_display,
+                is_timeout=bool(result.get("timeout")),
+                context_label="media group",
+            )
             logger.error(f"Error processing media group")
             sanitized_stderr = sanitize_subprocess_output(result['stderr'])
             sanitized_stdout = sanitize_subprocess_output(result['stdout'])
@@ -2549,6 +2566,48 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
                     os.unlink(temp_file)
             except Exception:
                 pass
+
+
+async def notify_script_failure(
+    anchor_message,
+    status_msg,
+    error_display: str,
+    *,
+    is_timeout: bool = False,
+    context_label: str = "script",
+) -> None:
+    """Tell the user the uploader failed or hit the time limit.
+
+    Prefer editing the \"Processing…\" status message; if that fails or returns
+    None (retries exhausted), send a new reply so failures are not silent.
+    """
+    tag = "TIMEOUT" if is_timeout else "FAILURE"
+    text = (error_display or "").strip()
+    if not text:
+        text = (
+            f"⏱️ Script execution timed out (see server logs)."
+            if is_timeout
+            else f"❌ {context_label} failed (see server logs)."
+        )
+    # Telegram hard limit for text messages
+    if len(text) > 4096:
+        text = text[:4090] + "\n…"
+
+    try:
+        sent = None
+        if status_msg:
+            sent = await send_message_with_retry(status_msg, text, edit_text=True)
+        else:
+            sent = await send_message_with_retry(anchor_message, text)
+        if sent is None:
+            logger.error("%s: Telegram update returned None after retries; sending new reply", tag)
+            await anchor_message.reply_text(text[:4096])
+    except Exception as e:
+        logger.error("%s: could not deliver Telegram notification (%s); sending fallback reply", tag, e)
+        try:
+            await anchor_message.reply_text(text[:4096])
+        except Exception as e2:
+            logger.error("%s: fallback reply also failed: %s", tag, e2)
 
 
 async def send_message_with_retry(message, text, max_retries=3, retry_delay=1.0, edit_text=False, **kwargs):
@@ -3037,10 +3096,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     else:
                         error_display = f"❌ Error processing media file(s)\n\n{error_msg}"
                 
-                if status_msg:
-                    await send_message_with_retry(status_msg, error_display, edit_text=True)
-                else:
-                    await send_message_with_retry(message, error_display)
+                if result.get("timeout"):
+                    logger.error(
+                        "nostr_media_uploader TIMEOUT after %ss (media files). stderr_len=%s stdout_len=%s",
+                        timeout,
+                        len(result.get("stderr") or ""),
+                        len(result.get("stdout") or ""),
+                    )
+                await notify_script_failure(
+                    message,
+                    status_msg,
+                    error_display,
+                    is_timeout=bool(result.get("timeout")),
+                    context_label="media file(s)",
+                )
                 logger.error(f"Error processing media files")
                 sanitized_stderr = sanitize_subprocess_output(result['stderr'])
                 sanitized_stdout = sanitize_subprocess_output(result['stdout'])
@@ -3245,10 +3314,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 else:
                     error_display = f"❌ Error processing URL(s)\n\n{error_msg}"
             
-            if status_msg:
-                await send_message_with_retry(status_msg, error_display, edit_text=True)
-            else:
-                await send_message_with_retry(message, error_display)
+            if result.get("timeout"):
+                logger.error(
+                    "nostr_media_uploader TIMEOUT after %ss (URLs). urls=%s stderr_len=%s stdout_len=%s",
+                    timeout,
+                    urls,
+                    len(result.get("stderr") or ""),
+                    len(result.get("stdout") or ""),
+                )
+            await notify_script_failure(
+                message,
+                status_msg,
+                error_display,
+                is_timeout=bool(result.get("timeout")),
+                context_label="URL(s)",
+            )
             logger.error(f"Error processing URLs {urls}")
             sanitized_stderr = sanitize_subprocess_output(result['stderr'])
             sanitized_stdout = sanitize_subprocess_output(result['stdout'])
