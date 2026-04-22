@@ -58,7 +58,7 @@ COPY aiart.sh .
 RUN chmod +x image_uploader.sh aiart.sh
 
 # Auto-NSFW: same interpreter as bot (requirements.txt); run_nude_detector uses system python when env is set
-COPY run_nude_detector.sh nude_detector.py .
+COPY run_nude_detector.sh nude_detector.py ./
 RUN chmod +x run_nude_detector.sh
 ENV RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON=1
 # Fetch EJS challenge scripts from GitHub at runtime (override with ejs:npm if you prefer Deno/npm; unset to use wheel-only)
