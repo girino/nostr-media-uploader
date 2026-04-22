@@ -16,12 +16,17 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     curl \
+    unzip \
     ffmpeg \
     jq \
     file \
     coreutils \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Deno for yt-dlp JavaScript challenge solving support
+RUN curl -fsSL https://deno.land/install.sh | sh -s -- --no-modify-path && \
+    ln -sf /root/.deno/bin/deno /usr/local/bin/deno
 
 # Install Python dependencies for telegram bot
 COPY requirements.txt .
@@ -61,6 +66,7 @@ RUN mkdir -p /root/.nostr
 # Verify installations
 RUN gallery-dl --version && \
     yt-dlp --version && \
+    deno --version && \
     ffmpeg -version | head -n 1 && \
     jq --version && \
     file --version | head -n 1 && \
