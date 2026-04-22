@@ -1,5 +1,5 @@
-# Build stage: Build nak using Go (requires Go >= 1.25)
-FROM golang:1.25 AS nak-builder
+# Build stage: Build nak using Go 1.26 (Debian bookworm)
+FROM golang:1.26-bookworm AS nak-builder
 
 WORKDIR /build
 

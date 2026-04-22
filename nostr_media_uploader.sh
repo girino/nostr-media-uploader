@@ -1597,7 +1597,7 @@ download_video() {
 		FORMATS='bestvideo[codec^=hevc]+bestaudio/bestvideo[codec^=avc]+bestaudio/best[codec^=hevc]/best[codec^=avc]/best'
 	fi
 	
-	local YT_DLP_OPTS=()
+	local YT_DLP_OPTS=(--no-playlist)
 	local EFFECTIVE_JS_RUNTIMES="${JS_RUNTIMES:-}"
 	if [ "$OS_TYPE" = "linux" ] && [ -n "$EFFECTIVE_JS_RUNTIMES" ]; then
 		# Linux/Docker cannot execute Windows-style runtime paths (e.g., C:\...\deno.exe).

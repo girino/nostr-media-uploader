@@ -1,19 +1,23 @@
-# Build stage: Build nak using Go (requires Go >= 1.25)
-FROM golang:1.25 AS nak-builder
+# Build stage: Build nak using Go 1.26, Debian bookworm (glibc) for consistency with runtime image
+FROM golang:1.26-bookworm AS nak-builder
 
 WORKDIR /build
+
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
 
 # Build nak from source
 RUN go install github.com/fiatjaf/nak@latest
 
-# Final stage: Python runtime with all dependencies
-FROM python:3.11-slim
+# Final stage: Python runtime with all dependencies (bookworm + full apt upgrade)
+FROM python:3.12-slim-bookworm
 
 # Set working directory
 WORKDIR /app
 
 # Install system dependencies required by nostr_media_uploader.sh
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && \
+    apt-get install -y --no-install-recommends \
     bash \
     curl \
     unzip \
