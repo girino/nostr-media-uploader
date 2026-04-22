@@ -1599,13 +1599,24 @@ download_video() {
 	
 	local YT_DLP_OPTS=()
 	local EFFECTIVE_JS_RUNTIMES="${JS_RUNTIMES:-}"
+	if [ "$OS_TYPE" = "linux" ] && [ -n "$EFFECTIVE_JS_RUNTIMES" ]; then
+		# Linux/Docker cannot execute Windows-style runtime paths (e.g., C:\...\deno.exe).
+		# Ignore such values and auto-detect a valid in-container runtime path below.
+		if [[ "$EFFECTIVE_JS_RUNTIMES" =~ [A-Za-z]:\\ ]] || [[ "$EFFECTIVE_JS_RUNTIMES" == *"\\"* ]]; then
+			echo "Warning: Ignoring JS_RUNTIMES with Windows path on Linux: $EFFECTIVE_JS_RUNTIMES" >&2
+			EFFECTIVE_JS_RUNTIMES=""
+		fi
+	fi
 	if [ -z "$EFFECTIVE_JS_RUNTIMES" ]; then
-		if command -v deno >/dev/null 2>&1; then
-			local DENO_BIN
+		local DENO_BIN=""
+		if is_running_in_docker && [ -x "/usr/local/bin/deno" ]; then
+			# Prefer explicit container path to avoid inherited host/Cygwin runtime paths.
+			DENO_BIN="/usr/local/bin/deno"
+		elif command -v deno >/dev/null 2>&1; then
 			DENO_BIN=$(command -v deno)
-			if [ -n "$DENO_BIN" ]; then
-				EFFECTIVE_JS_RUNTIMES="deno:${DENO_BIN}"
-			fi
+		fi
+		if [ -n "$DENO_BIN" ]; then
+			EFFECTIVE_JS_RUNTIMES="deno:${DENO_BIN}"
 		fi
 	fi
 	if [ -n "$EFFECTIVE_JS_RUNTIMES" ]; then
