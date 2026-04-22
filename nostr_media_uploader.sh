@@ -1172,6 +1172,12 @@ convert_video_with_encoder() {
 	local PRESET=""
 	local PIX_FMT=""
 	local EXTRA_OPTS=()
+	local INPUT_CODEC=""
+	local CUDA_DECODER=""
+
+	# Detect input codec so we can opportunistically enable hardware decoding.
+	# This is best-effort only; if unavailable, conversion still proceeds.
+	INPUT_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
 	
 	if [ "$ENCODER" = "hevc_qsv" ]; then
 		PRESET="slow"
@@ -1275,6 +1281,29 @@ convert_video_with_encoder() {
 	else
 		echo "Unknown encoder: $ENCODER" >&2
 		return 1
+	fi
+
+	# Prefer hardware decoding for NVENC when the matching CUVID decoder exists
+	# and successfully decodes this specific input on the current GPU.
+	# This avoids selecting unsupported paths (e.g., AV1 on older NVIDIA GPUs).
+	if [[ "$ENCODER" == *"_nvenc" ]] && [ -n "$INPUT_CODEC" ] && [ "$INPUT_CODEC" != "N/A" ]; then
+		CUDA_DECODER="${INPUT_CODEC}_cuvid"
+		if ffmpeg -decoders 2>/dev/null | grep -q "\\b${CUDA_DECODER}\\b"; then
+			local CUDA_DECODE_TEST_OUTPUT
+			CUDA_DECODE_TEST_OUTPUT=$(ffmpeg -v error -hwaccel cuda -c:v "$CUDA_DECODER" -i "$WIN_INPUT" -frames:v 1 -f null - 2>&1)
+			if [ $? -eq 0 ]; then
+				INPUT_OPTS=(-hwaccel cuda -c:v "$CUDA_DECODER")
+				echo "Using NVIDIA hardware decoding: ${CUDA_DECODER}" >&2
+			else
+				echo "NVIDIA decoder '${CUDA_DECODER}' is present but cannot decode this input/GPU, using software decode" >&2
+				if [ -n "$CUDA_DECODE_TEST_OUTPUT" ]; then
+					echo "Decoder probe error (tail):" >&2
+					echo "$CUDA_DECODE_TEST_OUTPUT" | tail -n 6 >&2
+				fi
+			fi
+		else
+			echo "NVIDIA hardware decoder not available for codec '${INPUT_CODEC}', using software decode" >&2
+		fi
 	fi
 	
 	# Common options for all encoders
