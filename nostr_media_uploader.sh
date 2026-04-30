@@ -3725,13 +3725,19 @@ upload_and_publish_event() {
 		fi
 		rm -f "$DETECTOR_STDERR"
 		log_phase "upload_and_publish_event: run_nude_detector exited 0, parsing JSON result"
-		echo "Auto-NSFW detector result: $DETECTOR_JSON"
-		if echo "$DETECTOR_JSON" | jq -e '.nsfw == true' >/dev/null 2>&1; then
+		# Normalize detector output in case helper logs leak to stdout before JSON.
+		local DETECTOR_JSON_CLEAN
+		DETECTOR_JSON_CLEAN=$(printf '%s\n' "$DETECTOR_JSON" | sed -n '/^[[:space:]]*[{[]/,$p')
+		if ! echo "$DETECTOR_JSON_CLEAN" | jq -e . >/dev/null 2>&1; then
+			die "auto-nsfw detector returned invalid JSON. First 300 bytes: $(printf '%s' "$DETECTOR_JSON" | head -c 300 | tr '\n' ' ')"
+		fi
+		echo "Auto-NSFW detector result: $DETECTOR_JSON_CLEAN"
+		if echo "$DETECTOR_JSON_CLEAN" | jq -e '.nsfw == true' >/dev/null 2>&1; then
 			AUTO_NSFW_DETECTED=1
 			echo "Auto-NSFW: detector reported nsfw, will mark as unsafe and add #nsfw"
 		fi
 		# Store detector results for later tag generation (filename -> {nsfw, top_class, unsafe})
-		local DETECTOR_RESULTS_JSON="$DETECTOR_JSON"
+		local DETECTOR_RESULTS_JSON="$DETECTOR_JSON_CLEAN"
 	else
 		local DETECTOR_RESULTS_JSON=""
 		log_phase "upload_and_publish_event: auto-nsfw disabled (AUTO_NSFW_PARAM=$AUTO_NSFW_PARAM)"

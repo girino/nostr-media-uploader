@@ -130,8 +130,8 @@ if [ "$OS_TYPE" = "windows" ]; then
 fi
 
 if [ "$USE_SYSTEM_PY" -eq 1 ]; then
-	echo "[run_nude_detector] mode=system_python PYTHON=$VENV_PYTHON script=$NUDE_DETECTOR_PY argc=$# (bash ${BASH_VERSION:-?})"
+	echo "[run_nude_detector] mode=system_python PYTHON=$VENV_PYTHON script=$NUDE_DETECTOR_PY argc=$# (bash ${BASH_VERSION:-?})" >&2
 else
-	echo "[run_nude_detector] mode=venv VENV_DIR=$VENV_DIR PYTHON=$VENV_PYTHON script=$NUDE_DETECTOR_PY argc=$# (bash ${BASH_VERSION:-?})"
+	echo "[run_nude_detector] mode=venv VENV_DIR=$VENV_DIR PYTHON=$VENV_PYTHON script=$NUDE_DETECTOR_PY argc=$# (bash ${BASH_VERSION:-?})" >&2
 fi
 exec "$VENV_PYTHON" "$NUDE_DETECTOR_PY" "$@"
