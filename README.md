@@ -170,6 +170,7 @@ For detailed installation instructions, see [INSTALLATION.md](INSTALLATION.md).
 ### Command-Line Options
 
 - `--convert` / `--noconvert`: Enable/disable video conversion (default: enabled)
+- `--force-reencode-h264` / `--reencode-h264`: Always re-encode h264/hevc at source-equivalent bitrate (auto-detection runs by default when converting)
 - `--norelay`: Don't send event to Nostr relays
 - `--nopow`: Disable proof of work
 - `--nocheck`: Disable hash check (allows re-uploading)

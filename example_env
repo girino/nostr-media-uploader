@@ -81,6 +81,10 @@ NSEC_KEY="nsec1..."
 #   ENCODERS="libx264"           # Use only libx264 (h264 software encoder)
 # ENCODERS=""
 
+# Force re-encode h264/hevc videos (e.g. Dailymotion) even when codec already matches.
+# Auto-detection of Apple-incompatible h264/hevc runs by default when conversion is enabled.
+# FORCE_REENCODE_H264=0
+
 # Disable sending events to relays (useful for testing)
 # Default: 1 (send to relays)
 # Set SEND_TO_RELAY=0, NO_RELAY=1, or DISABLE_RELAY=1 to disable

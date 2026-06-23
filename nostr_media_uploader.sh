@@ -1096,6 +1096,7 @@ get_available_encoders_priority() {
 #   $4: ENCODER_TYPE - "h265" or "h264"
 #   $5: IS_HARDWARE - "1" if hardware accelerated, "0" if software
 #   $6: BITRATE - source bitrate (will be adjusted based on encoder type)
+#   $7: EQUIVALENT_BITRATE - 1 to match source bitrate (h264/hevc re-encode), 0 for default multipliers
 # Returns: 0 on success, 1 on failure
 convert_video_with_encoder() {
 	local INPUT_FILE="$1"
@@ -1104,6 +1105,7 @@ convert_video_with_encoder() {
 	local ENCODER_TYPE="$4"
 	local IS_HARDWARE="$5"
 	local BITRATE="$6"
+	local EQUIVALENT_BITRATE="${7:-0}"
 	
 	local WIN_INPUT=$(convert_path_for_tool "$INPUT_FILE")
 	local WIN_OUTPUT=$(convert_path_for_tool "$OUTPUT_FILE")
@@ -1154,7 +1156,10 @@ convert_video_with_encoder() {
 	local BITRATE_MULTIPLIER
 	local TARGET_BITRATE=""
 	if [[ "$BITRATE" =~ ^[0-9]+$ ]] && [ "$BITRATE" -gt 0 ]; then
-		if [ "$ENCODER_TYPE" = "h265" ]; then
+		if [ "$EQUIVALENT_BITRATE" -eq 1 ]; then
+			# Re-encoding h264/hevc for Apple compatibility: keep source bitrate
+			BITRATE_MULTIPLIER=100
+		elif [ "$ENCODER_TYPE" = "h265" ]; then
 			# H265 is more efficient, use 1.5x bitrate
 			BITRATE_MULTIPLIER=150
 		else
@@ -1278,9 +1283,26 @@ convert_video_with_encoder() {
 		else
 			ENCODER_OPTS=(-c:v libx264 -b:v "${TARGET_BITRATE}" -preset "$PRESET")
 		fi
+		if [ "$EQUIVALENT_BITRATE" -eq 1 ]; then
+			EXTRA_OPTS+=(-profile:v high -level:v 4.1)
+		fi
 	else
 		echo "Unknown encoder: $ENCODER" >&2
 		return 1
+	fi
+
+	if [ "$EQUIVALENT_BITRATE" -eq 1 ] && [ "$ENCODER_TYPE" = "h264" ]; then
+		case "$ENCODER" in
+			h264_qsv|h264_nvenc|h264_videotoolbox|h264_amf|h264_vaapi|h264_v4l2m2m)
+				EXTRA_OPTS+=(-profile:v high -level:v 4.1)
+				;;
+		esac
+	elif [ "$EQUIVALENT_BITRATE" -eq 1 ] && [ "$ENCODER_TYPE" = "h265" ]; then
+		case "$ENCODER" in
+			hevc_qsv|hevc_nvenc|hevc_videotoolbox|hevc_amf|hevc_vaapi)
+				EXTRA_OPTS+=(-tag:v hvc1)
+				;;
+		esac
 	fi
 
 	# Prefer hardware decoding for NVENC when the matching CUVID decoder exists
@@ -1367,8 +1389,23 @@ convert_video_with_encoder() {
 		FFMPEG_CMD+=(-sar "$SAR")
 		echo "Setting sample aspect ratio: $SAR" >&2
 	fi
-	
-	FFMPEG_CMD+=(-movflags +faststart -c:a copy "$WIN_OUTPUT")
+
+	local AUDIO_OPTS=(-c:a copy)
+	if [ "$EQUIVALENT_BITRATE" -eq 1 ]; then
+		local AUDIO_CODEC AUDIO_BITRATE
+		AUDIO_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+		if [ -n "$AUDIO_CODEC" ] && [ "$AUDIO_CODEC" != "N/A" ] && [ "$AUDIO_CODEC" != "aac" ]; then
+			AUDIO_BITRATE=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -cd '[:digit:]')
+			if [[ "$AUDIO_BITRATE" =~ ^[0-9]+$ ]] && [ "$AUDIO_BITRATE" -gt 0 ]; then
+				AUDIO_OPTS=(-c:a aac -b:a "${AUDIO_BITRATE}")
+			else
+				AUDIO_OPTS=(-c:a aac -b:a 128k)
+			fi
+			echo "Re-encoding audio from ${AUDIO_CODEC} to AAC for iOS compatibility" >&2
+		fi
+	fi
+
+	FFMPEG_CMD+=(-movflags +faststart "${AUDIO_OPTS[@]}" "$WIN_OUTPUT")
 	
 	# Debug: Print the full ffmpeg command
 	echo "Debug: ffmpeg command: ffmpeg ${FFMPEG_CMD[*]}" >&2
@@ -1440,6 +1477,80 @@ infer_video_bitrate() {
 	return 1
 }
 
+# Detect h264/hevc files that are nominally compatible but fail on Apple devices
+# (common with Dailymotion downloads: high level, avc3 tag, non-AAC audio, etc.).
+# Parameters:
+#   $1: INPUT_FILE - source video file
+# Return variables:
+#   video_needs_ios_reencode_ret - 1 if re-encode recommended, 0 if already Apple-safe
+video_needs_ios_reencode() {
+	local INPUT_FILE="$1"
+	local WIN_INPUT
+	WIN_INPUT=$(convert_path_for_tool "$INPUT_FILE")
+	video_needs_ios_reencode_ret=0
+
+	local VIDEO_CODEC PROFILE LEVEL PIX_FMT CODEC_TAG FIELD_ORDER
+	VIDEO_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	PROFILE=$(ffprobe -v error -select_streams v:0 -show_entries stream=profile -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	LEVEL=$(ffprobe -v error -select_streams v:0 -show_entries stream=level -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	PIX_FMT=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	CODEC_TAG=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_tag_string -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	FIELD_ORDER=$(ffprobe -v error -select_streams v:0 -show_entries stream=field_order -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+
+	if [ "$VIDEO_CODEC" != "h264" ] && [ "$VIDEO_CODEC" != "hevc" ]; then
+		return 0
+	fi
+
+	local REASONS=()
+
+	if [ -n "$PIX_FMT" ] && [ "$PIX_FMT" != "N/A" ] && [ "$PIX_FMT" != "yuv420p" ]; then
+		REASONS+=("pixel format ${PIX_FMT} (iOS expects yuv420p)")
+	fi
+
+	if [ "$VIDEO_CODEC" = "h264" ]; then
+		if [[ "$LEVEL" =~ ^[0-9]+$ ]] && [ "$LEVEL" -gt 41 ]; then
+			REASONS+=("H.264 level ${LEVEL} exceeds iOS-friendly limit (4.1 / level 41)")
+		fi
+		if echo "$PROFILE" | grep -qiE '422|444|10'; then
+			REASONS+=("H.264 profile '${PROFILE}' is not supported on iOS")
+		fi
+		if [ "$CODEC_TAG" = "avc3" ]; then
+			REASONS+=("avc3 codec tag (iOS prefers avc1)")
+		fi
+	elif [ "$VIDEO_CODEC" = "hevc" ]; then
+		if echo "$PROFILE" | grep -qi 'Main 10'; then
+			REASONS+=("HEVC Main 10 profile is not supported on older iOS devices")
+		fi
+		if [ "$CODEC_TAG" = "hev1" ]; then
+			REASONS+=("hev1 codec tag (iOS prefers hvc1)")
+		fi
+		# HEVC level in ffprobe: 120=4.0, 123=4.1, 150=5.0, 153=5.1, 156=5.2
+		if [[ "$LEVEL" =~ ^[0-9]+$ ]] && [ "$LEVEL" -gt 150 ]; then
+			REASONS+=("HEVC level ${LEVEL} exceeds common iOS limits (5.0 / level 150)")
+		fi
+	fi
+
+	if [ -n "$FIELD_ORDER" ] && [ "$FIELD_ORDER" != "progressive" ] && [ "$FIELD_ORDER" != "unknown" ] && [ "$FIELD_ORDER" != "N/A" ]; then
+		REASONS+=("interlaced field order '${FIELD_ORDER}'")
+	fi
+
+	local AUDIO_CODEC
+	AUDIO_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	if [ -n "$AUDIO_CODEC" ] && [ "$AUDIO_CODEC" != "N/A" ] && [ "$AUDIO_CODEC" != "aac" ]; then
+		REASONS+=("audio codec '${AUDIO_CODEC}' (iOS MP4 expects AAC)")
+	fi
+
+	if [ ${#REASONS[@]} -gt 0 ]; then
+		video_needs_ios_reencode_ret=1
+		echo "Auto-detected Apple-incompatible ${VIDEO_CODEC} video:" >&2
+		local REASON
+		for REASON in "${REASONS[@]}"; do
+			echo "  - $REASON" >&2
+		done
+	fi
+	return 0
+}
+
 # Ensure a video file is iOS-compatible (h264/hevc), converting when required.
 # Parameters:
 #   $1: INPUT_FILE - source video file
@@ -1460,13 +1571,32 @@ ensure_compatible_video() {
 	VIDEO_CODEC=$(echo "$VIDEO_CODEC" | tr -d '\r')
 	echo "${CONTEXT_LABEL} codec: '$VIDEO_CODEC' for $INPUT_FILE"
 
-	# Already compatible - no conversion needed
+	local SKIP_CONVERSION=0
+	local EQUIVALENT_BITRATE=0
+
 	if [ "$VIDEO_CODEC" = "h264" ] || [ "$VIDEO_CODEC" = "hevc" ]; then
+		if [ "${FORCE_REENCODE_H264:-0}" -eq 1 ]; then
+			echo "Force re-encode enabled for ${VIDEO_CODEC}"
+			EQUIVALENT_BITRATE=1
+		else
+			video_needs_ios_reencode "$INPUT_FILE"
+			if [ "$video_needs_ios_reencode_ret" -eq 0 ]; then
+				SKIP_CONVERSION=1
+			else
+				EQUIVALENT_BITRATE=1
+			fi
+		fi
+	fi
+
+	if [ "$SKIP_CONVERSION" -eq 1 ]; then
 		ensure_compatible_video_ret_file="$INPUT_FILE"
 		return 0
 	fi
 
 	if [ "$CONVERT_VIDEO" -ne 1 ]; then
+		if [ "$VIDEO_CODEC" = "h264" ] || [ "$VIDEO_CODEC" = "hevc" ]; then
+			die "${CONTEXT_LABEL} is h264/hevc but not Apple-compatible and conversion is disabled (try without --noconvert, or use --force-reencode-h264)"
+		fi
 		die "${CONTEXT_LABEL} codec is not h264 or hevc and conversion is disabled"
 	fi
 
@@ -1509,7 +1639,7 @@ ensure_compatible_video() {
 			HW_DESC="hardware-accelerated"
 		fi
 		echo "Trying encoder: $ENCODER_NAME ($ENCODER_TYPE, $HW_DESC)"
-		if convert_video_with_encoder "$INPUT_FILE" "$OUTPUT_FILE" "$ENCODER_NAME" "$ENCODER_TYPE" "$IS_HARDWARE" "$BITRATE"; then
+		if convert_video_with_encoder "$INPUT_FILE" "$OUTPUT_FILE" "$ENCODER_NAME" "$ENCODER_TYPE" "$IS_HARDWARE" "$BITRATE" "$EQUIVALENT_BITRATE"; then
 			if [ -f "$OUTPUT_FILE" ]; then
 				echo "Conversion successful with $ENCODER_NAME"
 				CONVERSION_SUCCESS=1
@@ -2724,6 +2854,10 @@ usage() {
 	echo "                    Can also be set via ENCODERS environment variable in config file"
 	echo "  --enable-h265     Enable HEVC/H265 codecs (disabled by default, only H264 is used)"
 	echo "                    Can also be set via ENABLE_H265=1 environment variable in config file"
+	echo "  --force-reencode-h264, --reencode-h264"
+	echo "                    Re-encode h264/hevc videos even when codec matches (e.g. Dailymotion)"
+	echo "                    Uses source-equivalent bitrate; auto-detection runs by default when converting"
+	echo "                    Can also be set via FORCE_REENCODE_H264=1 environment variable in config file"
 	echo "  --file-drop URL  Use file-drop server for uploads (e.g., http://192.168.31.103:3232/upload)"
 	echo "                    If file-drop fails, falls back to blossom servers"
 	echo "                    Can also be set via FILE_DROP_URL environment variable in config file"
@@ -2914,6 +3048,7 @@ prepare_gallery_dl_params() {
 #   parse_command_line_ret_file_drop_url - file-drop server URL if --file-drop option was used
 #   parse_command_line_ret_file_drop_url_prefix - URL prefix if --file-drop-url-prefix option was used
 #   parse_command_line_ret_enable_h265 - 1 if --enable-h265 was used, 0 otherwise
+#   parse_command_line_ret_force_reencode_h264 - 1 if --force-reencode-h264 was used, 0 otherwise
 #   parse_command_line_ret_nsfw - 1 if --nsfw was used, 0 otherwise
 #   parse_command_line_ret_auto_nsfw - 1 if --auto-nsfw was used, 0 otherwise
 #   parse_command_line_ret_copy_only_dir - destination dir if --copy-only was used (else empty)
@@ -2936,6 +3071,7 @@ parse_command_line() {
 	local FILE_DROP_URL=""
 	local FILE_DROP_URL_PREFIX=""
 	local ENABLE_H265=0
+	local FORCE_REENCODE_H264=0
 	local NSFW=0
 	local AUTO_NSFW=0
 	local NUDE_DETECTOR_BACKEND="sightengine"
@@ -3056,6 +3192,8 @@ while (( "$#" )); do
 		shift  # shift to remove the prefix from the params
 	elif [[ "$PARAM" == "--enable-h265" || "$PARAM" == "-enable-h265" || "$PARAM" == "--enable-hevc" || "$PARAM" == "-enable-hevc" ]]; then
 		ENABLE_H265=1
+	elif [[ "$PARAM" == "--force-reencode-h264" || "$PARAM" == "-force-reencode-h264" || "$PARAM" == "--reencode-h264" || "$PARAM" == "-reencode-h264" ]]; then
+		FORCE_REENCODE_H264=1
 	elif [[ "$PARAM" == "--nsfw" || "$PARAM" == "-nsfw" ]]; then
 		NSFW=1
 	elif [[ "$PARAM" == "--auto-nsfw" || "$PARAM" == "-auto-nsfw" ]]; then
@@ -3147,6 +3285,7 @@ fi
 	parse_command_line_ret_file_drop_url="$FILE_DROP_URL"
 	parse_command_line_ret_file_drop_url_prefix="$FILE_DROP_URL_PREFIX"
 	parse_command_line_ret_enable_h265="$ENABLE_H265"
+	parse_command_line_ret_force_reencode_h264="$FORCE_REENCODE_H264"
 	parse_command_line_ret_nsfw="$NSFW"
 	parse_command_line_ret_auto_nsfw="$AUTO_NSFW"
 	parse_command_line_ret_nude_detector_backend="$NUDE_DETECTOR_BACKEND"
@@ -4337,6 +4476,7 @@ PARSED_ENCODERS="$parse_command_line_ret_encoders"
 PARSED_FILE_DROP_URL="$parse_command_line_ret_file_drop_url"
 PARSED_FILE_DROP_URL_PREFIX="$parse_command_line_ret_file_drop_url_prefix"
 PARSED_ENABLE_H265="$parse_command_line_ret_enable_h265"
+PARSED_FORCE_REENCODE_H264="$parse_command_line_ret_force_reencode_h264"
 PARSED_NSFW="$parse_command_line_ret_nsfw"
 PARSED_AUTO_NSFW="$parse_command_line_ret_auto_nsfw"
 PARSED_NUDE_DETECTOR_BACKEND="$parse_command_line_ret_nude_detector_backend"
@@ -4429,6 +4569,19 @@ elif [ -n "${ENABLE_H265:-}" ]; then
 else
 	# Default: disabled (only H264)
 	ENABLE_H265=0
+fi
+
+# Merge FORCE_REENCODE_H264: Command-line takes precedence over environment variable
+if [ "$PARSED_FORCE_REENCODE_H264" -eq 1 ]; then
+	FORCE_REENCODE_H264=1
+elif [ -n "${FORCE_REENCODE_H264:-}" ]; then
+	if [[ "${FORCE_REENCODE_H264}" == "1" ]] || [[ "${FORCE_REENCODE_H264}" == "true" ]] || [[ "${FORCE_REENCODE_H264}" == "yes" ]]; then
+		FORCE_REENCODE_H264=1
+	else
+		FORCE_REENCODE_H264=0
+	fi
+else
+	FORCE_REENCODE_H264=0
 fi
 
 # Merge: Use parsed command-line value if it was explicitly set (differs from default),
@@ -4590,6 +4743,7 @@ export PROFILE_NAME
 export FILE_DROP_URL
 export FILE_DROP_URL_PREFIX
 export ENABLE_H265
+export FORCE_REENCODE_H264
 export NSFW
 export AUTO_NSFW
 export NUDE_DETECTOR_BACKEND
