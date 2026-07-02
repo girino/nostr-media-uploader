@@ -18,3 +18,4 @@ venv_linux/
 .cache/
 docker-compose.yml
 telegram_bot.yaml*
+*.mp4

@@ -1478,16 +1478,18 @@ infer_video_bitrate() {
 }
 
 # Detect h264/hevc files that are nominally compatible but fail on Apple devices
-# (common with Dailymotion downloads: high level, avc3 tag, non-AAC audio, etc.).
+# (common with Dailymotion downloads: fragmented iso5 MP4, high level, avc3 tag, etc.).
 # Parameters:
 #   $1: INPUT_FILE - source video file
 # Return variables:
-#   video_needs_ios_reencode_ret - 1 if re-encode recommended, 0 if already Apple-safe
+#   video_needs_ios_reencode_ret - 1 if fix recommended, 0 if already Apple-safe
+#   video_needs_ios_fix_mode - "remux" (stream copy) or "reencode" when ret is 1
 video_needs_ios_reencode() {
 	local INPUT_FILE="$1"
 	local WIN_INPUT
 	WIN_INPUT=$(convert_path_for_tool "$INPUT_FILE")
 	video_needs_ios_reencode_ret=0
+	video_needs_ios_fix_mode=""
 
 	local VIDEO_CODEC PROFILE LEVEL PIX_FMT CODEC_TAG FIELD_ORDER
 	VIDEO_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
@@ -1501,54 +1503,106 @@ video_needs_ios_reencode() {
 		return 0
 	fi
 
-	local REASONS=()
+	local REENCODE_REASONS=()
+	local REMUX_REASONS=()
 
 	if [ -n "$PIX_FMT" ] && [ "$PIX_FMT" != "N/A" ] && [ "$PIX_FMT" != "yuv420p" ]; then
-		REASONS+=("pixel format ${PIX_FMT} (iOS expects yuv420p)")
+		REENCODE_REASONS+=("pixel format ${PIX_FMT} (iOS expects yuv420p)")
 	fi
 
 	if [ "$VIDEO_CODEC" = "h264" ]; then
 		if [[ "$LEVEL" =~ ^[0-9]+$ ]] && [ "$LEVEL" -gt 41 ]; then
-			REASONS+=("H.264 level ${LEVEL} exceeds iOS-friendly limit (4.1 / level 41)")
+			REENCODE_REASONS+=("H.264 level ${LEVEL} exceeds iOS-friendly limit (4.1 / level 41)")
 		fi
 		if echo "$PROFILE" | grep -qiE '422|444|10'; then
-			REASONS+=("H.264 profile '${PROFILE}' is not supported on iOS")
+			REENCODE_REASONS+=("H.264 profile '${PROFILE}' is not supported on iOS")
 		fi
 		if [ "$CODEC_TAG" = "avc3" ]; then
-			REASONS+=("avc3 codec tag (iOS prefers avc1)")
+			REENCODE_REASONS+=("avc3 codec tag (iOS prefers avc1)")
 		fi
 	elif [ "$VIDEO_CODEC" = "hevc" ]; then
 		if echo "$PROFILE" | grep -qi 'Main 10'; then
-			REASONS+=("HEVC Main 10 profile is not supported on older iOS devices")
+			REENCODE_REASONS+=("HEVC Main 10 profile is not supported on older iOS devices")
 		fi
 		if [ "$CODEC_TAG" = "hev1" ]; then
-			REASONS+=("hev1 codec tag (iOS prefers hvc1)")
+			REENCODE_REASONS+=("hev1 codec tag (iOS prefers hvc1)")
 		fi
 		# HEVC level in ffprobe: 120=4.0, 123=4.1, 150=5.0, 153=5.1, 156=5.2
 		if [[ "$LEVEL" =~ ^[0-9]+$ ]] && [ "$LEVEL" -gt 150 ]; then
-			REASONS+=("HEVC level ${LEVEL} exceeds common iOS limits (5.0 / level 150)")
+			REENCODE_REASONS+=("HEVC level ${LEVEL} exceeds common iOS limits (5.0 / level 150)")
 		fi
 	fi
 
 	if [ -n "$FIELD_ORDER" ] && [ "$FIELD_ORDER" != "progressive" ] && [ "$FIELD_ORDER" != "unknown" ] && [ "$FIELD_ORDER" != "N/A" ]; then
-		REASONS+=("interlaced field order '${FIELD_ORDER}'")
+		REENCODE_REASONS+=("interlaced field order '${FIELD_ORDER}'")
 	fi
 
 	local AUDIO_CODEC
 	AUDIO_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
 	if [ -n "$AUDIO_CODEC" ] && [ "$AUDIO_CODEC" != "N/A" ] && [ "$AUDIO_CODEC" != "aac" ]; then
-		REASONS+=("audio codec '${AUDIO_CODEC}' (iOS MP4 expects AAC)")
+		REENCODE_REASONS+=("audio codec '${AUDIO_CODEC}' (iOS MP4 expects AAC)")
 	fi
 
-	if [ ${#REASONS[@]} -gt 0 ]; then
+	# Container / MP4 structure checks (codec can be fine but iPad still won't play)
+	local MAJOR_BRAND COMPAT_BRANDS FMT_START
+	MAJOR_BRAND=$(ffprobe -v error -show_entries format_tags=major_brand -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	COMPAT_BRANDS=$(ffprobe -v error -show_entries format_tags=compatible_brands -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+	FMT_START=$(ffprobe -v error -show_entries format=start_time -of csv=p=0 "$WIN_INPUT" 2>/dev/null | tr -d '\r\n' | xargs)
+
+	if [ "$MAJOR_BRAND" = "iso5" ] || [ "$MAJOR_BRAND" = "iso6" ] || [ "$MAJOR_BRAND" = "dash" ]; then
+		REMUX_REASONS+=("MP4 major_brand '${MAJOR_BRAND}' (fragmented format; iOS prefers mp42/isom)")
+	fi
+	if [ -n "$COMPAT_BRANDS" ] && echo "$COMPAT_BRANDS" | grep -qE 'iso5|iso6'; then
+		REMUX_REASONS+=("compatible_brands '${COMPAT_BRANDS}' include iso5/iso6")
+	fi
+	if LC_ALL=C grep -aq 'moof' "$WIN_INPUT" 2>/dev/null; then
+		REMUX_REASONS+=("fragmented MP4 with moof segments (iOS prefers progressive mp4)")
+	fi
+	if [ -n "$FMT_START" ] && awk -v s="$FMT_START" 'BEGIN { exit !(s+0 > 0.001) }'; then
+		REMUX_REASONS+=("non-zero container start_time (${FMT_START}s)")
+	fi
+
+	local REASON
+	if [ ${#REENCODE_REASONS[@]} -gt 0 ] || [ ${#REMUX_REASONS[@]} -gt 0 ]; then
 		video_needs_ios_reencode_ret=1
-		echo "Auto-detected Apple-incompatible ${VIDEO_CODEC} video:" >&2
-		local REASON
-		for REASON in "${REASONS[@]}"; do
+		if [ ${#REENCODE_REASONS[@]} -gt 0 ]; then
+			video_needs_ios_fix_mode="reencode"
+		else
+			video_needs_ios_fix_mode="remux"
+		fi
+		echo "Auto-detected Apple-incompatible ${VIDEO_CODEC} video (${video_needs_ios_fix_mode}):" >&2
+		for REASON in "${REENCODE_REASONS[@]}" "${REMUX_REASONS[@]}"; do
 			echo "  - $REASON" >&2
 		done
 	fi
 	return 0
+}
+
+# Remux h264/hevc+AAC to progressive iOS-friendly MP4 without re-encoding video.
+# Parameters:
+#   $1: INPUT_FILE - source video file
+#   $2: OUTPUT_FILE - remuxed output path
+# Returns: 0 on success, 1 on failure
+remux_video_for_ios() {
+	local INPUT_FILE="$1"
+	local OUTPUT_FILE="$2"
+	local WIN_INPUT WIN_OUTPUT
+	WIN_INPUT=$(convert_path_for_tool "$INPUT_FILE")
+	WIN_OUTPUT=$(convert_path_for_tool "$OUTPUT_FILE")
+
+	echo "Remuxing to iOS-compatible progressive MP4 (stream copy, mp42 brand)..." >&2
+	local FFMPEG_OUTPUT
+	FFMPEG_OUTPUT=$(ffmpeg -y -i "$WIN_INPUT" -c copy -movflags +faststart -brand mp42 -metadata encoder= "$WIN_OUTPUT" 2>&1)
+	local FFMPEG_EXIT=$?
+	if [ $FFMPEG_EXIT -eq 0 ] && [ -f "$OUTPUT_FILE" ]; then
+		echo "Remux successful" >&2
+		return 0
+	fi
+	echo "Remux failed" >&2
+	if [ -n "$FFMPEG_OUTPUT" ]; then
+		echo "$FFMPEG_OUTPUT" | tail -n 15 >&2
+	fi
+	return 1
 }
 
 # Ensure a video file is iOS-compatible (h264/hevc), converting when required.
@@ -1573,16 +1627,19 @@ ensure_compatible_video() {
 
 	local SKIP_CONVERSION=0
 	local EQUIVALENT_BITRATE=0
+	local IOS_FIX_MODE=""
 
 	if [ "$VIDEO_CODEC" = "h264" ] || [ "$VIDEO_CODEC" = "hevc" ]; then
 		if [ "${FORCE_REENCODE_H264:-0}" -eq 1 ]; then
 			echo "Force re-encode enabled for ${VIDEO_CODEC}"
+			IOS_FIX_MODE="reencode"
 			EQUIVALENT_BITRATE=1
 		else
 			video_needs_ios_reencode "$INPUT_FILE"
 			if [ "$video_needs_ios_reencode_ret" -eq 0 ]; then
 				SKIP_CONVERSION=1
 			else
+				IOS_FIX_MODE="$video_needs_ios_fix_mode"
 				EQUIVALENT_BITRATE=1
 			fi
 		fi
@@ -1598,6 +1655,15 @@ ensure_compatible_video() {
 			die "${CONTEXT_LABEL} is h264/hevc but not Apple-compatible and conversion is disabled (try without --noconvert, or use --force-reencode-h264)"
 		fi
 		die "${CONTEXT_LABEL} codec is not h264 or hevc and conversion is disabled"
+	fi
+
+	if [ "$IOS_FIX_MODE" = "remux" ]; then
+		if remux_video_for_ios "$INPUT_FILE" "$OUTPUT_FILE"; then
+			ensure_compatible_video_ret_file="$OUTPUT_FILE"
+			return 0
+		fi
+		echo "Warning: remux failed, falling back to re-encode..." >&2
+		IOS_FIX_MODE="reencode"
 	fi
 
 	echo "Converting ${CONTEXT_LABEL} $INPUT_FILE to compatible format (h264 or h265)"
@@ -2857,6 +2923,7 @@ usage() {
 	echo "  --force-reencode-h264, --reencode-h264"
 	echo "                    Re-encode h264/hevc videos even when codec matches (e.g. Dailymotion)"
 	echo "                    Uses source-equivalent bitrate; auto-detection runs by default when converting"
+	echo "                    Auto-detect includes fragmented iso5 MP4 (moof) common from Dailymotion"
 	echo "                    Can also be set via FORCE_REENCODE_H264=1 environment variable in config file"
 	echo "  --file-drop URL  Use file-drop server for uploads (e.g., http://192.168.31.103:3232/upload)"
 	echo "                    If file-drop fails, falls back to blossom servers"
