@@ -23,13 +23,21 @@ script_path: ./nostr_media_uploader.sh
 #   disable_cookies_for_sites: [example.com]
 # disable_cookies_for_sites: []
 
-# Optional: Script execution timeout in seconds (default: 360 = 6 minutes)
+# Optional: Script execution timeout for Nostr upload channels (default: 360 = 6 minutes)
 # Scripts that take longer than this will be forcefully killed
 # Useful for preventing long waits on rate-limited sites (e.g., X.com/Twitter)
 # Can be specified as:
 #   - Integer: 360 (seconds)
-#   - String with unit: "6m" (6 minutes) or "360s" (360 seconds)
-# script_timeout: 360
+#   - String with unit: "6m", "360s", or "1h"
+# script_timeout: 360s
+
+# Optional: Timeout for copy-only channels (default: 1h)
+# Copy-only runs download/convert/remux without posting to Nostr (feature-length films, etc.)
+# Rule of thumb: about half the video length (e.g. 1h for a 2h film if encoding is slow)
+# URL posts add +1/3 of this value for download time (e.g. 1h base → 1h20m for URLs)
+# Supports: "1h", "90m", "3600s", or integer seconds
+# Per-channel override: set script_timeout on a copy_only_channels entry
+# copy_only_script_timeout: 1h
 
 # Optional: Path to Cygwin installation (e.g., C:\cygwin64 or F:\cygwin64)
 # If not specified, will try to auto-detect common locations
@@ -45,8 +53,9 @@ script_path: ./nostr_media_uploader.sh
 # If not specified, bot will return only the nevent string
 # nostr_client_url: https://snort.social/e/{nevent}
 
-# Channels configuration
+# Channels configuration (Nostr upload)
 # Each channel can have its own chat_id and profile_name
+# Per-channel auto_nsfw: false, or { engine: sightengine|nudenet|openai|falconsai [, sensitivity: low|medium|high ] }
 channels:
   # Example channel 1: using numeric chat ID
   channel1:
@@ -75,6 +84,28 @@ channels:
     profile_name: public_profile
     disable_cookies_for_sites: [facebook.com, instagram.com]  # Don't use cookies for these sites
 
+  # Example channel 6: with auto-NSFW moderation
+  channel6:
+    chat_id: -1003333333333
+    profile_name: moderated_profile
+    auto_nsfw:
+      engine: sightengine
+      sensitivity: low
+
+# Copy-only channels (download/convert only — no Nostr upload)
+# Messages are processed with: nostr_media_uploader.sh --copy-only <copy_only_dir>
+# Output files land in copy_only_dir (Cygwin path recommended when using bash on Windows)
+# Uses copy_only_script_timeout globally (default 1h); URL posts add +1/3 for download
+# Override per channel with script_timeout
+copy_only_channels:
+  # Example: Dailymotion / long videos for local playback (e.g. iPad)
+  copy_channel1:
+    chat_id: -1003928506989  # Get numeric ID from @RawDataBot
+    profile_name: girino      # ~/.nostr/<profile_name> for encoder/cookie settings
+    copy_only_dir: /home/user/exports/telegram_copy
+    # script_timeout: 2h      # optional; overrides copy_only_script_timeout for this channel
+
 # Note: If no channels are configured, the bot will only process messages
 # from the owner (owner_id). Messages from channels will be ignored.
-# Each channel MUST have a profile_name - there is no default.
+# Each channel (upload or copy-only) MUST have a profile_name — there is no default.
+# copy_only_channels entries MUST have copy_only_dir (or output_dir).

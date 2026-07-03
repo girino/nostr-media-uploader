@@ -68,6 +68,27 @@ URL_PATTERN = re.compile(
     r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
 )
 
+# Default script timeout for copy-only (download/remux of feature-length video)
+DEFAULT_COPY_ONLY_SCRIPT_TIMEOUT = 3600  # 1 hour (~half a 2h film if encoding is slow)
+
+
+def parse_script_timeout(value, default=360):
+    """Parse timeout from int/float or strings like 360, 6m, 90s, 8h."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        timeout_str = value.lower().strip()
+        if timeout_str.endswith('h'):
+            return int(float(timeout_str[:-1]) * 3600)
+        if timeout_str.endswith('m'):
+            return int(float(timeout_str[:-1]) * 60)
+        if timeout_str.endswith('s'):
+            return int(float(timeout_str[:-1]))
+        return int(float(timeout_str))
+    return default
+
 
 def load_config(config_path, use_firefox=True, cookies_file=None):
     """Load configuration from YAML file.
@@ -84,6 +105,12 @@ def load_config(config_path, use_firefox=True, cookies_file=None):
       channel2:
         chat_id: @channelname
         profile_name: another_profile
+    copy_only_channels:
+      copy_channel1:
+        chat_id: -1001234567890
+        profile_name: girino
+        copy_only_dir: /home/user/exports/telegram_copy
+        script_timeout: 2h  # optional per-channel override
     """
     if not os.path.exists(config_path):
         logger.error(f"Configuration file not found: {config_path}")
@@ -113,21 +140,11 @@ def load_config(config_path, use_firefox=True, cookies_file=None):
         # Don't raise error, just log warning - user might fix it later
     
     # Get script timeout (default: 6 minutes = 360 seconds)
-    script_timeout = config_data.get('script_timeout', 360)
-    # Convert to int if it's a number
-    if isinstance(script_timeout, (int, float)):
-        script_timeout = int(script_timeout)
-    elif isinstance(script_timeout, str):
-        # Support format like "6m" or "360s"
-        script_timeout_str = script_timeout.lower().strip()
-        if script_timeout_str.endswith('m'):
-            script_timeout = int(float(script_timeout_str[:-1]) * 60)
-        elif script_timeout_str.endswith('s'):
-            script_timeout = int(float(script_timeout_str[:-1]))
-        else:
-            script_timeout = int(float(script_timeout_str))
-    else:
-        script_timeout = 360  # Default fallback
+    script_timeout = parse_script_timeout(config_data.get('script_timeout'), default=360)
+    copy_only_script_timeout = parse_script_timeout(
+        config_data.get('copy_only_script_timeout'),
+        default=DEFAULT_COPY_ONLY_SCRIPT_TIMEOUT,
+    )
     
     return {
         'bot_token': config_data.get('bot_token'),
@@ -136,10 +153,12 @@ def load_config(config_path, use_firefox=True, cookies_file=None):
         'cygwin_root': config_data.get('cygwin_root'),  # Optional: path to Cygwin installation
         'nostr_client_url': config_data.get('nostr_client_url'),  # Optional: URL template for nostr client links
         'channels': config_data.get('channels', {}),
+        'copy_only_channels': config_data.get('copy_only_channels', {}),
         'use_firefox': use_firefox,
         'cookies_file': cookies_file,
         'disable_cookies_for_sites': config_data.get('disable_cookies_for_sites'),  # Optional: list of domains to disable cookies for
-        'script_timeout': script_timeout,  # Timeout for script execution in seconds (default: 360 = 6 minutes)
+        'script_timeout': script_timeout,  # Timeout for Nostr upload runs (default: 360 = 6 minutes)
+        'copy_only_script_timeout': copy_only_script_timeout,  # Timeout for copy-only (default: 1 hour)
         'nude_detector_backend': config_data.get('nude_detector_backend'),  # Optional: falconsai, nudenet, openai, sightengine
         'sightengine_api_user': config_data.get('sightengine_api_user'),
         'sightengine_api_secret': config_data.get('sightengine_api_secret'),
@@ -170,39 +189,49 @@ def get_auto_nsfw_config(channel_config, config):
     return False, None, None
 
 
+def get_copy_only_dir(channel_config):
+    """Return copy-only output directory when channel uses copy-only mode."""
+    if not channel_config:
+        return None
+    value = channel_config.get('copy_only_dir') or channel_config.get('output_dir')
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
 def find_channel_config(config, chat_id=None, chat_username=None):
     """Find channel configuration matching the given chat_id or username.
     
-    Channel config may include: profile_name, chat_id, auto_nsfw (false or {engine, sensitivity}),
-    nsfw, disable_cookies_for_sites.
+    Searches `channels` (Nostr upload) then `copy_only_channels` (download/convert only).
+    Channel config may include: profile_name, chat_id, copy_only_dir, auto_nsfw, nsfw, etc.
     Returns the channel config dict if found, None otherwise.
     """
-    channels = config.get('channels', {})
-    
     if not chat_id and not chat_username:
         return None
-    
+
     chat_id_str = str(chat_id) if chat_id else None
     chat_username_str = chat_username.lstrip('@') if chat_username else None
-    
-    # Search through channels for a match
-    for channel_name, channel_config in channels.items():
-        channel_chat_id = channel_config.get('chat_id')
-        if not channel_chat_id:
-            continue
-        
-        channel_chat_id_str = str(channel_chat_id).lstrip('@')
-        
-        # Match by numeric ID
-        if chat_id_str and chat_id_str == channel_chat_id_str:
-            logger.debug(f"Found channel config '{channel_name}' for chat_id={chat_id_str}")
-            return channel_config
-        
-        # Match by username
-        if chat_username_str and chat_username_str == channel_chat_id_str:
-            logger.debug(f"Found channel config '{channel_name}' for username={chat_username_str}")
-            return channel_config
-    
+
+    for section_name, channels in (
+        ('channels', config.get('channels', {})),
+        ('copy_only_channels', config.get('copy_only_channels', {})),
+    ):
+        for channel_name, channel_config in channels.items():
+            channel_chat_id = channel_config.get('chat_id')
+            if not channel_chat_id:
+                continue
+
+            channel_chat_id_str = str(channel_chat_id).lstrip('@')
+
+            if chat_id_str and chat_id_str == channel_chat_id_str:
+                logger.debug(f"Found {section_name} config '{channel_name}' for chat_id={chat_id_str}")
+                return channel_config
+
+            if chat_username_str and chat_username_str == channel_chat_id_str:
+                logger.debug(f"Found {section_name} config '{channel_name}' for username={chat_username_str}")
+                return channel_config
+
     return None
 
 
@@ -531,6 +560,102 @@ async def encode_to_nevent(event_id_hex):
         logger.warning(f"Failed to encode nevent using nak: {e}")
     
     return None
+
+
+def format_copy_only_success(stdout, stderr, copy_only_dir):
+    """Build Telegram message for successful copy-only script runs."""
+    combined = f"{stdout or ''}\n{stderr or ''}"
+    copied = re.findall(r'^Copied: (.+)$', combined, re.MULTILINE)
+    msg = f"✅ Copy-only finished\n📁 `{copy_only_dir}`"
+    if copied:
+        lines = [f"• `{path}`" for path in copied[:10]]
+        msg += "\n\n" + "\n".join(lines)
+        if len(copied) > 10:
+            msg += f"\n… and {len(copied) - 10} more"
+    return msg
+
+
+async def reply_script_success(message, status_msg, result, config, channel_config, fallback_label):
+    """Send Telegram reply after a successful nostr_media_uploader.sh run."""
+    logger.info(
+        "Script execution successful. stdout length: %d, stderr length: %d",
+        len(result.get('stdout', '')),
+        len(result.get('stderr', '')),
+    )
+    if result.get('stdout'):
+        sanitized_stdout = sanitize_subprocess_output(result['stdout'])
+        logger.info("Script stdout:\n%s", sanitized_stdout)
+    if result.get('stderr'):
+        sanitized_stderr = sanitize_subprocess_output(result['stderr'])
+        logger.info("Script stderr:\n%s", sanitized_stderr)
+
+    copy_only_dir = get_copy_only_dir(channel_config)
+    if copy_only_dir:
+        response_msg = format_copy_only_success(result.get('stdout', ''), result.get('stderr', ''), copy_only_dir)
+        if status_msg:
+            await send_message_with_retry(status_msg, response_msg, edit_text=True, parse_mode='Markdown')
+        else:
+            await send_message_with_retry(message, response_msg, parse_mode='Markdown')
+        logger.info("Copy-only processing finished: %s", copy_only_dir)
+        return
+
+    event_id = None
+    nevent = None
+    stdout = result.get('stdout', '')
+    stderr = result.get('stderr', '')
+
+    if stdout:
+        event_id = extract_event_id(stdout)
+        if event_id:
+            logger.info("Extracted event ID from stdout: %s", event_id)
+    if not event_id and stderr:
+        event_id = extract_event_id(stderr)
+        if event_id:
+            logger.info("Extracted event ID from stderr: %s", event_id)
+
+    if event_id:
+        nevent = await encode_to_nevent(event_id)
+        if nevent:
+            logger.info("Encoded to nevent: %s", nevent)
+        else:
+            logger.warning("Could not encode event ID to nevent: %s", event_id)
+    else:
+        logger.warning(
+            "Could not extract event ID from output. stdout length: %d, stderr length: %d",
+            len(stdout),
+            len(stderr),
+        )
+
+    if nevent:
+        if config.get('nostr_client_url'):
+            client_url_template = config['nostr_client_url']
+            if '{nevent}' in client_url_template:
+                client_url = client_url_template.format(nevent=nevent)
+            elif client_url_template.endswith('/'):
+                client_url = f"{client_url_template}e/{nevent}"
+            else:
+                client_url = f"{client_url_template}/e/{nevent}"
+            response_msg = f"✅ [View on Nostr]({client_url})\n\n`{nevent}`"
+            if status_msg:
+                await send_message_with_retry(status_msg, response_msg, edit_text=True, parse_mode='Markdown')
+            else:
+                await send_message_with_retry(message, response_msg, parse_mode='Markdown')
+            logger.info("Successfully processed, nevent: %s, client_url: %s", nevent, client_url)
+        else:
+            if status_msg:
+                await send_message_with_retry(status_msg, nevent, edit_text=True)
+            else:
+                await send_message_with_retry(message, nevent)
+            logger.info("Successfully processed, nevent: %s", nevent)
+        return
+
+    success_msg = f"✅ {fallback_label}"
+    if event_id:
+        success_msg += f"\nEvent ID: {event_id} (could not encode to nevent)"
+    if status_msg:
+        await send_message_with_retry(status_msg, success_msg, edit_text=True)
+    else:
+        await send_message_with_retry(message, success_msg)
 
 
 def is_cygwin():
@@ -909,7 +1034,7 @@ async def download_media_file(bot, file, file_extension=None, max_retries=3, ret
         return None
 
 
-def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None, auto_nsfw=False, nude_detector_backend='sightengine', nude_detector_sensitivity=None, sightengine_api_user=None, sightengine_api_secret=None, openai_api_key=None):
+def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None, auto_nsfw=False, nude_detector_backend='sightengine', nude_detector_sensitivity=None, sightengine_api_user=None, sightengine_api_secret=None, openai_api_key=None, copy_only_dir=None):
     """Build the command to execute nostr_media_uploader.sh.
     
     Args:
@@ -928,6 +1053,7 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
         sightengine_api_user: Sightengine API user (from config, passed when backend is sightengine)
         sightengine_api_secret: Sightengine API secret (from config)
         openai_api_key: OpenAI API key (from config, passed when backend is openai)
+        copy_only_dir: If set, run in copy-only mode (download/convert to this directory, no Nostr upload)
     """
     # Convert script path to absolute path
     script_path = Path(script_path)
@@ -955,9 +1081,14 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
     if disable_cookies_for_sites:
         logger.debug(f"Checking disable_cookies_for_sites: {disable_cookies_for_sites} against URLs: {urls}, result: {disable_cookies}")
     
-    # Build command: bash script_path -p profile_name [--cookies FILE|--firefox] [--nsfw] url1 url2 ... "extra_text"
+    # Build command: bash script_path -p profile_name [--copy-only DIR] [--cookies FILE|--firefox] [--nsfw] ...
     cmd = [bash_path, script_path, '-p', profile_name]
-    
+
+    if copy_only_dir:
+        copy_dest = convert_path_for_cygwin(copy_only_dir, config)
+        cmd.extend(['--copy-only', copy_dest])
+        logger.info("Adding --copy-only parameter with directory: %s", copy_dest)
+
     # Use cookies file if provided and not disabled (takes precedence over --firefox)
     if cookies_file and not disable_cookies:
         # Convert cookies file path to Cygwin path if needed
@@ -971,13 +1102,13 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
     elif disable_cookies:
         logger.info("Cookies disabled for this request (URL matches disable_cookies_for_sites pattern)")
     
-    # Add --nsfw if enabled
-    if nsfw:
+    # NSFW flags only apply to Nostr upload mode
+    if not copy_only_dir and nsfw:
         cmd.append('--nsfw')
         logger.info("Adding --nsfw parameter")
     
     # Add --auto-nsfw if enabled (channel config)
-    if auto_nsfw:
+    if not copy_only_dir and auto_nsfw:
         cmd.append('--auto-nsfw')
         cmd.extend(['--nude-detector-backend', nude_detector_backend])
         if nude_detector_sensitivity:
@@ -1578,7 +1709,23 @@ async def _kill_process_and_read_remaining_output(process, stdout_bytes, stderr_
 
 
 def get_script_timeout(config, channel_config, num_files, is_url_based=False):
-    """Compute effective script timeout: base + 20s per file if auto_nsfw, + 2 min if URL-based."""
+    """Compute effective script timeout in seconds."""
+    if get_copy_only_dir(channel_config):
+        if channel_config.get('script_timeout') is not None:
+            base = parse_script_timeout(channel_config.get('script_timeout'))
+        else:
+            base = config.get('copy_only_script_timeout', DEFAULT_COPY_ONLY_SCRIPT_TIMEOUT)
+        if is_url_based:
+            extra = base // 3
+            base += extra
+            logger.info(
+                "Copy-only timeout (URL): %d seconds (%.1f hours, includes +%d for download)",
+                base, base / 3600, extra,
+            )
+        else:
+            logger.info("Copy-only timeout: %d seconds (%.1f hours)", base, base / 3600)
+        return base
+
     base = config.get('script_timeout', 360)
     auto_nsfw_enabled, _, _ = get_auto_nsfw_config(channel_config, config)
     if auto_nsfw_enabled:
@@ -2407,6 +2554,7 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
             config.get('sightengine_api_user'),
             config.get('sightengine_api_secret'),
             config.get('openai_api_key'),
+            copy_only_dir=get_copy_only_dir(channel_config),
         )
         
         # Execute script with timeout (extra time for auto_nsfw: +20s per file)
@@ -2424,65 +2572,14 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
         
         # Format response (same as single media processing)
         if result['success']:
-            logger.info(f"Script execution successful. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
-            if result['stdout']:
-                sanitized_stdout = sanitize_subprocess_output(result['stdout'])
-                logger.info(f"Script stdout:\n{sanitized_stdout}")
-            if result['stderr']:
-                sanitized_stderr = sanitize_subprocess_output(result['stderr'])
-                logger.info(f"Script stderr:\n{sanitized_stderr}")
-            
-            event_id = None
-            nevent = None
-            
-            if result['stdout']:
-                event_id = extract_event_id(result['stdout'])
-                if event_id:
-                    logger.info(f"Extracted event ID from stdout: {event_id}")
-            
-            if not event_id and result['stderr']:
-                event_id = extract_event_id(result['stderr'])
-                if event_id:
-                    logger.info(f"Extracted event ID from stderr: {event_id}")
-            
-            if event_id:
-                nevent = await encode_to_nevent(event_id)
-                logger.info(f"Encoded to nevent: {nevent}")
-            else:
-                logger.warning(f"Could not extract event ID from output for media group")
-            
-            if nevent:
-                if config.get('nostr_client_url'):
-                    client_url_template = config['nostr_client_url']
-                    if '{nevent}' in client_url_template:
-                        client_url = client_url_template.format(nevent=nevent)
-                    else:
-                        if client_url_template.endswith('/'):
-                            client_url = f"{client_url_template}e/{nevent}"
-                        else:
-                            client_url = f"{client_url_template}/e/{nevent}"
-                    
-                    response_msg = f"✅ [View on Nostr]({client_url})\n\n`{nevent}`"
-                    if status_msg:
-                        await send_message_with_retry(status_msg, response_msg, edit_text=True, parse_mode='Markdown')
-                    else:
-                        await send_message_with_retry(first_message, response_msg, parse_mode='Markdown')
-                    logger.info(f"Successfully processed media group, nevent: {nevent}, client_url: {client_url}")
-                else:
-                    if status_msg:
-                        await send_message_with_retry(status_msg, nevent, edit_text=True)
-                    else:
-                        await send_message_with_retry(first_message, nevent)
-                    logger.info(f"Successfully processed media group, nevent: {nevent}")
-            else:
-                logger.warning(f"Could not extract event ID from output for media group")
-                success_msg = f"✅ Successfully processed media group with {len(media_files)} file(s)"
-                if event_id:
-                    success_msg += f"\nEvent ID: {event_id} (could not encode to nevent)"
-                if status_msg:
-                    await send_message_with_retry(status_msg, success_msg, edit_text=True)
-                else:
-                    await send_message_with_retry(first_message, success_msg)
+            await reply_script_success(
+                first_message,
+                status_msg,
+                result,
+                config,
+                channel_config,
+                f"Successfully processed media group with {len(media_files)} file(s)",
+            )
         else:
             # Check for timeout first
             if result.get('timeout'):
@@ -2651,12 +2748,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     
                     # Count channels
                     channels_count = len(new_config.get('channels', {}))
+                    copy_only_count = len(new_config.get('copy_only_channels', {}))
                     
                     # Build status message
                     status_parts = [
                         f"✅ Configuration reloaded successfully!",
                         f"",
                         f"Channels: {channels_count}",
+                        f"Copy-only channels: {copy_only_count}",
                         f"Script path: {new_config['script_path']}",
                     ]
                     if new_config.get('cookies_file'):
@@ -2665,7 +2764,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         status_parts.append(f"Use Firefox: {new_config.get('use_firefox', True)}")
                     
                     await message.reply_text("\n".join(status_parts))
-                    logger.info(f"Configuration reloaded successfully. Channels: {channels_count}")
+                    logger.info(f"Configuration reloaded successfully. Channels: {channels_count}, copy-only: {copy_only_count}")
                 except Exception as e:
                     error_msg = f"❌ Failed to reload configuration: {str(e)}"
                     logger.exception(f"Error reloading configuration: {e}")
@@ -2897,6 +2996,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 config.get('sightengine_api_user'),
                 config.get('sightengine_api_secret'),
                 config.get('openai_api_key'),
+                copy_only_dir=get_copy_only_dir(channel_config),
             )
             
             # Execute script with timeout (extra time for auto_nsfw: +20s per file)
@@ -2914,83 +3014,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
             # Format response (same as URL processing)
             if result['success']:
-                # Log stdout/stderr for debugging (always log, even on success)
-                logger.info(f"Script execution successful. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
-                if result['stdout']:
-                    sanitized_stdout = sanitize_subprocess_output(result['stdout'])
-                    logger.info(f"Script stdout:\n{sanitized_stdout}")
-                if result['stderr']:
-                    sanitized_stderr = sanitize_subprocess_output(result['stderr'])
-                    logger.info(f"Script stderr:\n{sanitized_stderr}")
-                
-                # Try to extract event ID and convert to nevent
-                event_id = None
-                nevent = None
-                
-                # Try stdout first
-                if result['stdout']:
-                    event_id = extract_event_id(result['stdout'])
-                    if event_id:
-                        logger.info(f"Extracted event ID from stdout: {event_id}")
-                
-                # If not found in stdout, try stderr
-                if not event_id and result['stderr']:
-                    event_id = extract_event_id(result['stderr'])
-                    if event_id:
-                        logger.info(f"Extracted event ID from stderr: {event_id}")
-                
-                # Encode to nevent if we found an event ID
-                if event_id:
-                    nevent = await encode_to_nevent(event_id)
-                    logger.info(f"Encoded to nevent: {nevent}")
-                else:
-                    logger.warning(f"Could not extract event ID from stdout or stderr. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
-                    if result['stdout']:
-                        sanitized_stdout = sanitize_subprocess_output(result['stdout'])
-                        logger.warning(f"stdout content (first 500 chars): {sanitized_stdout[:500]}")
-                    if result['stderr']:
-                        sanitized_stderr = sanitize_subprocess_output(result['stderr'])
-                        logger.warning(f"stderr content (first 500 chars): {sanitized_stderr[:500]}")
-                
-                if nevent:
-                    # Format response with nostr client link if configured
-                    if config.get('nostr_client_url'):
-                        # Format the client URL with the nevent
-                        client_url_template = config['nostr_client_url']
-                        # Replace {nevent} placeholder if present, otherwise append nevent
-                        if '{nevent}' in client_url_template:
-                            client_url = client_url_template.format(nevent=nevent)
-                        else:
-                            # If no placeholder, append /e/nevent or just nevent depending on URL
-                            if client_url_template.endswith('/'):
-                                client_url = f"{client_url_template}e/{nevent}"
-                            else:
-                                client_url = f"{client_url_template}/e/{nevent}"
-                        
-                        # Create clickable link using Markdown format
-                        response_msg = f"✅ [View on Nostr]({client_url})\n\n`{nevent}`"
-                        if status_msg:
-                            await send_message_with_retry(status_msg, response_msg, edit_text=True, parse_mode='Markdown')
-                        else:
-                            await send_message_with_retry(message, response_msg, parse_mode='Markdown')
-                        logger.info(f"Successfully processed media files, nevent: {nevent}, client_url: {client_url}")
-                    else:
-                        # Return only the nevent formatted ID if no client URL configured
-                        if status_msg:
-                            await send_message_with_retry(status_msg, nevent, edit_text=True)
-                        else:
-                            await send_message_with_retry(message, nevent)
-                        logger.info(f"Successfully processed media files, nevent: {nevent}")
-                else:
-                    # Fallback if we couldn't extract/encode event ID
-                    logger.warning(f"Could not extract event ID from output for media files")
-                    success_msg = f"✅ Successfully processed {len(media_files)} media file(s)"
-                    if event_id:
-                        success_msg += f"\nEvent ID: {event_id} (could not encode to nevent)"
-                    if status_msg:
-                        await send_message_with_retry(status_msg, success_msg, edit_text=True)
-                    else:
-                        await send_message_with_retry(message, success_msg)
+                await reply_script_success(
+                    message,
+                    status_msg,
+                    result,
+                    config,
+                    channel_config,
+                    f"Successfully processed {len(media_files)} media file(s)",
+                )
             else:
                 # Check for timeout first
                 if result.get('timeout'):
@@ -3110,6 +3141,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             config.get('sightengine_api_user'),
             config.get('sightengine_api_secret'),
             config.get('openai_api_key'),
+            copy_only_dir=get_copy_only_dir(channel_config),
         )
         
         # Execute script with timeout (extra: +20s per file if auto_nsfw, +2 min if URL-based)
@@ -3118,85 +3150,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         # Format response
         if result['success']:
-            # Log stdout/stderr for debugging (always log, even on success)
-            logger.info(f"Script execution successful. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
-            if result['stdout']:
-                # Output is already sanitized in execute_script, but sanitize again as safety measure
-                logger.info(f"Script stdout:\n{result['stdout']}")
-            if result['stderr']:
-                # Output is already sanitized in execute_script, but sanitize again as safety measure
-                logger.info(f"Script stderr:\n{result['stderr']}")
-            
-            # Try to extract event ID and convert to nevent
-            # Check both stdout and stderr, as the script might output to either
-            event_id = None
-            nevent = None
-            
-            # Try stdout first
-            if result['stdout']:
-                event_id = extract_event_id(result['stdout'])
-                if event_id:
-                    logger.info(f"Extracted event ID from stdout: {event_id}")
-            
-            # If not found in stdout, try stderr
-            if not event_id and result['stderr']:
-                event_id = extract_event_id(result['stderr'])
-                if event_id:
-                    logger.info(f"Extracted event ID from stderr: {event_id}")
-            
-            # Encode to nevent if we found an event ID
-            if event_id:
-                nevent = await encode_to_nevent(event_id)
-                logger.info(f"Encoded to nevent: {nevent}")
-            else:
-                logger.warning(f"Could not extract event ID from stdout or stderr. stdout length: {len(result['stdout'])}, stderr length: {len(result['stderr'])}")
-                if result['stdout']:
-                    sanitized_stdout = sanitize_subprocess_output(result['stdout'])
-                    logger.warning(f"stdout content (first 500 chars): {sanitized_stdout[:500]}")
-                if result['stderr']:
-                    sanitized_stderr = sanitize_subprocess_output(result['stderr'])
-                    logger.warning(f"stderr content (first 500 chars): {sanitized_stderr[:500]}")
-            
-            if nevent:
-                # Format response with nostr client link if configured
-                if config.get('nostr_client_url'):
-                    # Format the client URL with the nevent
-                    # Common formats: https://snort.social/e/{nevent} or https://primal.net/e/{nevent}
-                    client_url_template = config['nostr_client_url']
-                    # Replace {nevent} placeholder if present, otherwise append nevent
-                    if '{nevent}' in client_url_template:
-                        client_url = client_url_template.format(nevent=nevent)
-                    else:
-                        # If no placeholder, append /e/nevent or just nevent depending on URL
-                        if client_url_template.endswith('/'):
-                            client_url = f"{client_url_template}e/{nevent}"
-                        else:
-                            client_url = f"{client_url_template}/e/{nevent}"
-                    
-                    # Create clickable link using Markdown format
-                    response_msg = f"✅ [View on Nostr]({client_url})\n\n`{nevent}`"
-                    if status_msg:
-                        await send_message_with_retry(status_msg, response_msg, edit_text=True, parse_mode='Markdown')
-                    else:
-                        await send_message_with_retry(message, response_msg, parse_mode='Markdown')
-                    logger.info(f"Successfully processed URLs: {urls}, nevent: {nevent}, client_url: {client_url}")
-                else:
-                    # Return only the nevent formatted ID if no client URL configured
-                    if status_msg:
-                        await send_message_with_retry(status_msg, nevent, edit_text=True)
-                    else:
-                        await send_message_with_retry(message, nevent)
-                    logger.info(f"Successfully processed URLs: {urls}, nevent: {nevent}")
-            else:
-                # Fallback if we couldn't extract/encode event ID
-                logger.warning(f"Could not extract event ID from output for URLs: {urls}")
-                success_msg = f"✅ Successfully processed {len(urls)} URL(s)"
-                if event_id:
-                    success_msg += f"\nEvent ID: {event_id} (could not encode to nevent)"
-                if status_msg:
-                    await send_message_with_retry(status_msg, success_msg, edit_text=True)
-                else:
-                    await send_message_with_retry(message, success_msg)
+            await reply_script_success(
+                message,
+                status_msg,
+                result,
+                config,
+                channel_config,
+                f"Successfully processed {len(urls)} URL(s)",
+            )
         else:
             # Check for timeout first
             if result.get('timeout'):
@@ -3414,14 +3375,28 @@ def main() -> None:
         logger.info(f"Cookies file: {config['cookies_file']}")
     else:
         logger.info(f"Use Firefox: {config.get('use_firefox', True)}")
+    if config.get('copy_only_script_timeout'):
+        logger.info(
+            "Copy-only script timeout: %ss (%.1fh)",
+            config['copy_only_script_timeout'],
+            config['copy_only_script_timeout'] / 3600,
+        )
     channels = config.get('channels', {})
+    copy_only_channels = config.get('copy_only_channels', {})
     if channels:
         logger.info(f"Configured channels: {len(channels)}")
         for channel_name, channel_config in channels.items():
             chat_id = channel_config.get('chat_id', 'N/A')
             profile_name = channel_config.get('profile_name', 'N/A')
             logger.info(f"  - {channel_name}: chat_id={chat_id}, profile_name={profile_name}")
-    else:
+    if copy_only_channels:
+        logger.info(f"Configured copy-only channels: {len(copy_only_channels)}")
+        for channel_name, channel_config in copy_only_channels.items():
+            chat_id = channel_config.get('chat_id', 'N/A')
+            profile_name = channel_config.get('profile_name', 'N/A')
+            copy_dir = get_copy_only_dir(channel_config) or 'N/A'
+            logger.info(f"  - {channel_name}: chat_id={chat_id}, profile_name={profile_name}, copy_only_dir={copy_dir}")
+    if not channels and not copy_only_channels:
         logger.info("No channels configured - will only process messages from owner")
     logger.info("Bot is ready and listening for messages...")
     
