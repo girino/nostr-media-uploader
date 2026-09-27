@@ -1363,10 +1363,19 @@ convert_video_with_encoder() {
 		fi
 	fi
 	
+	# FFMPEG_THREADS is opt-in: when unset or 0, preserve ffmpeg's defaults.
+	# A positive integer limits both codec and filter worker threads.
+	local FFMPEG_THREAD_OPTS=()
+	if [[ "${FFMPEG_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
+		FFMPEG_THREAD_OPTS=(-threads "$FFMPEG_THREADS" -filter_threads "$FFMPEG_THREADS")
+	elif [ -n "${FFMPEG_THREADS:-}" ] && [ "$FFMPEG_THREADS" != "0" ]; then
+		echo "Warning: ignoring invalid FFMPEG_THREADS='$FFMPEG_THREADS' (expected a positive integer or 0)" >&2
+	fi
+
 	# Build ffmpeg command with comprehensive aspect ratio and resolution preservation
-	# This provides maximum hints to the blossom server for proper re-encoding
-	# INPUT_OPTS must come before -i, ENCODER_OPTS and EXTRA_OPTS come after -i
-	local FFMPEG_CMD=(-y "${INPUT_OPTS[@]}" -i "$WIN_INPUT" "${ENCODER_OPTS[@]}" "${EXTRA_OPTS[@]}")
+	# This provides maximum hints to the blossom server for proper re-encoding.
+	# INPUT_OPTS must come before -i, ENCODER_OPTS and EXTRA_OPTS come after -i.
+	local FFMPEG_CMD=(-y "${FFMPEG_THREAD_OPTS[@]}" "${INPUT_OPTS[@]}" -i "$WIN_INPUT" "${ENCODER_OPTS[@]}" "${EXTRA_OPTS[@]}")
 	
 	# For non-VAAPI encoders: add scale filter if not already in ENCODER_OPTS
 	if [ -n "$INPUT_WIDTH" ] && [ -n "$INPUT_HEIGHT" ] && [ "$INPUT_WIDTH" != "N/A" ] && [ "$INPUT_HEIGHT" != "N/A" ]; then

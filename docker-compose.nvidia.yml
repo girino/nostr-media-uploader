@@ -105,3 +105,33 @@ services:
     #         - driver: nvidia
     #           count: all
     #           capabilities: [gpu, compute, video]
+
+  telegram-bot-doramas:
+    build:
+      context: .
+      dockerfile: Dockerfile.nvidia
+    container_name: nostr-telegram-bot-doramas
+    restart: unless-stopped
+    cpus: "1.0"
+    runtime: nvidia
+    environment:
+      - TELEGRAM_BOT_CONFIG=/app/telegram_bot.doramas.yaml
+      - RUN_NUDE_DETECTOR_USE_SYSTEM_PYTHON=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+      # Default to one ffmpeg worker thread for doramas; set DORAMAS_FFMPEG_THREADS=0 to disable.
+      - FFMPEG_THREADS=${DORAMAS_FFMPEG_THREADS:-1}
+    volumes:
+      - ./.nostr:/root/.nostr:rw
+      - ./firefox_cookies.txt:/app/firefox_cookies.txt:rw
+      - ./telegram_bot.doramas.yaml:/app/telegram_bot.doramas.yaml:ro
+      - ./telegram_bot.py:/app/telegram_bot.py:ro
+      - ./nostr_media_uploader.sh:/app/nostr_media_uploader.sh:ro
+      - ./image_uploader.sh:/app/image_uploader.sh:ro
+      - ./aiart.sh:/app/aiart.sh:ro
+      - ./run_nude_detector.sh:/app/run_nude_detector.sh:ro
+      - ./nude_detector.py:/app/nude_detector.py:ro
+      - /zfs/datasets/doramas:/zfs/datasets/doramas:rw
+    command: python telegram_bot.py --cookies /app/firefox_cookies.txt
+    stdin_open: true
+    tty: true
