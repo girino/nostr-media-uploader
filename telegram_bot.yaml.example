@@ -103,6 +103,7 @@ copy_only_channels:
     chat_id: -1003928506989  # Get numeric ID from @RawDataBot
     profile_name: girino      # ~/.nostr/<profile_name> for encoder/cookie settings
     copy_only_dir: /home/user/exports/telegram_copy
+    # copy_only_convert_video: false  # Preserve original codec; default is true (convert when needed)
     # script_timeout: 2h      # optional; overrides copy_only_script_timeout for this channel
 
 # Note: If no channels are configured, the bot will only process messages

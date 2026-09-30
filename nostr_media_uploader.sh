@@ -1798,8 +1798,10 @@ download_video() {
 	local WINFILE=$(convert_path_for_tool "$OUT_FILE")
 	
 	local FORMATS='bestvideo[codec^=hevc]+bestaudio/bestvideo[codec^=avc]+bestaudio/best[codec^=hevc]/best[codec^=avc]/bestvideo+bestaudio/best'
-	if [ "$CONVERT_VIDEO" -eq 0 ]; then
+	if [ "$CONVERT_VIDEO" -eq 0 ] && [ "${COPY_ORIGINAL:-0}" -ne 1 ]; then
 		FORMATS='bestvideo[codec^=hevc]+bestaudio/bestvideo[codec^=avc]+bestaudio/best[codec^=hevc]/best[codec^=avc]/best'
+	elif [ "${COPY_ORIGINAL:-0}" -eq 1 ]; then
+		FORMATS='bestvideo+bestaudio/best'
 	fi
 	
 	local YT_DLP_OPTS=(--no-playlist)
@@ -1919,8 +1921,12 @@ download_video() {
 			return 0
 		fi
 		
-		ensure_compatible_video "$OUT_FILE_INT" "$OUT_FILE" "$CONVERT_VIDEO" "Downloaded video"
-		download_video_ret_files+=("$ensure_compatible_video_ret_file")
+		if [ "${COPY_ORIGINAL:-0}" -eq 1 ]; then
+			download_video_ret_files+=("$OUT_FILE_INT")
+		else
+			ensure_compatible_video "$OUT_FILE_INT" "$OUT_FILE" "$CONVERT_VIDEO" "Downloaded video"
+			download_video_ret_files+=("$ensure_compatible_video_ret_file")
+		fi
 		download_video_ret_captions+=("$file_caption")
 		local _dv_n=${#download_video_ret_files[@]}
 		echo "Downloaded as video: '${download_video_ret_files[$((_dv_n - 1))]}'"
@@ -2952,6 +2958,7 @@ usage() {
 	echo "  --sightengine-api-secret S Sightengine API secret (when backend is sightengine)"
 	echo "  --copy-only DIR         Download/convert media only; copy results to DIR (no upload, no nostr event)"
 	echo "                          Does not require nostr keys; history checks are skipped"
+	echo "  --copy-original         With --copy-only, preserve the source video codec without conversion"
 	echo
 	echo "Arguments:"
 	echo "  file|url          One or more paths to image or video files, or URLs to download videos"
@@ -3133,6 +3140,7 @@ parse_command_line() {
 	# Initialize default values (hardcoded defaults, NOT from environment)
 	# Environment variables will be merged later after loading the profile file
 	local CONVERT_VIDEO=1
+	local COPY_ORIGINAL=0
 	local SEND_TO_RELAY=1
 	local DISABLE_HASH_CHECK=0
 	local MAX_FILE_SEARCH=10
@@ -3197,6 +3205,10 @@ while (( "$#" )); do
 		CONVERT_VIDEO=1
 	elif [[ "$PARAM" == "--noconvert" || "$PARAM" == "-noconvert" ]]; then
 		CONVERT_VIDEO=0
+	elif [[ "$PARAM" == "--copy-original" || "$PARAM" == "-copy-original" ]]; then
+		# Copy-only mode: preserve the downloaded/local video without codec checks or re-encoding.
+		CONVERT_VIDEO=0
+		COPY_ORIGINAL=1
 	elif [[ "$PARAM" == "--norelay" || "$PARAM" == "-norelay" ]]; then
 		SEND_TO_RELAY=0
 	elif [[ "$PARAM" == "--nopow" || "$PARAM" == "-nopow" ]]; then
@@ -3345,6 +3357,7 @@ fi
 	# Set return variables
 	parse_command_line_ret_media_files=$(serialize_array "${ALL_MEDIA_FILES[@]}")
 	parse_command_line_ret_convert_video="$CONVERT_VIDEO"
+	parse_command_line_ret_copy_original="$COPY_ORIGINAL"
 	parse_command_line_ret_send_to_relay="$SEND_TO_RELAY"
 	parse_command_line_ret_disable_hash_check="$DISABLE_HASH_CHECK"
 	parse_command_line_ret_max_file_search="$MAX_FILE_SEARCH"
@@ -3805,8 +3818,10 @@ process_media_items() {
 				LOCAL_TMPDIR=$(mktemp -d)
 				add_to_cleanup "$LOCAL_TMPDIR"
 				local CONVERTED_LOCAL_FILE="${LOCAL_TMPDIR}/video_converted.mp4"
-				ensure_compatible_video "$MEDIA_ITEM" "$CONVERTED_LOCAL_FILE" "$CONVERT_VIDEO" "Local video"
-				FINAL_LOCAL_FILE="$ensure_compatible_video_ret_file"
+				if [ "${COPY_ORIGINAL:-0}" -ne 1 ]; then
+					ensure_compatible_video "$MEDIA_ITEM" "$CONVERTED_LOCAL_FILE" "$CONVERT_VIDEO" "Local video"
+					FINAL_LOCAL_FILE="$ensure_compatible_video_ret_file"
+				fi
 			fi
 			PROCESSED_FILES+=("$FINAL_LOCAL_FILE")
 			
@@ -4537,6 +4552,7 @@ parse_command_line "$@"
 PARSED_PROFILE_NAME="$parse_command_line_ret_profile_name"
 PARSED_MEDIA_FILES="$parse_command_line_ret_media_files"
 PARSED_CONVERT_VIDEO="$parse_command_line_ret_convert_video"
+PARSED_COPY_ORIGINAL="$parse_command_line_ret_copy_original"
 PARSED_SEND_TO_RELAY="$parse_command_line_ret_send_to_relay"
 PARSED_DISABLE_HASH_CHECK="$parse_command_line_ret_disable_hash_check"
 PARSED_MAX_FILE_SEARCH="$parse_command_line_ret_max_file_search"
@@ -4807,6 +4823,8 @@ export APPEND_ORIGINAL_COMMENT
 export USE_COOKIES_FF
 export SEND_TO_RELAY
 export CONVERT_VIDEO
+COPY_ORIGINAL="$PARSED_COPY_ORIGINAL"
+export COPY_ORIGINAL
 export DISABLE_HASH_CHECK
 export MAX_FILE_SEARCH
 export PASSWORD

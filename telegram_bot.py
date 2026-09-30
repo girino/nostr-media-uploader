@@ -1034,7 +1034,7 @@ async def download_media_file(bot, file, file_extension=None, max_retries=3, ret
         return None
 
 
-def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None, auto_nsfw=False, nude_detector_backend='sightengine', nude_detector_sensitivity=None, sightengine_api_user=None, sightengine_api_secret=None, openai_api_key=None, copy_only_dir=None):
+def build_command(profile_name, script_path, urls, extra_text, use_firefox=True, cookies_file=None, config=None, nsfw=False, disable_cookies_for_sites=None, auto_nsfw=False, nude_detector_backend='sightengine', nude_detector_sensitivity=None, sightengine_api_user=None, sightengine_api_secret=None, openai_api_key=None, copy_only_dir=None, copy_only_convert_video=True):
     """Build the command to execute nostr_media_uploader.sh.
     
     Args:
@@ -1054,6 +1054,7 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
         sightengine_api_secret: Sightengine API secret (from config)
         openai_api_key: OpenAI API key (from config, passed when backend is openai)
         copy_only_dir: If set, run in copy-only mode (download/convert to this directory, no Nostr upload)
+        copy_only_convert_video: Convert incompatible videos in copy-only mode (default: True)
     """
     # Convert script path to absolute path
     script_path = Path(script_path)
@@ -1088,6 +1089,9 @@ def build_command(profile_name, script_path, urls, extra_text, use_firefox=True,
         copy_dest = convert_path_for_cygwin(copy_only_dir, config)
         cmd.extend(['--copy-only', copy_dest])
         logger.info("Adding --copy-only parameter with directory: %s", copy_dest)
+        if not copy_only_convert_video:
+            cmd.append('--copy-original')
+            logger.info("Copy-only conversion disabled; preserving downloaded video codec")
 
     # Use cookies file if provided and not disabled (takes precedence over --firefox)
     if cookies_file and not disable_cookies:
@@ -2554,8 +2558,9 @@ async def process_media_group(media_group_id: str, messages: List, context: Cont
             config.get('sightengine_api_user'),
             config.get('sightengine_api_secret'),
             config.get('openai_api_key'),
-            copy_only_dir=get_copy_only_dir(channel_config),
-        )
+                copy_only_dir=get_copy_only_dir(channel_config),
+                copy_only_convert_video=channel_config.get('copy_only_convert_video', True),
+            )
         
         # Execute script with timeout (extra time for auto_nsfw: +20s per file)
         timeout = get_script_timeout(config, channel_config, len(media_files), is_url_based=False)
@@ -2996,8 +3001,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 config.get('sightengine_api_user'),
                 config.get('sightengine_api_secret'),
                 config.get('openai_api_key'),
-                copy_only_dir=get_copy_only_dir(channel_config),
-            )
+            copy_only_dir=get_copy_only_dir(channel_config),
+            copy_only_convert_video=channel_config.get('copy_only_convert_video', True),
+        )
             
             # Execute script with timeout (extra time for auto_nsfw: +20s per file)
             timeout = get_script_timeout(config, channel_config, len(media_files), is_url_based=False)
@@ -3142,6 +3148,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             config.get('sightengine_api_secret'),
             config.get('openai_api_key'),
             copy_only_dir=get_copy_only_dir(channel_config),
+            copy_only_convert_video=channel_config.get('copy_only_convert_video', True),
         )
         
         # Execute script with timeout (extra: +20s per file if auto_nsfw, +2 min if URL-based)
@@ -3453,4 +3460,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
