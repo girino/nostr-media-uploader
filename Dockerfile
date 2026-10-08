@@ -40,7 +40,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # gallery-dl requires >= 1.30.6 for Facebook support
 # yt-dlp + yt-dlp-ejs: external JavaScript solver (EJS) for YouTube challenges; needs a JS runtime (Deno above)
 # https://github.com/yt-dlp/yt-dlp/wiki/EJS
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --upgrade \
     gallery-dl==1.30.6 \
     yt-dlp \
     yt-dlp-ejs

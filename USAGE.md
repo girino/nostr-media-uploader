@@ -23,7 +23,7 @@ The main script for downloading media from URLs and uploading to Nostr.
 
 #### Video Conversion
 - `--convert`: Enable video conversion (default)
-- `--noconvert`: Disable video conversion
+- `--noconvert`: Disable conversion and preserve the original video without codec or iOS-compatibility validation
 
 #### Relay and Publishing
 - `--norelay`: Don't send event to Nostr relays (upload only)
@@ -288,4 +288,3 @@ For sites requiring login (e.g., private Facebook/Instagram):
 3. For gallery-dl, cookies are automatically extracted
 
 For more help, see the [README.md](README.md) or open an issue.
-

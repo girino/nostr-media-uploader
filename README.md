@@ -169,7 +169,7 @@ For detailed installation instructions, see [INSTALLATION.md](INSTALLATION.md).
 
 ### Command-Line Options
 
-- `--convert` / `--noconvert`: Enable/disable video conversion (default: enabled)
+- `--convert` / `--noconvert`: Enable/disable video conversion (default: enabled). `--noconvert` preserves the original file without codec or iOS-compatibility validation.
 - `--force-reencode-h264` / `--reencode-h264`: Always re-encode h264/hevc at source-equivalent bitrate (auto-detection runs by default when converting)
 - `--norelay`: Don't send event to Nostr relays
 - `--nopow`: Disable proof of work
@@ -707,4 +707,3 @@ python3 telegram_bot.py
 ## Support
 
 This project does not provide support or accept feature requests. If you encounter issues, please adapt the code yourself or refer to the documentation for troubleshooting guidance.
-

@@ -1615,6 +1615,8 @@ remux_video_for_ios() {
 }
 
 # Ensure a video file is iOS-compatible (h264/hevc), converting when required.
+# When conversion is disabled, preserve the input without probing or validating
+# its codec/container compatibility.
 # Parameters:
 #   $1: INPUT_FILE - source video file
 #   $2: OUTPUT_FILE - converted output path if conversion is needed
@@ -1627,6 +1629,10 @@ ensure_compatible_video() {
 	local OUTPUT_FILE="$2"
 	local CONVERT_VIDEO="$3"
 	local CONTEXT_LABEL="$4"
+	if [ "$CONVERT_VIDEO" -ne 1 ]; then
+		ensure_compatible_video_ret_file="$INPUT_FILE"
+		return 0
+	fi
 	local WIN_INPUT_FILE
 	WIN_INPUT_FILE=$(convert_path_for_tool "$INPUT_FILE")
 	local VIDEO_CODEC
@@ -1657,13 +1663,6 @@ ensure_compatible_video() {
 	if [ "$SKIP_CONVERSION" -eq 1 ]; then
 		ensure_compatible_video_ret_file="$INPUT_FILE"
 		return 0
-	fi
-
-	if [ "$CONVERT_VIDEO" -ne 1 ]; then
-		if [ "$VIDEO_CODEC" = "h264" ] || [ "$VIDEO_CODEC" = "hevc" ]; then
-			die "${CONTEXT_LABEL} is h264/hevc but not Apple-compatible and conversion is disabled (try without --noconvert, or use --force-reencode-h264)"
-		fi
-		die "${CONTEXT_LABEL} codec is not h264 or hevc and conversion is disabled"
 	fi
 
 	if [ "$IOS_FIX_MODE" = "remux" ]; then
@@ -1867,7 +1866,14 @@ download_video() {
 	"$YT_DLP_CMD" "${YT_DLP_OPTS[@]}" "$VIDEO_URL" -f "$FORMATS" -S ext:mp4:m4a --merge-output-format mp4 --write-description -o "$WINFILE_INT" 2>&1
 	local YT_DLP_EXIT_CODE=$?
 	
-	if [ $YT_DLP_EXIT_CODE -eq 0 ] && [ -f "$OUT_FILE_INT" ]; then
+	# yt-dlp can return a non-zero status after successfully merging the media
+	# (for example, when a non-essential post-processing step fails).  The
+	# merged file is the authoritative result: do not discard it and fall back
+	# to gallery-dl merely because that optional step returned an error.
+	if [ -f "$OUT_FILE_INT" ]; then
+		if [ $YT_DLP_EXIT_CODE -ne 0 ]; then
+			echo "Warning: yt-dlp exited with status $YT_DLP_EXIT_CODE, but created '$OUT_FILE_INT'; continuing with the downloaded video." >&2
+		fi
 		DOWNLOADED=1
 		local file_caption=""
 		local extracted_caption=""
@@ -1931,6 +1937,10 @@ download_video() {
 		local _dv_n=${#download_video_ret_files[@]}
 		echo "Downloaded as video: '${download_video_ret_files[$((_dv_n - 1))]}'"
 		download_video_ret_success=0
+	elif [ $YT_DLP_EXIT_CODE -eq 0 ]; then
+		echo "Error: yt-dlp reported success but did not create the expected output file: $OUT_FILE_INT" >&2
+	else
+		echo "Error: yt-dlp failed with status $YT_DLP_EXIT_CODE and did not create an output file." >&2
 	fi
 }
 
@@ -3500,7 +3510,13 @@ process_media_items() {
 	# Deserialize arrays
 	local ALL_MEDIA_FILES=()
 	eval "ALL_MEDIA_FILES=($ALL_MEDIA_FILES_STR)"
-	log_phase "process_media_items: ${#ALL_MEDIA_FILES[@]} input path(s)/URL(s) CONVERT_VIDEO=$CONVERT_VIDEO USE_COOKIES_FF=$USE_COOKIES_FF"
+	local COOKIES_MODE="disabled"
+	if [ -n "$COOKIES_FILE" ]; then
+		COOKIES_MODE="file"
+	elif [ "$USE_COOKIES_FF" -eq 1 ]; then
+		COOKIES_MODE="firefox"
+	fi
+	log_phase "process_media_items: ${#ALL_MEDIA_FILES[@]} input path(s)/URL(s) CONVERT_VIDEO=$CONVERT_VIDEO COOKIES_MODE=$COOKIES_MODE"
 	
 	local GALLERY_DL_PARAMS=()
 	eval "GALLERY_DL_PARAMS=($GALLERY_DL_PARAMS_STR)"
