@@ -255,20 +255,19 @@ def should_disable_cookies(urls, disable_cookies_for_sites):
     if not urls:
         return False
     
-    # If disable_cookies_for_sites is None or empty list, don't disable
-    if not disable_cookies_for_sites:
-        return False
-    
     # Convert to list if it's not already
-    if not isinstance(disable_cookies_for_sites, list):
+    if not disable_cookies_for_sites:
+        disable_cookies_for_sites = []
+    elif not isinstance(disable_cookies_for_sites, list):
         disable_cookies_for_sites = [disable_cookies_for_sites]
     
     # Filter out empty strings
     disable_cookies_for_sites = [p for p in disable_cookies_for_sites if p and p.strip()]
     
-    # If list is empty after filtering, don't disable
-    if not disable_cookies_for_sites:
-        return False
+    # Dailymotion's media API rejects the shared browser cookie jar used by
+    # the bot. Keep this built-in so all bot configurations behave correctly.
+    if 'dailymotion.com' not in [p.lower().strip('.') for p in disable_cookies_for_sites]:
+        disable_cookies_for_sites.append('dailymotion.com')
     
     for url in urls:
         # Only check HTTP/HTTPS URLs

@@ -39,11 +39,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install Python dependencies for nostr_media_uploader.sh
 # gallery-dl requires >= 1.30.6 for Facebook support
 # yt-dlp + yt-dlp-ejs: external JavaScript solver (EJS) for YouTube challenges; needs a JS runtime (Deno above)
+# curl-cffi provides browser impersonation required by extractors such as Dailymotion.
 # https://github.com/yt-dlp/yt-dlp/wiki/EJS
 RUN pip install --no-cache-dir --upgrade \
     gallery-dl==1.30.6 \
     yt-dlp \
-    yt-dlp-ejs
+    yt-dlp-ejs \
+    curl-cffi
 
 # Copy nak binary from build stage
 COPY --from=nak-builder /go/bin/nak /usr/local/bin/nak
@@ -75,6 +77,7 @@ RUN mkdir -p /root/.nostr
 RUN gallery-dl --version && \
     yt-dlp --version && \
     pip show yt-dlp-ejs >/dev/null && \
+    python -c "import curl_cffi" && \
     deno --version && \
     ffmpeg -version | head -n 1 && \
     jq --version && \
@@ -85,4 +88,3 @@ RUN gallery-dl --version && \
 
 # Set default command
 CMD ["python", "telegram_bot.py"]
-
