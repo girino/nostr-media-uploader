@@ -297,6 +297,7 @@ See [example_env](example_env) for a complete configuration template.
 - **`POW_DIFF`**: Proof of work difficulty (default: 20)
 - **`USE_COOKIES_FF`**: Use Firefox cookies by default (0/1, default: 0)
 - **`COOKIES_FILE`**: Path to cookies file (Mozilla/Netscape format). If set, takes precedence over `USE_COOKIES_FF` and `--firefox` option
+- **`COOKIES_FALLBACK`**: Try `yt-dlp` without cookies first, then retry with configured cookies only if no media file was created (0/1, default: 0)
 - **`ENCODERS`**: Comma-separated list of preferred video encoders (e.g., `libx264,hevc_qsv`). Overrides automatic encoder detection. Encoders will be tried in the specified order.
 - **`APPEND_ORIGINAL_COMMENT`**: Append original captions (0/1, default: 1)
 - **`NSFW`**: Mark posts as NSFW by adding content-warning tag (0/1, default: 0). Can also be set via `--nsfw` command-line flag, or automatically detected from `#NSFW`/`#nsfw` hashtag in content

@@ -18,4 +18,5 @@ venv_linux/
 # Hugging Face model cache (nude_detector falconsai backend)
 .cache/
 docker-compose.yml
+docker-compose.yaml
 *.mp4

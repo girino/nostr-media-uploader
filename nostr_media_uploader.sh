@@ -1804,6 +1804,7 @@ download_video() {
 	fi
 	
 	local YT_DLP_OPTS=(--no-playlist)
+	local YT_DLP_COOKIE_OPTS=()
 	local EFFECTIVE_JS_RUNTIMES="${JS_RUNTIMES:-}"
 	if [ "$OS_TYPE" = "linux" ] && [ -n "$EFFECTIVE_JS_RUNTIMES" ]; then
 		# Linux/Docker cannot execute Windows-style runtime paths (e.g., C:\...\deno.exe).
@@ -1846,9 +1847,9 @@ download_video() {
 			COOKIES_FILE_TO_USE="$TEMP_COOKIES"
 		fi
 		local WIN_COOKIES_FILE=$(convert_path_for_tool "$COOKIES_FILE_TO_USE")
-		YT_DLP_OPTS+=(--cookies "$WIN_COOKIES_FILE")
+		YT_DLP_COOKIE_OPTS+=(--cookies "$WIN_COOKIES_FILE")
 	elif [ "$USE_COOKIES_FF" -eq 1 ]; then
-		YT_DLP_OPTS+=(--cookies-from-browser firefox)
+		YT_DLP_COOKIE_OPTS+=(--cookies-from-browser firefox)
 	fi
 	
 	# Find yt-dlp command dynamically (check PATH first, then fallback to hardcoded path for Cygwin)
@@ -1863,8 +1864,23 @@ download_video() {
 	fi
 	
 	echo "yt-dlp stdout/stderr:" >&2
-	"$YT_DLP_CMD" "${YT_DLP_OPTS[@]}" "$VIDEO_URL" -f "$FORMATS" -S ext:mp4:m4a --merge-output-format mp4 --write-description -o "$WINFILE_INT" 2>&1
-	local YT_DLP_EXIT_CODE=$?
+	local TRY_COOKIES_FALLBACK=0
+	case "${COOKIES_FALLBACK:-0}" in
+		1|true|TRUE|yes|YES) TRY_COOKIES_FALLBACK=1 ;;
+	esac
+	if [ "$TRY_COOKIES_FALLBACK" -eq 1 ] && [ ${#YT_DLP_COOKIE_OPTS[@]} -gt 0 ]; then
+		echo "yt-dlp: trying without cookies first" >&2
+		"$YT_DLP_CMD" "${YT_DLP_OPTS[@]}" "$VIDEO_URL" -f "$FORMATS" -S ext:mp4:m4a --merge-output-format mp4 --write-description -o "$WINFILE_INT" 2>&1
+		local YT_DLP_EXIT_CODE=$?
+		if [ ! -f "$OUT_FILE_INT" ]; then
+			echo "yt-dlp: no output without cookies; retrying with cookies" >&2
+			"$YT_DLP_CMD" "${YT_DLP_OPTS[@]}" "${YT_DLP_COOKIE_OPTS[@]}" "$VIDEO_URL" -f "$FORMATS" -S ext:mp4:m4a --merge-output-format mp4 --write-description -o "$WINFILE_INT" 2>&1
+			YT_DLP_EXIT_CODE=$?
+		fi
+	else
+		"$YT_DLP_CMD" "${YT_DLP_OPTS[@]}" "${YT_DLP_COOKIE_OPTS[@]}" "$VIDEO_URL" -f "$FORMATS" -S ext:mp4:m4a --merge-output-format mp4 --write-description -o "$WINFILE_INT" 2>&1
+		local YT_DLP_EXIT_CODE=$?
+	fi
 	
 	# yt-dlp can return a non-zero status after successfully merging the media
 	# (for example, when a non-essential post-processing step fails).  The

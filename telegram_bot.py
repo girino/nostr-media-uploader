@@ -252,6 +252,13 @@ def should_disable_cookies(urls, disable_cookies_for_sites):
     Returns:
         True if any URL matches a domain in the disable list, False otherwise
     """
+    # In fallback mode the uploader needs the cookie source available for its
+    # second attempt. It performs the no-cookie attempt itself, so per-site
+    # exclusions must not strip --cookies from the command here.
+    if os.environ.get('COOKIES_FALLBACK', '').lower() in ('1', 'true', 'yes'):
+        logger.info("Cookie fallback mode enabled; uploader will try without cookies first")
+        return False
+
     if not urls:
         return False
     
