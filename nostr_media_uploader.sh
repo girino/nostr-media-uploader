@@ -4303,7 +4303,8 @@ update_history_file() {
 	return 0
 }
 
-# Copy processed media files into a directory; basename collisions get _1, _2, ...
+# Copy processed media files using a short content hash as the filename.
+# Identical content is skipped; different files with the same short hash get _1, _2, ...
 # Parameters:
 #   $1: PROCESSED_FILES_STR - serialized array of file paths
 #   $2: DEST_DIR - destination directory (created if missing)
@@ -4317,38 +4318,47 @@ copy_processed_files_to_destination() {
 	fi
 	mkdir -p "$DEST_DIR" || die "Failed to create destination directory: $DEST_DIR"
 	local FILE
-	local base
 	local dest
-	local name
-	local ext
+	local file_hash
+	local hash_output
+	local short_hash
+	local existing_hash
+	local existing_hash_output
 	local i
 	local copied=0
+	local skipped=0
 	for FILE in "${PROCESSED_FILES[@]}"; do
 		if [ ! -f "$FILE" ]; then
 			echo "Warning: copy-only: skipping missing file: $FILE" >&2
 			continue
 		fi
-		base=$(basename "$FILE")
-		dest="$DEST_DIR/$base"
-		if [ -e "$dest" ]; then
-			name="${base%.*}"
-			ext="${base#*.}"
-			if [ "$ext" = "$base" ]; then
-				ext=""
-			else
-				ext=".$ext"
+		hash_output=$(sha256sum "$FILE") || die "copy-only: failed to calculate SHA-256 for $FILE"
+		file_hash="${hash_output%% *}"
+		short_hash="${file_hash:0:12}"
+		dest="$DEST_DIR/v_${short_hash}.mp4"
+		i=0
+		while [ -e "$dest" ]; do
+			if [ -f "$dest" ]; then
+				existing_hash_output=$(sha256sum "$dest") || die "copy-only: failed to calculate SHA-256 for $dest"
+				existing_hash="${existing_hash_output%% *}"
+				if [ "$existing_hash" = "$file_hash" ]; then
+					echo "Skipped duplicate: $dest"
+					skipped=$((skipped + 1))
+					dest=""
+					break
+				fi
 			fi
-			i=1
-			while [ -e "$DEST_DIR/${name}_${i}${ext}" ]; do
-				i=$((i + 1))
-			done
-			dest="$DEST_DIR/${name}_${i}${ext}"
+			i=$((i + 1))
+			dest="$DEST_DIR/v_${short_hash}_${i}.mp4"
+		done
+		if [ -z "$dest" ]; then
+			continue
 		fi
 		cp -p "$FILE" "$dest" || die "Failed to copy $FILE to $dest"
 		echo "Copied: $dest"
 		copied=$((copied + 1))
 	done
-	if [ "$copied" -eq 0 ]; then
+	if [ "$copied" -eq 0 ] && [ "$skipped" -eq 0 ]; then
 		die "copy-only: no files were copied (all inputs missing?)"
 	fi
 }
